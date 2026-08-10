@@ -1,0 +1,21 @@
+{
+  "base_config": {
+    "num_points": 256,
+    "bits": 12,
+    "train_samples": 448,
+    "validation_samples": 140,
+    "parameter_ood_samples": 140,
+    "batch_size": 8,
+    "epochs": 12,
+    "learning_rate": 0.001,
+    "surface_weight": 0.1,
+    "repulsion_weight": 0.01,
+    "seed": 7,
+    "output_dir": "artifacts/local/experiment_002_relation_aware"
+  },
+  "constellation_sizes": [4, 16, 32],
+  "model_kinds": ["learned", "relation", "relation_fps"],
+  "gated_model_kind": "relation",
+  "min_endpoint_improvement_percent": 1.0,
+  "max_adjacent_regression_percent": 0.5
+}

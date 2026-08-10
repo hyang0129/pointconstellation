@@ -20,6 +20,11 @@ All notable project changes will be recorded here.
 - Reproducible constellation-size and coordinate-precision sweep runner.
 - Local 12-point rate sweep showing learned-over-FPS gains but no learned
   fidelity improvement from increasing the current bottleneck rate.
+- Experiment 002 plan, relation-aware coordinate-only transformer, selected-rate
+  K=4/16/32 runner, parameter-OOD evaluation, and automated rate-curve gate.
+- Local Experiment 002 result: monotonic learned curves passed the gate, longer
+  training corrected the earlier flat-curve conclusion, and matched-decoder
+  FPS isolated learned anchor generation as the next bottleneck.
 - Four-point analytic codec for approximately planar clouds.
 - NumPy Chamfer RMSE and Hausdorff metrics.
 - Secret-free EmpireAI Jupyter allocation, connection, and GPU dispatch tooling.

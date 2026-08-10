@@ -150,6 +150,23 @@ from 96 to 1,152 payload bits. The current global-pooling architecture does not
 convert extra anchors into better fidelity. See the
 [rate sweep report](docs/experiment-001-rate-sweep.md).
 
+Experiment 002 replaces that bottleneck with relation-aware point and anchor
+attention, then trains longer selected-rate curves at `K=4, 16, 32`. It also
+evaluates held-out procedural parameter ranges and compares learned anchors
+with FPS coordinates feeding the same relation-aware decoder:
+
+```bash
+.venv-train/bin/python -m pointconstellation.selected_rate \
+  --config configs/experiment_002_relation_aware.json
+```
+
+Its quantitative hypothesis and stop/go gate are defined in the
+[relation-aware experiment plan](docs/experiment-002-relation-aware-plan.md).
+The first local run passed its monotonic-rate gate, but FPS anchors with the
+same relation-aware decoder substantially outperformed learned anchors at
+K=16 and K=32. See the
+[Experiment 002 result](docs/experiment-002-relation-aware-result.md).
+
 ## EmpireAI GPUs
 
 The repository includes secret-free EmpireAI tooling adapted from HalluLens:
@@ -162,9 +179,10 @@ is submitted automatically.
 
 ## Project status
 
-This repository is entering research milestone 1. The plane codec and local ML
-experiment are usable; claims about competitive compression performance have
-not been made. Issues and small, reproducible experiments are welcome.
+This repository is in research milestone 1. The plane codec, fixed-rate ML
+baselines, rate sweeps, and relation-aware architectural control are runnable;
+claims about competitive compression performance have not been made. Issues
+and small, reproducible experiments are welcome.
 
 ## License
 

@@ -11,12 +11,15 @@ from pointconstellation.models import (
     ConstellationAutoencoder,
     FarthestPointEncoder,
     FPSAutoencoder,
+    RelationAwareConstellationAutoencoder,
+    RelationAwareFPSAutoencoder,
 )
 from pointconstellation.quantization import (
     quantization_step,
     quantize_coordinates,
     quantize_ste,
 )
+from pointconstellation.selected_rate import SelectedRateSpec, rate_curve_gate
 from pointconstellation.sweep import SweepSpec, pareto_frontier
 from pointconstellation.train import TrainingConfig
 
@@ -99,6 +102,42 @@ def test_learned_and_fps_models_start_from_the_same_decoder() -> None:
         assert torch.equal(learned_value, fps.decoder.state_dict()[name])
 
 
+def test_relation_model_contract_and_set_permutation_invariance() -> None:
+    torch.manual_seed(23)
+    model = RelationAwareConstellationAutoencoder(
+        num_input_points=32, constellation_size=8, bits=10
+    ).eval()
+    points = torch.stack(
+        [
+            torch.from_numpy(generate_sample(index, num_points=32).points)
+            for index in range(2)
+        ]
+    )
+
+    reconstruction, constellation = model(points)
+    _, input_permuted_constellation = model(points[:, torch.randperm(32)])
+    anchor_permuted_reconstruction = model.decoder(constellation[:, torch.randperm(8)])
+
+    assert reconstruction.shape == (2, 32, 3)
+    assert constellation.shape == (2, 8, 3)
+    assert torch.allclose(constellation, input_permuted_constellation, atol=2e-6)
+    assert torch.allclose(reconstruction, anchor_permuted_reconstruction, atol=2e-6)
+
+
+def test_relation_learned_and_fps_start_from_the_same_decoder() -> None:
+    torch.manual_seed(29)
+    learned = RelationAwareConstellationAutoencoder(
+        num_input_points=32, constellation_size=8, bits=10
+    )
+    torch.manual_seed(29)
+    fps = RelationAwareFPSAutoencoder(
+        num_input_points=32, constellation_size=8, bits=10
+    )
+
+    for name, learned_value in learned.decoder.state_dict().items():
+        assert torch.equal(learned_value, fps.decoder.state_dict()[name])
+
+
 def test_sweep_spec_validates_axes_and_pareto_frontier() -> None:
     with pytest.raises(ValueError, match="between 2 and num_points"):
         SweepSpec(TrainingConfig(num_points=32), (8, 64), (8, 12))
@@ -129,6 +168,49 @@ def test_sweep_spec_validates_axes_and_pareto_frontier() -> None:
 
     frontier = pareto_frontier(points, "learned")
     assert [point["coordinate_payload_bits"] for point in frontier] == [96, 192]
+
+
+def test_selected_rate_spec_and_gate() -> None:
+    config = TrainingConfig(num_points=32, parameter_ood_samples=7)
+    spec = SelectedRateSpec(
+        config,
+        (4, 8, 16),
+        ("learned", "relation"),
+        min_endpoint_improvement_percent=1.0,
+        max_adjacent_regression_percent=0.5,
+    )
+    assert spec.gated_model_kind == "relation"
+
+    runs = [
+        {
+            "model_kind": "relation",
+            "constellation_size": size,
+            "coordinate_payload_bits": 3 * size * 12,
+            "validation": {"chamfer_rmse": rmse},
+            "parameter_ood": {"chamfer_rmse": rmse + 0.1},
+        }
+        for size, rmse in ((4, 0.5), (8, 0.49), (16, 0.48))
+    ]
+    passing = rate_curve_gate(
+        runs,
+        model_kind="relation",
+        split="validation",
+        min_endpoint_improvement_percent=1.0,
+        max_adjacent_regression_percent=0.5,
+    )
+    assert passing["passed"]
+    assert passing["endpoint_improvement_percent"] == pytest.approx(4.0)
+
+    runs[1]["validation"]["chamfer_rmse"] = 0.51
+    failing = rate_curve_gate(
+        runs,
+        model_kind="relation",
+        split="validation",
+        min_endpoint_improvement_percent=1.0,
+        max_adjacent_regression_percent=0.5,
+    )
+    assert not failing["passed"]
+    assert not failing["adjacency_passed"]
 
 
 def test_one_training_step_has_finite_loss_and_gradients() -> None:

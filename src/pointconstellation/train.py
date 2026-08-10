@@ -17,9 +17,20 @@ from torch.utils.data import DataLoader
 
 from pointconstellation.data import ProceduralPointCloudDataset
 from pointconstellation.losses import constellation_loss
-from pointconstellation.models import ConstellationAutoencoder, FPSAutoencoder
+from pointconstellation.models import (
+    ConstellationAutoencoder,
+    FPSAutoencoder,
+    RelationAwareConstellationAutoencoder,
+    RelationAwareFPSAutoencoder,
+)
 
-MODEL_KINDS = ("learned", "fps")
+MODEL_KINDS = ("learned", "fps", "relation", "relation_fps")
+MODEL_CLASSES = {
+    "learned": ConstellationAutoencoder,
+    "fps": FPSAutoencoder,
+    "relation": RelationAwareConstellationAutoencoder,
+    "relation_fps": RelationAwareFPSAutoencoder,
+}
 
 
 @dataclass(frozen=True)
@@ -29,6 +40,7 @@ class TrainingConfig:
     bits: int = 12
     train_samples: int = 224
     validation_samples: int = 70
+    parameter_ood_samples: int = 0
     batch_size: int = 8
     epochs: int = 3
     learning_rate: float = 1e-3
@@ -183,16 +195,28 @@ def train(
         shuffle=False,
         num_workers=0,
     )
-    model_class = (
-        ConstellationAutoencoder if model_kind == "learned" else FPSAutoencoder
-    )
+    parameter_ood_loader = None
+    if config.parameter_ood_samples:
+        parameter_ood_dataset = ProceduralPointCloudDataset(
+            config.parameter_ood_samples,
+            num_points=config.num_points,
+            seed=config.seed,
+            split="parameter_ood",
+        )
+        parameter_ood_loader = DataLoader(
+            parameter_ood_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=0,
+        )
+    model_class = MODEL_CLASSES[model_kind]
     model = model_class(
         num_input_points=config.num_points,
         constellation_size=config.constellation_size,
         bits=config.bits,
     ).to(device)
-    # Encoder construction consumes random values only for the learned model.
-    # Reset here so both matched-rate runs see the same training-time jitter.
+    # Model variants consume different numbers of initialization draws. Reset
+    # here so matched runs see the same training-time jitter and data randomness.
     set_seed(config.seed)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 
@@ -206,6 +230,13 @@ def train(
         record = {"epoch": epoch, "train": training, "validation": validation}
         history.append(record)
         print(json.dumps(record))
+
+    final_parameter_ood = None
+    if parameter_ood_loader is not None:
+        final_parameter_ood = run_epoch(
+            model, parameter_ood_loader, device, config, optimizer=None
+        )
+        print(json.dumps({"parameter_ood": final_parameter_ood}))
 
     result = {
         "config": asdict(config),
@@ -222,6 +253,7 @@ def train(
         "coordinate_payload_bits": 3 * config.constellation_size * config.bits,
         "initial_validation": initial,
         "final_validation": history[-1]["validation"],
+        "final_parameter_ood": final_parameter_ood,
         "elapsed_seconds": time.perf_counter() - started,
         "history": history,
     }

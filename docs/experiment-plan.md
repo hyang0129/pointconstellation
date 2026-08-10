@@ -86,6 +86,14 @@ The first fixed-rate sweep is recorded in the
 at every tested point but produced an essentially flat curve, so a
 relation-aware decoder is required before adaptive-`K` training.
 
+The next architectural gate is defined in the
+[Experiment 002 relation-aware plan](experiment-002-relation-aware-plan.md).
+It compares longer legacy, relation-aware learned, and matched-decoder FPS
+curves at selected rates on both in-distribution and parameter-OOD geometry.
+The [local result](experiment-002-relation-aware-result.md) passed the
+rate-utilization gate, corrected the earlier undertraining confound, and
+isolated learned anchor generation as the next bottleneck.
+
 ## Dataset ladder
 
 1. Synthetic planes, corners, cylinders, spheres, thin structures, and mixtures.
