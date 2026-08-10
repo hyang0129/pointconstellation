@@ -10,4 +10,4 @@ build/
 dist/
 artifacts/
 configs/empire.nodes.json
-data/
+/data/

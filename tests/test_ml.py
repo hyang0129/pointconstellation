@@ -3,10 +3,9 @@
 import numpy as np
 import pytest
 
-from pointconstellation.data import FAMILIES, generate_sample
-
 torch = pytest.importorskip("torch")
 
+from pointconstellation.data import FAMILIES, generate_sample
 from pointconstellation.losses import constellation_loss
 from pointconstellation.models import (
     ConstellationAutoencoder,
