@@ -72,7 +72,13 @@ Example output fields:
 
 ## Research direction
 
-The first learned experiment will compare a coordinate-only constellation
+The core experiment is explicitly an **ML encoder/decoder**, not an analytic
+primitive codec. The encoder learns to reduce a dense cloud to an unordered,
+quantized `K x 3` constellation. The decoder receives only those coordinates
+and learns to reconstruct dense geometry. The analytic plane implementation is
+only a contract test and sanity baseline.
+
+The first learned experiment will compare this coordinate-only constellation
 autoencoder against farthest-point sampling, learned simplification, a latent
 point model with feature channels, and conventional codecs at matched rates.
 The decisive ablations are:
@@ -86,6 +92,35 @@ The decisive ablations are:
 See the [field map](docs/research-landscape.md) and
 [experiment plan](docs/experiment-plan.md) for the prior art, novelty boundary,
 metrics, datasets, and stop/go criteria.
+
+Implementation is tracked in [Experiment 1](https://github.com/hyang0129/pointconstellation/issues/1).
+
+### Local ML smoke run
+
+The first real encoder/decoder slice can run on Apple MPS, CUDA, or CPU:
+
+```bash
+uv venv --python 3.13 .venv-train
+uv pip install --python .venv-train/bin/python -e '.[train,dev]'
+.venv-train/bin/python -m pointconstellation.train \
+  --config configs/experiment_001_smoke.json
+```
+
+This smoke configuration uses 256 input points, a 16-point coordinate-only
+constellation, and 12-bit training quantization. Outputs go to ignored
+`artifacts/local/`; it is a pipeline validation, not a compression benchmark.
+The first MPS run and its limitations are recorded in the
+[local smoke report](docs/experiment-001-local-smoke.md).
+
+## EmpireAI GPUs
+
+The repository includes secret-free EmpireAI tooling adapted from HalluLens:
+a guarded Jupyter allocation launcher, live SLURM node discovery, remote
+Jupyter execution, GPU-aware dispatch, and job tracking. It assumes the local
+SSH alias `empire-ai`; keys and passwords stay outside Git.
+
+See the [EmpireAI guide](docs/empire-ai.md). No GPU allocation or training job
+is submitted automatically.
 
 ## Project status
 

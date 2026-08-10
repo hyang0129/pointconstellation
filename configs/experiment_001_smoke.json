@@ -1,0 +1,14 @@
+{
+  "num_points": 256,
+  "constellation_size": 16,
+  "bits": 12,
+  "train_samples": 224,
+  "validation_samples": 70,
+  "batch_size": 8,
+  "epochs": 3,
+  "learning_rate": 0.001,
+  "surface_weight": 0.1,
+  "repulsion_weight": 0.01,
+  "seed": 7,
+  "output_dir": "artifacts/local/experiment_001_smoke"
+}

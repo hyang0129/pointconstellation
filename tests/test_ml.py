@@ -1,0 +1,84 @@
+import numpy as np
+import pytest
+
+torch = pytest.importorskip("torch")
+
+from pointconstellation.data import FAMILIES, generate_sample  # noqa: E402
+from pointconstellation.losses import constellation_loss  # noqa: E402
+from pointconstellation.models import ConstellationAutoencoder  # noqa: E402
+from pointconstellation.quantization import (  # noqa: E402
+    quantization_step,
+    quantize_coordinates,
+    quantize_ste,
+)
+
+
+def test_procedural_data_are_deterministic_and_normalized() -> None:
+    for sample_id, family in enumerate(FAMILIES):
+        first = generate_sample(sample_id, num_points=64, seed=11)
+        second = generate_sample(sample_id, num_points=64, seed=11)
+
+        assert first.family == family
+        np.testing.assert_array_equal(first.points, second.points)
+        np.testing.assert_array_equal(first.normals, second.normals)
+        assert np.linalg.norm(first.points, axis=1).max() <= 1.000001
+        np.testing.assert_allclose(
+            np.linalg.norm(first.normals, axis=1), 1.0, atol=1e-5
+        )
+
+
+def test_quantizer_uses_declared_lattice_and_ste_gradient() -> None:
+    values = torch.tensor([[[-1.0, -0.2, 0.73]]], requires_grad=True)
+    quantized = quantize_ste(values, 8, training=True, jitter=False)
+    step = quantization_step(8)
+    lattice = (quantized.detach() + 1.0) / step
+
+    assert torch.allclose(lattice, lattice.round(), atol=1e-5)
+    quantized.sum().backward()
+    assert torch.equal(values.grad, torch.ones_like(values))
+    assert torch.equal(quantize_coordinates(values.detach(), 8), quantized.detach())
+
+
+def test_autoencoder_contract_and_permutation_invariance() -> None:
+    torch.manual_seed(5)
+    model = ConstellationAutoencoder(
+        num_input_points=32, constellation_size=8, bits=10
+    ).eval()
+    points = torch.stack(
+        [
+            torch.from_numpy(generate_sample(index, num_points=32).points)
+            for index in range(2)
+        ]
+    )
+
+    reconstruction, constellation = model(points)
+    assert constellation.shape == (2, 8, 3)
+    assert reconstruction.shape == (2, 32, 3)
+
+    input_permutation = torch.randperm(32)
+    _, permuted_constellation = model(points[:, input_permutation])
+    assert torch.allclose(constellation, permuted_constellation, atol=2e-6)
+
+    anchor_permutation = torch.randperm(8)
+    permuted_reconstruction = model.decoder(constellation[:, anchor_permutation])
+    assert torch.allclose(reconstruction, permuted_reconstruction, atol=2e-6)
+
+
+def test_one_training_step_has_finite_loss_and_gradients() -> None:
+    torch.manual_seed(9)
+    model = ConstellationAutoencoder(num_input_points=32, constellation_size=8, bits=10)
+    points = torch.stack(
+        [
+            torch.from_numpy(generate_sample(index, num_points=32).points)
+            for index in range(2)
+        ]
+    )
+    reconstruction, constellation = model(points)
+    loss, _ = constellation_loss(reconstruction, points, constellation)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert any(
+        parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        for parameter in model.parameters()
+    )
