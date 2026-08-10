@@ -17,6 +17,8 @@ from pointconstellation.quantization import (
     quantize_coordinates,
     quantize_ste,
 )
+from pointconstellation.sweep import SweepSpec, pareto_frontier
+from pointconstellation.train import TrainingConfig
 
 
 def test_procedural_data_are_deterministic_and_normalized() -> None:
@@ -95,6 +97,38 @@ def test_learned_and_fps_models_start_from_the_same_decoder() -> None:
 
     for name, learned_value in learned.decoder.state_dict().items():
         assert torch.equal(learned_value, fps.decoder.state_dict()[name])
+
+
+def test_sweep_spec_validates_axes_and_pareto_frontier() -> None:
+    with pytest.raises(ValueError, match="between 2 and num_points"):
+        SweepSpec(TrainingConfig(num_points=32), (8, 64), (8, 12))
+
+    points = [
+        {
+            "constellation_size": 4,
+            "bits_per_coordinate": 8,
+            "coordinate_payload_bits": 96,
+            "bits_per_input_point": 0.375,
+            "learned": {"chamfer_rmse": 0.5},
+        },
+        {
+            "constellation_size": 4,
+            "bits_per_coordinate": 12,
+            "coordinate_payload_bits": 144,
+            "bits_per_input_point": 0.5625,
+            "learned": {"chamfer_rmse": 0.51},
+        },
+        {
+            "constellation_size": 8,
+            "bits_per_coordinate": 8,
+            "coordinate_payload_bits": 192,
+            "bits_per_input_point": 0.75,
+            "learned": {"chamfer_rmse": 0.4},
+        },
+    ]
+
+    frontier = pareto_frontier(points, "learned")
+    assert [point["coordinate_payload_bits"] for point in frontier] == [96, 192]
 
 
 def test_one_training_step_has_finite_loss_and_gradients() -> None:

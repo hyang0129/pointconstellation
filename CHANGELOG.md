@@ -15,6 +15,11 @@ All notable project changes will be recorded here.
 - Deterministic quantized FPS encoder and matched-rate comparison runner.
 - Per-family validation metrics and a local learned-versus-FPS result at the
   same 576-bit raw coordinate payload.
+- Adaptive variable-cardinality codec target with an explicit raw pass-through
+  endpoint and transformer-first architecture ladder.
+- Reproducible constellation-size and coordinate-precision sweep runner.
+- Local 12-point rate sweep showing learned-over-FPS gains but no learned
+  fidelity improvement from increasing the current bottleneck rate.
 - Four-point analytic codec for approximately planar clouds.
 - NumPy Chamfer RMSE and Hausdorff metrics.
 - Secret-free EmpireAI Jupyter allocation, connection, and GPU dispatch tooling.

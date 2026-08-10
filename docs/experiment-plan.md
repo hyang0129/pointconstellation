@@ -10,6 +10,12 @@ The initial target is lossy static geometry without color. Attributes, temporal
 coding, and lossless reconstruction are out of scope until this question is
 answered.
 
+The intended codec is not permanently fixed-rate. It must eventually accept a
+variable number of input points, select a variable constellation size, and
+produce a variable-size reconstruction. A raw/pass-through mode is a required
+endpoint when constellation coding does not improve the rate-distortion trade.
+The [adaptive codec target](adaptive-codec.md) defines this direction.
+
 ## Milestone 0: analytic primitives
 
 Validate the representation contract with deterministic codecs:
@@ -75,6 +81,11 @@ Use identical train/test data and preprocessing.
 
 Compare rate-distortion curves, not a single `K`.
 
+The first fixed-rate sweep is recorded in the
+[rate sweep report](experiment-001-rate-sweep.md). The learned model beat FPS
+at every tested point but produced an essentially flat curve, so a
+relation-aware decoder is required before adaptive-`K` training.
+
 ## Dataset ladder
 
 1. Synthetic planes, corners, cylinders, spheres, thin structures, and mixtures.
@@ -126,3 +137,18 @@ Proceed if the coordinate-only model:
 Reframe the idea as learned simplification or hybrid primitive coding if it
 requires high-precision off-surface anchors, feature channels, or a category-
 specific decoder to work.
+
+## Milestone 2: adaptive variable-rate set codec
+
+Replace independently trained fixed-`K` models with one set-to-set model that:
+
+- accepts variable input cardinality `N`;
+- selects `K` per cloud under an explicit rate objective;
+- reconstructs a variable cardinality `M` without dropping transmitted points;
+- can choose quantized raw pass-through when compression is counterproductive;
+- exposes no per-point features at the bottleneck; and
+- counts mode, cardinality, precision, bounds, and entropy syntax in the rate.
+
+Begin with a masked point/set transformer and learned token halting. Treat a
+conditional diffusion decoder as a later reconstruction-quality ablation, not
+as a change to the coordinate-only message.

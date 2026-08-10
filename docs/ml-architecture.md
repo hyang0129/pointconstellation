@@ -1,5 +1,10 @@
 # Core ML architecture
 
+The long-term target is an adaptive variable-input, variable-constellation,
+variable-output codec with a raw pass-through endpoint. The fixed-cardinality
+model below is the controlled precursor used to test whether a coordinate-only
+message works at all. See the [adaptive codec target](adaptive-codec.md).
+
 The analytic plane codec is not the proposed general solution. The central
 experiment is a learned encoder/decoder with a geometric bottleneck:
 

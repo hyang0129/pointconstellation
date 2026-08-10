@@ -73,10 +73,17 @@ Example output fields:
 ## Research direction
 
 The core experiment is explicitly an **ML encoder/decoder**, not an analytic
-primitive codec. The encoder learns to reduce a dense cloud to an unordered,
-quantized `K x 3` constellation. The decoder receives only those coordinates
-and learns to reconstruct dense geometry. The analytic plane implementation is
-only a contract test and sanity baseline.
+primitive codec. The final target accepts a variable-size input set, chooses a
+variable-size unordered constellation, and produces a variable-size output set.
+Compression is optional: when a smaller geometric message is not worthwhile,
+the codec should preserve the original coordinates through a raw/pass-through
+endpoint instead of forcing a lossy bottleneck.
+
+The current fixed `N -> K -> N` model is a controlled precursor. Its encoder
+learns to reduce a dense cloud to a quantized `K x 3` constellation, and its
+decoder receives only those coordinates. See the
+[adaptive codec target](docs/adaptive-codec.md) for the transformer-first design,
+rate-controlled cardinality, preservation rule, and diffusion-decoder ablation.
 
 The first learned experiment compares this coordinate-only constellation
 autoencoder against farthest-point sampling with the same decoder and raw
@@ -126,6 +133,22 @@ coordinate budget. The learned model's validation Chamfer RMSE was 4.29% lower
 in the first local run and was lower for all seven procedural families. See the
 [matched FPS report](docs/experiment-001-fps-comparison.md) for the result and
 its important limitations.
+
+The next fixed-rate control sweeps constellation size and precision:
+
+```bash
+.venv-train/bin/python -m pointconstellation.sweep \
+  --config configs/experiment_001_rate_sweep.json
+```
+
+These independently trained points establish the rate-distortion targets that
+the later single adaptive model must match or beat.
+
+The first local sweep found that learned constellations beat FPS at all 12
+points, but also exposed a limitation: the learned model was essentially flat
+from 96 to 1,152 payload bits. The current global-pooling architecture does not
+convert extra anchors into better fidelity. See the
+[rate sweep report](docs/experiment-001-rate-sweep.md).
 
 ## EmpireAI GPUs
 
