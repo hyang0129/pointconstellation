@@ -63,6 +63,49 @@ class ConstellationEncoder(nn.Module):
         return quantize_ste(anchors, self.bits, training=self.training)
 
 
+class FarthestPointEncoder(nn.Module):
+    """Select a deterministic FPS constellation with the same quantizer."""
+
+    def __init__(self, constellation_size: int, *, bits: int = 12) -> None:
+        super().__init__()
+        if constellation_size < 2:
+            raise ValueError("constellation_size must be at least 2")
+        self.constellation_size = constellation_size
+        self.bits = bits
+
+    def forward(self, points: Tensor) -> Tensor:
+        if points.ndim != 3 or points.shape[-1] != 3:
+            raise ValueError("points must have shape (batch, N, 3)")
+        if self.constellation_size > points.shape[1]:
+            raise ValueError("constellation_size cannot exceed the input point count")
+
+        batch_size, num_points, _ = points.shape
+        batch_indices = torch.arange(batch_size, device=points.device)
+        centroid = points.mean(dim=1, keepdim=True)
+        farthest = ((points - centroid) ** 2).sum(dim=-1).argmax(dim=1)
+        minimum_distances = torch.full(
+            (batch_size, num_points),
+            torch.inf,
+            dtype=points.dtype,
+            device=points.device,
+        )
+        selected_indices = torch.empty(
+            (batch_size, self.constellation_size),
+            dtype=torch.long,
+            device=points.device,
+        )
+
+        for anchor_index in range(self.constellation_size):
+            selected_indices[:, anchor_index] = farthest
+            selected = points[batch_indices, farthest][:, None, :]
+            squared_distances = ((points - selected) ** 2).sum(dim=-1)
+            minimum_distances = torch.minimum(minimum_distances, squared_distances)
+            farthest = minimum_distances.argmax(dim=1)
+
+        constellation = points.gather(1, selected_indices[:, :, None].expand(-1, -1, 3))
+        return quantize_ste(constellation, self.bits, training=self.training)
+
+
 def _folding_grid(num_points: int) -> Tensor:
     width = math.ceil(math.sqrt(num_points))
     axis = torch.linspace(-1.0, 1.0, width)
@@ -109,8 +152,32 @@ class ConstellationAutoencoder(nn.Module):
         bits: int = 12,
     ) -> None:
         super().__init__()
-        self.encoder = ConstellationEncoder(constellation_size, bits=bits)
+        # Construct the shared decoder first so resetting the seed gives learned
+        # and FPS experiments identical decoder initialization.
         self.decoder = ConstellationDecoder(num_input_points)
+        self.encoder = ConstellationEncoder(constellation_size, bits=bits)
+
+    def forward(self, points: Tensor) -> tuple[Tensor, Tensor]:
+        constellation = self.encoder(points)
+        if constellation.shape != (len(points), self.encoder.constellation_size, 3):
+            raise RuntimeError("encoder violated the strict K x 3 bottleneck")
+        reconstruction = self.decoder(constellation)
+        return reconstruction, constellation
+
+
+class FPSAutoencoder(nn.Module):
+    """Matched-rate baseline: quantized FPS coordinates plus the same decoder."""
+
+    def __init__(
+        self,
+        *,
+        num_input_points: int,
+        constellation_size: int,
+        bits: int = 12,
+    ) -> None:
+        super().__init__()
+        self.decoder = ConstellationDecoder(num_input_points)
+        self.encoder = FarthestPointEncoder(constellation_size, bits=bits)
 
     def forward(self, points: Tensor) -> tuple[Tensor, Tensor]:
         constellation = self.encoder(points)

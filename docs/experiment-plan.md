@@ -10,7 +10,7 @@ The initial target is lossy static geometry without color. Attributes, temporal
 coding, and lossless reconstruction are out of scope until this question is
 answered.
 
-## Milestone 0: analytic primitives (current)
+## Milestone 0: analytic primitives
 
 Validate the representation contract with deterministic codecs:
 
@@ -24,7 +24,7 @@ Validate the representation contract with deterministic codecs:
 Success means stable permutation-invariant decoding and transparent distortion
 measurements. It does not establish learned compression performance.
 
-## Milestone 1: learned fixed-rate autoencoder
+## Milestone 1: learned fixed-rate autoencoder (current)
 
 Use a fixed input size `N` and constellation size `K`.
 

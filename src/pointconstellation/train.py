@@ -12,12 +12,14 @@ from typing import Any
 
 import numpy as np
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 from torch.utils.data import DataLoader
 
 from pointconstellation.data import ProceduralPointCloudDataset
 from pointconstellation.losses import constellation_loss
-from pointconstellation.models import ConstellationAutoencoder
+from pointconstellation.models import ConstellationAutoencoder, FPSAutoencoder
+
+MODEL_KINDS = ("learned", "fps")
 
 
 @dataclass(frozen=True)
@@ -72,17 +74,25 @@ def _accumulate(
         totals[name] = totals.get(name, 0.0) + float(value.item()) * batch_size
 
 
+def _average_metrics(totals: dict[str, float], count: int) -> dict[str, float]:
+    metrics = {name: value / count for name, value in totals.items()}
+    metrics["chamfer_rmse"] = metrics["chamfer"] ** 0.5
+    return metrics
+
+
 def run_epoch(
-    model: ConstellationAutoencoder,
+    model: nn.Module,
     loader: DataLoader[dict[str, Any]],
     device: torch.device,
     config: TrainingConfig,
     *,
     optimizer: torch.optim.Optimizer | None,
-) -> dict[str, float]:
+) -> dict[str, Any]:
     training = optimizer is not None
     model.train(training)
     totals: dict[str, float] = {}
+    family_totals: dict[str, dict[str, float]] = {}
+    family_counts: dict[str, int] = {}
     count = 0
     for batch in loader:
         points = batch["points"].to(device)
@@ -103,8 +113,34 @@ def run_epoch(
         batch_size = len(points)
         _accumulate(totals, components, batch_size)
         count += batch_size
-    metrics = {name: value / count for name, value in totals.items()}
-    metrics["chamfer_rmse"] = metrics["chamfer"] ** 0.5
+        if not training:
+            families = batch["family"]
+            for family in sorted(set(families)):
+                indices = torch.tensor(
+                    [index for index, name in enumerate(families) if name == family],
+                    device=device,
+                )
+                _, family_components = constellation_loss(
+                    reconstruction[indices],
+                    points[indices],
+                    constellation[indices],
+                    surface_weight=config.surface_weight,
+                    repulsion_weight=config.repulsion_weight,
+                )
+                family_size = len(indices)
+                _accumulate(
+                    family_totals.setdefault(family, {}),
+                    family_components,
+                    family_size,
+                )
+                family_counts[family] = family_counts.get(family, 0) + family_size
+
+    metrics: dict[str, Any] = _average_metrics(totals, count)
+    if family_totals:
+        metrics["by_family"] = {
+            family: _average_metrics(values, family_counts[family])
+            for family, values in sorted(family_totals.items())
+        }
     return metrics
 
 
@@ -112,7 +148,10 @@ def train(
     config: TrainingConfig,
     *,
     device_name: str = "auto",
+    model_kind: str = "learned",
 ) -> dict[str, Any]:
+    if model_kind not in MODEL_KINDS:
+        raise ValueError(f"model_kind must be one of {MODEL_KINDS}")
     set_seed(config.seed)
     device = select_device(device_name)
     output_dir = Path(config.output_dir)
@@ -144,11 +183,17 @@ def train(
         shuffle=False,
         num_workers=0,
     )
-    model = ConstellationAutoencoder(
+    model_class = (
+        ConstellationAutoencoder if model_kind == "learned" else FPSAutoencoder
+    )
+    model = model_class(
         num_input_points=config.num_points,
         constellation_size=config.constellation_size,
         bits=config.bits,
     ).to(device)
+    # Encoder construction consumes random values only for the learned model.
+    # Reset here so both matched-rate runs see the same training-time jitter.
+    set_seed(config.seed)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
 
     started = time.perf_counter()
@@ -164,9 +209,16 @@ def train(
 
     result = {
         "config": asdict(config),
+        "model_kind": model_kind,
         "device": str(device),
         "torch_version": torch.__version__,
         "parameter_count": sum(parameter.numel() for parameter in model.parameters()),
+        "encoder_parameter_count": sum(
+            parameter.numel() for parameter in model.encoder.parameters()
+        ),
+        "decoder_parameter_count": sum(
+            parameter.numel() for parameter in model.decoder.parameters()
+        ),
         "coordinate_payload_bits": 3 * config.constellation_size * config.bits,
         "initial_validation": initial,
         "final_validation": history[-1]["validation"],
@@ -191,6 +243,7 @@ def main() -> None:
     parser.add_argument(
         "--device", default="auto", choices=("auto", "mps", "cuda", "cpu")
     )
+    parser.add_argument("--model", default="learned", choices=MODEL_KINDS)
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--output-dir")
     args = parser.parse_args()
@@ -200,7 +253,9 @@ def main() -> None:
         values["epochs"] = args.epochs
     if args.output_dir is not None:
         values["output_dir"] = args.output_dir
-    result = train(TrainingConfig(**values), device_name=args.device)
+    result = train(
+        TrainingConfig(**values), device_name=args.device, model_kind=args.model
+    )
     print(
         json.dumps({key: result[key] for key in result if key != "history"}, indent=2)
     )

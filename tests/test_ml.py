@@ -5,7 +5,11 @@ torch = pytest.importorskip("torch")
 
 from pointconstellation.data import FAMILIES, generate_sample  # noqa: E402
 from pointconstellation.losses import constellation_loss  # noqa: E402
-from pointconstellation.models import ConstellationAutoencoder  # noqa: E402
+from pointconstellation.models import (  # noqa: E402
+    ConstellationAutoencoder,
+    FarthestPointEncoder,
+    FPSAutoencoder,
+)
 from pointconstellation.quantization import (  # noqa: E402
     quantization_step,
     quantize_coordinates,
@@ -62,6 +66,33 @@ def test_autoencoder_contract_and_permutation_invariance() -> None:
     anchor_permutation = torch.randperm(8)
     permuted_reconstruction = model.decoder(constellation[:, anchor_permutation])
     assert torch.allclose(reconstruction, permuted_reconstruction, atol=2e-6)
+
+
+def test_fps_encoder_is_parameter_free_quantized_and_permutation_invariant() -> None:
+    encoder = FarthestPointEncoder(8, bits=10).eval()
+    points = torch.from_numpy(generate_sample(5, num_points=32).points)[None]
+
+    constellation = encoder(points)
+    permuted = encoder(points[:, torch.randperm(32)])
+
+    assert constellation.shape == (1, 8, 3)
+    assert sum(parameter.numel() for parameter in encoder.parameters()) == 0
+    assert torch.allclose(constellation, permuted, atol=2e-6)
+    step = quantization_step(10)
+    lattice = (constellation + 1.0) / step
+    assert torch.allclose(lattice, lattice.round(), atol=1e-5)
+
+
+def test_learned_and_fps_models_start_from_the_same_decoder() -> None:
+    torch.manual_seed(17)
+    learned = ConstellationAutoencoder(
+        num_input_points=32, constellation_size=8, bits=10
+    )
+    torch.manual_seed(17)
+    fps = FPSAutoencoder(num_input_points=32, constellation_size=8, bits=10)
+
+    for name, learned_value in learned.decoder.state_dict().items():
+        assert torch.equal(learned_value, fps.decoder.state_dict()[name])
 
 
 def test_one_training_step_has_finite_loss_and_gradients() -> None:

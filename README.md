@@ -37,7 +37,7 @@ vector in imperceptible coordinate perturbations.
 The complete rules are in the
 [representation contract](docs/representation-contract.md).
 
-## Current milestone: a falsifiable plane baseline
+## Current implementation
 
 The repository begins with a dependency-light, deterministic baseline:
 
@@ -47,8 +47,8 @@ The repository begins with a dependency-light, deterministic baseline:
 4. decode those unordered corners into a dense point sample; and
 5. report Chamfer RMSE, Hausdorff distance, and plane-fit error.
 
-This is not the final learned codec. It verifies the geometry-only API and
-provides a sanity-check that future models must beat.
+This analytic path is not the final learned codec. It verifies the
+geometry-only API and provides a sanity-check that learned models must beat.
 
 ```bash
 python -m venv .venv
@@ -78,9 +78,10 @@ quantized `K x 3` constellation. The decoder receives only those coordinates
 and learns to reconstruct dense geometry. The analytic plane implementation is
 only a contract test and sanity baseline.
 
-The first learned experiment will compare this coordinate-only constellation
-autoencoder against farthest-point sampling, learned simplification, a latent
-point model with feature channels, and conventional codecs at matched rates.
+The first learned experiment compares this coordinate-only constellation
+autoencoder against farthest-point sampling with the same decoder and raw
+coordinate rate. Later experiments add learned simplification, a latent point
+model with feature channels, and conventional codecs at matched coded rates.
 The decisive ablations are:
 
 - coordinates only versus coordinates plus latent features;
@@ -112,6 +113,20 @@ constellation, and 12-bit training quantization. Outputs go to ignored
 The first MPS run and its limitations are recorded in the
 [local smoke report](docs/experiment-001-local-smoke.md).
 
+Run the paired learned-versus-FPS gate with:
+
+```bash
+.venv-train/bin/python -m pointconstellation.compare \
+  --config configs/experiment_001_fps_comparison.json
+```
+
+Both models receive the same procedural data order, decoder architecture,
+decoder initialization, quantizer, 16-point constellation, and 576-bit raw
+coordinate budget. The learned model's validation Chamfer RMSE was 4.29% lower
+in the first local run and was lower for all seven procedural families. See the
+[matched FPS report](docs/experiment-001-fps-comparison.md) for the result and
+its important limitations.
+
 ## EmpireAI GPUs
 
 The repository includes secret-free EmpireAI tooling adapted from HalluLens:
@@ -124,9 +139,9 @@ is submitted automatically.
 
 ## Project status
 
-This repository is at research milestone 0. The plane codec is usable; claims
-about learned compression performance have not been made. Issues and small,
-reproducible experiments are welcome.
+This repository is entering research milestone 1. The plane codec and local ML
+experiment are usable; claims about competitive compression performance have
+not been made. Issues and small, reproducible experiments are welcome.
 
 ## License
 

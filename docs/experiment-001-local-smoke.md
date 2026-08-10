@@ -51,6 +51,7 @@ also reports a fixed coordinate payload rather than a complete serialized
 bitstream. Consequently, it does not show that learned constellations compress
 better than another representation.
 
-The next scientific gate is learned constellation versus FPS plus the same
-decoder at the same 576-bit coordinate payload, evaluated separately for each
-procedural family and on held-out parameter ranges.
+The next scientific gate—learned constellation versus FPS plus the same decoder
+at the same 576-bit coordinate payload—is now recorded in the
+[matched FPS report](experiment-001-fps-comparison.md). Evaluation on held-out
+parameter ranges remains open.

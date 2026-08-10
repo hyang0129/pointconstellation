@@ -12,6 +12,9 @@ All notable project changes will be recorded here.
 - Runnable procedural-data ML smoke experiment with a quantized `K x 3`
   bottleneck and MPS/CUDA/CPU device selection.
 - Reproducible Apple MPS smoke result showing a working local learning signal.
+- Deterministic quantized FPS encoder and matched-rate comparison runner.
+- Per-family validation metrics and a local learned-versus-FPS result at the
+  same 576-bit raw coordinate payload.
 - Four-point analytic codec for approximately planar clouds.
 - NumPy Chamfer RMSE and Hausdorff metrics.
 - Secret-free EmpireAI Jupyter allocation, connection, and GPU dispatch tooling.
