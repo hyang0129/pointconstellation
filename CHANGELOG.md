@@ -25,6 +25,9 @@ All notable project changes will be recorded here.
 - Local Experiment 002 result: monotonic learned curves passed the gate, longer
   training corrected the earlier flat-curve conclusion, and matched-decoder
   FPS isolated learned anchor generation as the next bottleneck.
+- Experiment 003 hard input-subset encoder, matched encoder-isolation sweep,
+  validation-only geometric gate, and local result identifying anchor collapse
+  plus missing constellation coverage as the next bottleneck.
 - Four-point analytic codec for approximately planar clouds.
 - NumPy Chamfer RMSE and Hausdorff metrics.
 - Secret-free EmpireAI Jupyter allocation, connection, and GPU dispatch tooling.

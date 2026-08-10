@@ -6,13 +6,19 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from pointconstellation.data import FAMILIES, generate_sample
+from pointconstellation.encoder_isolation import (
+    EncoderIsolationSpec,
+    encoder_isolation_gate,
+)
 from pointconstellation.losses import constellation_loss
 from pointconstellation.models import (
     ConstellationAutoencoder,
     FarthestPointEncoder,
     FPSAutoencoder,
+    HardSubsetConstellationEncoder,
     RelationAwareConstellationAutoencoder,
     RelationAwareFPSAutoencoder,
+    RelationAwareSubsetAutoencoder,
 )
 from pointconstellation.quantization import (
     quantization_step,
@@ -138,6 +144,49 @@ def test_relation_learned_and_fps_start_from_the_same_decoder() -> None:
         assert torch.equal(learned_value, fps.decoder.state_dict()[name])
 
 
+def test_hard_subset_encoder_selects_unique_quantized_input_points() -> None:
+    torch.manual_seed(31)
+    encoder = HardSubsetConstellationEncoder(8, bits=10).eval()
+    points = torch.from_numpy(generate_sample(4, num_points=32).points)[None]
+
+    constellation = encoder(points)
+    quantized_input = quantize_coordinates(points, 10)
+    distances = ((constellation[:, :, None] - quantized_input[:, None]) ** 2).sum(
+        dim=-1
+    )
+    permuted = encoder(points[:, torch.randperm(32)])
+
+    assert torch.all(distances.amin(dim=-1) < 1e-10)
+    assert len(torch.unique(constellation[0], dim=0)) == 8
+    assert torch.allclose(constellation, permuted, atol=2e-6)
+
+
+def test_hard_subset_straight_through_selection_has_finite_gradients() -> None:
+    torch.manual_seed(37)
+    encoder = HardSubsetConstellationEncoder(4, bits=10).train()
+    points = torch.from_numpy(generate_sample(2, num_points=16).points)[None]
+
+    constellation = encoder(points)
+    constellation.square().sum().backward()
+
+    assert encoder.selection_queries.weight.grad is not None
+    assert torch.isfinite(encoder.selection_queries.weight.grad).all()
+
+
+def test_relation_subset_and_fps_start_from_the_same_decoder() -> None:
+    torch.manual_seed(41)
+    subset = RelationAwareSubsetAutoencoder(
+        num_input_points=32, constellation_size=8, bits=10
+    )
+    torch.manual_seed(41)
+    fps = RelationAwareFPSAutoencoder(
+        num_input_points=32, constellation_size=8, bits=10
+    )
+
+    for name, subset_value in subset.decoder.state_dict().items():
+        assert torch.equal(subset_value, fps.decoder.state_dict()[name])
+
+
 def test_sweep_spec_validates_axes_and_pareto_frontier() -> None:
     with pytest.raises(ValueError, match="between 2 and num_points"):
         SweepSpec(TrainingConfig(num_points=32), (8, 64), (8, 12))
@@ -211,6 +260,43 @@ def test_selected_rate_spec_and_gate() -> None:
     )
     assert not failing["passed"]
     assert not failing["adjacency_passed"]
+
+
+def test_encoder_isolation_spec_and_validation_only_gate() -> None:
+    config = TrainingConfig(
+        num_points=32,
+        constellation_size=8,
+        parameter_ood_samples=7,
+    )
+    spec = EncoderIsolationSpec(config, (0.01, 0.05), (0.1, 1.0))
+    assert spec.max_surface_rmse == 0.01
+
+    runs = [
+        {
+            "condition": "fps",
+            "validation": {"chamfer_rmse": 0.1, "surface": 1e-8},
+            "parameter_ood": {"chamfer_rmse": 0.11, "surface": 1e-8},
+        },
+        {
+            "condition": "hard_subset",
+            "validation": {"chamfer_rmse": 0.104, "surface": 1e-8},
+            "parameter_ood": {"chamfer_rmse": 0.114, "surface": 1e-8},
+        },
+        {
+            "condition": "soft_t0p05_s0p1",
+            "validation": {"chamfer_rmse": 0.09, "surface": 4e-4},
+            "parameter_ood": {"chamfer_rmse": 0.09, "surface": 4e-4},
+        },
+    ]
+    gate = encoder_isolation_gate(
+        runs,
+        max_surface_rmse=0.01,
+        max_rmse_gap_vs_fps_percent=5.0,
+    )
+
+    assert gate["passed"]
+    assert gate["selected_condition"] == "hard_subset"
+    assert gate["validation_rmse_gap_vs_fps_percent"] == pytest.approx(4.0)
 
 
 def test_one_training_step_has_finite_loss_and_gradients() -> None:

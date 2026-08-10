@@ -6,10 +6,12 @@ from pointconstellation.models.autoencoder import (
     ConstellationEncoder,
     FarthestPointEncoder,
     FPSAutoencoder,
+    HardSubsetConstellationEncoder,
     RelationAwareConstellationAutoencoder,
     RelationAwareConstellationDecoder,
     RelationAwareConstellationEncoder,
     RelationAwareFPSAutoencoder,
+    RelationAwareSubsetAutoencoder,
 )
 
 __all__ = [
@@ -18,8 +20,10 @@ __all__ = [
     "ConstellationEncoder",
     "FarthestPointEncoder",
     "FPSAutoencoder",
+    "HardSubsetConstellationEncoder",
     "RelationAwareConstellationAutoencoder",
     "RelationAwareConstellationDecoder",
     "RelationAwareConstellationEncoder",
     "RelationAwareFPSAutoencoder",
+    "RelationAwareSubsetAutoencoder",
 ]

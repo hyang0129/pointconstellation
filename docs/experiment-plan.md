@@ -94,6 +94,13 @@ The [local result](experiment-002-relation-aware-result.md) passed the
 rate-utilization gate, corrected the earlier undertraining confound, and
 isolated learned anchor generation as the next bottleneck.
 
+[Experiment 003](experiment-003-encoder-isolation-plan.md) holds the
+relation-aware decoder controls constant and compares FPS, soft projection,
+and learned hard input-subset selection before adaptive-cardinality work.
+Its [local result](experiment-003-encoder-isolation-result.md) failed the
+predeclared gate and identified anchor collapse and missing input coverage as
+the next encoder objective.
+
 ## Dataset ladder
 
 1. Synthetic planes, corners, cylinders, spheres, thin structures, and mixtures.

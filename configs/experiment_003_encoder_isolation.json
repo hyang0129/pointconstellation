@@ -1,0 +1,23 @@
+{
+  "base_config": {
+    "num_points": 256,
+    "constellation_size": 16,
+    "bits": 12,
+    "train_samples": 448,
+    "validation_samples": 140,
+    "parameter_ood_samples": 140,
+    "batch_size": 8,
+    "epochs": 12,
+    "learning_rate": 0.001,
+    "surface_weight": 0.1,
+    "repulsion_weight": 0.01,
+    "projection_temperature": 0.05,
+    "selection_temperature": 0.1,
+    "seed": 7,
+    "output_dir": "artifacts/local/experiment_003_encoder_isolation"
+  },
+  "projection_temperatures": [0.005, 0.02, 0.05],
+  "surface_weights": [0.1, 1.0, 10.0],
+  "max_surface_rmse": 0.01,
+  "max_rmse_gap_vs_fps_percent": 5.0
+}

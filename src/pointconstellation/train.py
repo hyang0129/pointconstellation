@@ -22,14 +22,22 @@ from pointconstellation.models import (
     FPSAutoencoder,
     RelationAwareConstellationAutoencoder,
     RelationAwareFPSAutoencoder,
+    RelationAwareSubsetAutoencoder,
 )
 
-MODEL_KINDS = ("learned", "fps", "relation", "relation_fps")
+MODEL_KINDS = (
+    "learned",
+    "fps",
+    "relation",
+    "relation_fps",
+    "relation_subset",
+)
 MODEL_CLASSES = {
     "learned": ConstellationAutoencoder,
     "fps": FPSAutoencoder,
     "relation": RelationAwareConstellationAutoencoder,
     "relation_fps": RelationAwareFPSAutoencoder,
+    "relation_subset": RelationAwareSubsetAutoencoder,
 }
 
 
@@ -46,6 +54,8 @@ class TrainingConfig:
     learning_rate: float = 1e-3
     surface_weight: float = 0.1
     repulsion_weight: float = 0.01
+    projection_temperature: float = 0.05
+    selection_temperature: float = 0.1
     seed: int = 7
     output_dir: str = "artifacts/local/experiment_001_smoke"
 
@@ -210,10 +220,16 @@ def train(
             num_workers=0,
         )
     model_class = MODEL_CLASSES[model_kind]
+    model_options: dict[str, Any] = {}
+    if model_kind == "relation":
+        model_options["projection_temperature"] = config.projection_temperature
+    if model_kind == "relation_subset":
+        model_options["selection_temperature"] = config.selection_temperature
     model = model_class(
         num_input_points=config.num_points,
         constellation_size=config.constellation_size,
         bits=config.bits,
+        **model_options,
     ).to(device)
     # Model variants consume different numbers of initialization draws. Reset
     # here so matched runs see the same training-time jitter and data randomness.

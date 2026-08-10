@@ -167,6 +167,18 @@ same relation-aware decoder substantially outperformed learned anchors at
 K=16 and K=32. See the
 [Experiment 002 result](docs/experiment-002-relation-aware-result.md).
 
+Experiment 003 isolates that encoder gap with a learned hard input-subset
+selector and a projection-temperature/surface-loss grid:
+
+```bash
+.venv-train/bin/python -m pointconstellation.encoder_isolation \
+  --config configs/experiment_003_encoder_isolation.json
+```
+
+The hard selector produces genuine quantized input subsets but remained 28.12%
+worse than FPS on validation. All soft encoders collapsed their anchors. See
+the [Experiment 003 result](docs/experiment-003-encoder-isolation-result.md).
+
 ## EmpireAI GPUs
 
 The repository includes secret-free EmpireAI tooling adapted from HalluLens:

@@ -159,8 +159,11 @@ class RelationAwareConstellationEncoder(nn.Module):
             raise ValueError("constellation_size must be at least 2")
         if feature_width % num_heads:
             raise ValueError("feature_width must be divisible by num_heads")
+        if projection_temperature <= 0:
+            raise ValueError("projection_temperature must be positive")
         self.constellation_size = constellation_size
         self.bits = bits
+        self.feature_width = feature_width
         self.projection_temperature = projection_temperature
         self.point_embedding = nn.Sequential(
             nn.Linear(3, feature_width),
@@ -194,7 +197,7 @@ class RelationAwareConstellationEncoder(nn.Module):
             nn.Tanh(),
         )
 
-    def forward(self, points: Tensor) -> Tensor:
+    def _query_features(self, points: Tensor) -> tuple[Tensor, Tensor]:
         if points.ndim != 3 or points.shape[-1] != 3:
             raise ValueError("points must have shape (batch, N, 3)")
         context = self.point_relations(self.point_embedding(points))
@@ -202,11 +205,75 @@ class RelationAwareConstellationEncoder(nn.Module):
         attended, _ = self.anchor_attention(
             queries, context, context, need_weights=False
         )
-        proposals = self.proposal_head(self.anchor_norm(queries + attended))
+        return context, self.anchor_norm(queries + attended)
+
+    def forward(self, points: Tensor) -> Tensor:
+        _, query_features = self._query_features(points)
+        proposals = self.proposal_head(query_features)
 
         squared = ((proposals[:, :, None, :] - points[:, None, :, :]) ** 2).sum(dim=-1)
         weights = torch.softmax(-squared / self.projection_temperature, dim=-1)
         anchors = torch.einsum("bkn,bnd->bkd", weights, points)
+        return quantize_ste(anchors, self.bits, training=self.training)
+
+
+class HardSubsetConstellationEncoder(RelationAwareConstellationEncoder):
+    """Select unique input points with straight-through learned assignments."""
+
+    def __init__(
+        self,
+        constellation_size: int,
+        *,
+        bits: int = 12,
+        feature_width: int = 96,
+        num_heads: int = 4,
+        num_layers: int = 2,
+        selection_temperature: float = 0.1,
+    ) -> None:
+        if selection_temperature <= 0:
+            raise ValueError("selection_temperature must be positive")
+        super().__init__(
+            constellation_size,
+            bits=bits,
+            feature_width=feature_width,
+            num_heads=num_heads,
+            num_layers=num_layers,
+        )
+        del self.proposal_head
+        self.selection_temperature = selection_temperature
+        self.selection_queries = nn.Linear(feature_width, feature_width, bias=False)
+        self.selection_keys = nn.Linear(feature_width, feature_width, bias=False)
+
+    def forward(self, points: Tensor) -> Tensor:
+        if points.ndim != 3 or points.shape[-1] != 3:
+            raise ValueError("points must have shape (batch, N, 3)")
+        if self.constellation_size > points.shape[1]:
+            raise ValueError("constellation_size cannot exceed the input point count")
+        context, query_features = self._query_features(points)
+        queries = self.selection_queries(query_features)
+        keys = self.selection_keys(context)
+        scores = torch.einsum("bkd,bnd->bkn", queries, keys)
+        scores = scores / math.sqrt(self.feature_width)
+        scores = scores / self.selection_temperature
+
+        available = torch.ones(points.shape[:2], dtype=torch.bool, device=points.device)
+        selected_anchors = []
+        for query_index in range(self.constellation_size):
+            masked_scores = scores[:, query_index].masked_fill(
+                ~available, torch.finfo(scores.dtype).min
+            )
+            soft_weights = torch.softmax(masked_scores, dim=-1)
+            selected_indices = masked_scores.argmax(dim=-1, keepdim=True)
+            hard_weights = torch.zeros_like(soft_weights).scatter(
+                1, selected_indices, 1.0
+            )
+            weights = hard_weights
+            if self.training:
+                weights = hard_weights + soft_weights - soft_weights.detach()
+            selected_anchors.append(torch.einsum("bn,bnd->bd", weights, points))
+            available = available.scatter(1, selected_indices, False)
+
+        anchors = torch.stack(selected_anchors, dim=1)
         return quantize_ste(anchors, self.bits, training=self.training)
 
 
@@ -325,10 +392,41 @@ class RelationAwareConstellationAutoencoder(nn.Module):
         num_input_points: int,
         constellation_size: int,
         bits: int = 12,
+        projection_temperature: float = 0.05,
     ) -> None:
         super().__init__()
         self.decoder = RelationAwareConstellationDecoder(num_input_points)
-        self.encoder = RelationAwareConstellationEncoder(constellation_size, bits=bits)
+        self.encoder = RelationAwareConstellationEncoder(
+            constellation_size,
+            bits=bits,
+            projection_temperature=projection_temperature,
+        )
+
+    def forward(self, points: Tensor) -> tuple[Tensor, Tensor]:
+        constellation = self.encoder(points)
+        if constellation.shape != (len(points), self.encoder.constellation_size, 3):
+            raise RuntimeError("encoder violated the strict K x 3 bottleneck")
+        return self.decoder(constellation), constellation
+
+
+class RelationAwareSubsetAutoencoder(nn.Module):
+    """Learn a quantized hard input subset for the relation-aware decoder."""
+
+    def __init__(
+        self,
+        *,
+        num_input_points: int,
+        constellation_size: int,
+        bits: int = 12,
+        selection_temperature: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.decoder = RelationAwareConstellationDecoder(num_input_points)
+        self.encoder = HardSubsetConstellationEncoder(
+            constellation_size,
+            bits=bits,
+            selection_temperature=selection_temperature,
+        )
 
     def forward(self, points: Tensor) -> tuple[Tensor, Tensor]:
         constellation = self.encoder(points)
