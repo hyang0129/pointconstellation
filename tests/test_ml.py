@@ -1,16 +1,18 @@
+# ruff: noqa: E402, I001
+
 import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from pointconstellation.data import FAMILIES, generate_sample  # noqa: E402
-from pointconstellation.losses import constellation_loss  # noqa: E402
-from pointconstellation.models import (  # noqa: E402
+from pointconstellation.data import FAMILIES, generate_sample
+from pointconstellation.losses import constellation_loss
+from pointconstellation.models import (
     ConstellationAutoencoder,
     FarthestPointEncoder,
     FPSAutoencoder,
 )
-from pointconstellation.quantization import (  # noqa: E402
+from pointconstellation.quantization import (
     quantization_step,
     quantize_coordinates,
     quantize_ste,
