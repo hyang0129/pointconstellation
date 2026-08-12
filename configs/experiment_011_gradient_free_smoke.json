@@ -1,0 +1,30 @@
+{
+  "num_points": 16,
+  "input_size": 16,
+  "constellation_size": 4,
+  "bits": 8,
+  "train_samples": 8,
+  "validation_samples": 3,
+  "parameter_ood_samples": 3,
+  "batch_size": 4,
+  "decoder_epochs": 1,
+  "decoder_learning_rate": 0.001,
+  "feature_width": 16,
+  "num_heads": 4,
+  "num_layers": 1,
+  "start_kinds": [
+    "fps",
+    "random"
+  ],
+  "population_size": 4,
+  "generations": 2,
+  "cem_elite_fraction": 0.5,
+  "cem_initial_std": 0.15,
+  "cem_minimum_std": 0.01,
+  "mutation_swaps": 1,
+  "adam_learning_rate": 0.04,
+  "perturbation_samples": 3,
+  "decoder_checkpoint": null,
+  "seed": 7,
+  "output_dir": "artifacts/local/experiment_011_gradient_free_smoke"
+}

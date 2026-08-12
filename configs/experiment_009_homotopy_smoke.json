@@ -1,0 +1,23 @@
+{
+  "num_points": 32,
+  "input_size": 32,
+  "stage_sizes": [16, 8, 4],
+  "bits": 10,
+  "train_samples": 14,
+  "validation_samples": 7,
+  "parameter_ood_samples": 7,
+  "batch_size": 7,
+  "decoder_epochs": 1,
+  "encoder_epochs_per_stage": 1,
+  "decoder_learning_rate": 0.001,
+  "encoder_learning_rate": 0.001,
+  "coverage_weight": 0.05,
+  "feature_width": 24,
+  "num_heads": 4,
+  "num_layers": 1,
+  "merge_temperature": 0.2,
+  "maximum_update": 0.08,
+  "decoder_checkpoint": null,
+  "seed": 7,
+  "output_dir": "artifacts/local/experiment_009_homotopy_smoke"
+}

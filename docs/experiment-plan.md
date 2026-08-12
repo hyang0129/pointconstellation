@@ -101,6 +101,35 @@ Its [local result](experiment-003-encoder-isolation-result.md) failed the
 predeclared gate and identified anchor collapse and missing input coverage as
 the next encoder objective.
 
+[Experiment 004](experiment-004-frozen-decoder-plan.md) decouples completion
+from selection by training one decoder across input sizes and coordinate rates,
+then freezing it for all encoder controls. Its
+[local result](experiment-004-frozen-decoder-result.md) established a monotonic
+shared-decoder FPS curve but rejected the progressive learned subset. A
+per-cloud free-coordinate oracle beat the best sampled subset by approximately
+15% while moving materially away from the finite target samples. The current
+metric does not establish distance to the underlying continuous surface, and
+the two conditions used different random candidate pools. The resulting
+[co-adaptation and constellation inference hypotheses](co-adaptation-hypotheses.md)
+separate amortization, decoder-basin, set-allocation, discrete-assignment, and
+private-protocol explanations before choosing the next gate. The next gate must
+target one or more of those mechanisms explicitly, not proceed directly to
+adaptive cardinality or a larger decoder.
+
+The three resulting implementation paths now have separate runnable prototypes:
+a competitive semi-amortized refiner, a noise-trained coordinate auto-decoder,
+and gated conditional set diffusion. Their [implementation report and CPU smoke
+results](experiment-005-007-prototypes.md) retain the refiner as the recommended
+next scaling target.
+
+That scale test and five additional fan-out mechanisms are now implemented.
+The [corrected scale result](experiment-005-refiner-scale-result.md) isolates
+legal input-only decoder-gradient feedback from a no-feedback arm. The
+[Experiments 008-012 report](experiment-008-012-fanout.md) covers balanced
+transport, homotopy, decoder populations, gradient-free search, and
+autoregressive pointer selection. These remain fixed-rate mechanism tests;
+adaptive cardinality stays behind the fixed-`K` inference gate.
+
 ## Dataset ladder
 
 1. Synthetic planes, corners, cylinders, spheres, thin structures, and mixtures.

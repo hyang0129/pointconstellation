@@ -10,15 +10,21 @@ from pointconstellation.encoder_isolation import (
     EncoderIsolationSpec,
     encoder_isolation_gate,
 )
+from pointconstellation.bottleneck_audit import (
+    BottleneckAuditConfig,
+    bottleneck_audit_gate,
+)
 from pointconstellation.losses import constellation_loss
 from pointconstellation.models import (
     ConstellationAutoencoder,
     FarthestPointEncoder,
     FPSAutoencoder,
     HardSubsetConstellationEncoder,
+    ProgressiveSubsetEncoder,
     RelationAwareConstellationAutoencoder,
     RelationAwareFPSAutoencoder,
     RelationAwareSubsetAutoencoder,
+    VariableConstellationDecoder,
 )
 from pointconstellation.quantization import (
     quantization_step,
@@ -185,6 +191,119 @@ def test_relation_subset_and_fps_start_from_the_same_decoder() -> None:
 
     for name, subset_value in subset.decoder.state_dict().items():
         assert torch.equal(subset_value, fps.decoder.state_dict()[name])
+
+
+def test_progressive_subset_encoder_is_nested_quantized_and_differentiable() -> None:
+    torch.manual_seed(43)
+    encoder = ProgressiveSubsetEncoder(8, bits=10).eval()
+    points = torch.from_numpy(generate_sample(3, num_points=32).points)[None]
+
+    small = encoder(points, 4)
+    large = encoder(points, 8)
+    quantized_input = quantize_coordinates(points, 10)
+    membership = ((small[:, :, None] - large[:, None]) ** 2).sum(dim=-1)
+    input_membership = ((large[:, :, None] - quantized_input[:, None]) ** 2).sum(dim=-1)
+    permuted = encoder(points[:, torch.randperm(32)], 8)
+    permutation_membership = ((large[:, :, None] - permuted[:, None]) ** 2).sum(dim=-1)
+
+    assert torch.all(membership.amin(dim=-1) < 1e-10)
+    assert torch.all(input_membership.amin(dim=-1) < 1e-10)
+    assert len(torch.unique(large[0], dim=0)) == 8
+    assert torch.all(permutation_membership.amin(dim=-1) < 1e-10)
+
+    encoder.train()
+    constellation = encoder(points, 4)
+    constellation.square().sum().backward()
+    assert encoder.score_head[-1].weight.grad is not None
+    assert torch.isfinite(encoder.score_head[-1].weight.grad).all()
+
+
+def test_variable_decoder_preserves_anchors_and_accepts_variable_sizes() -> None:
+    torch.manual_seed(47)
+    decoder = VariableConstellationDecoder(32, 8).eval()
+    points = torch.from_numpy(generate_sample(1, num_points=32).points)[None]
+    anchors = quantize_coordinates(points[:, :8], 10)
+
+    small = decoder(anchors[:, :4], num_output_points=16)
+    large = decoder(anchors, num_output_points=24)
+    permuted_anchors = anchors[:, torch.randperm(8)]
+    permuted = decoder(permuted_anchors, num_output_points=24)
+
+    assert small.shape == (1, 16, 3)
+    assert large.shape == (1, 24, 3)
+    assert torch.equal(small[:, :4], anchors[:, :4])
+    assert torch.equal(large[:, :8], anchors)
+    assert torch.equal(permuted[:, :8], permuted_anchors)
+    assert torch.allclose(large[:, 8:], permuted[:, 8:], atol=2e-6)
+
+
+def test_bottleneck_audit_config_and_gate() -> None:
+    config = BottleneckAuditConfig(
+        num_points=32,
+        input_sizes=(16, 32),
+        constellation_sizes=(4, 8, 16),
+        primary_input_size=32,
+        primary_constellation_size=8,
+        train_samples=7,
+        validation_samples=7,
+        parameter_ood_samples=7,
+        decoder_epochs=1,
+        selector_epochs=1,
+        oracle_trials=2,
+        free_oracle_steps=2,
+    )
+    assert config.primary_constellation_size == 8
+
+    runs = []
+    for size, rmse in ((4, 0.12), (8, 0.10), (16, 0.09)):
+        runs.append(
+            {
+                "condition": "fps",
+                "input_size": 32,
+                "constellation_size": size,
+                "validation": {"chamfer_rmse": rmse},
+                "parameter_ood": {"chamfer_rmse": rmse + 0.01},
+            }
+        )
+    runs.extend(
+        [
+            {
+                "condition": "learned",
+                "input_size": 32,
+                "constellation_size": 8,
+                "validation": {"chamfer_rmse": 0.104},
+                "parameter_ood": {"chamfer_rmse": 0.114},
+            },
+            {
+                "condition": "best_subset",
+                "input_size": 32,
+                "constellation_size": 8,
+                "validation": {"chamfer_rmse": 0.10},
+                "parameter_ood": {"chamfer_rmse": 0.11},
+            },
+            {
+                "condition": "free_coordinates",
+                "input_size": 32,
+                "constellation_size": 8,
+                "validation": {"chamfer_rmse": 0.09},
+                "parameter_ood": {"chamfer_rmse": 0.099},
+            },
+        ]
+    )
+    gate = bottleneck_audit_gate(
+        runs,
+        primary_input_size=32,
+        primary_constellation_size=8,
+        min_endpoint_improvement_percent=1.0,
+        max_adjacent_regression_percent=0.5,
+        max_learned_gap_vs_fps_percent=5.0,
+        free_coordinate_headroom_percent=5.0,
+        decoder_unchanged=True,
+    )
+
+    assert gate["passed"]
+    assert gate["free_coordinate_headroom_detected"]
+    assert gate["validation_learned_gap_vs_fps_percent"] == pytest.approx(4.0)
 
 
 def test_sweep_spec_validates_axes_and_pareto_frontier() -> None:

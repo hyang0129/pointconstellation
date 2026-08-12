@@ -179,6 +179,61 @@ The hard selector produces genuine quantized input subsets but remained 28.12%
 worse than FPS on validation. All soft encoders collapsed their anchors. See
 the [Experiment 003 result](docs/experiment-003-encoder-isolation-result.md).
 
+Experiment 004 separates decoder learning from encoder selection. One
+completion decoder is trained across variable input and constellation sizes,
+then frozen while FPS, random, learned progressive subsets, best-of-sampled
+subsets, and free coordinates are compared:
+
+```bash
+.venv-train/bin/python -m pointconstellation.bottleneck_audit \
+  --config configs/experiment_004_frozen_decoder.json
+```
+
+The shared decoder produced a clean monotonic FPS rate curve, but the learned
+subset remained 41.65% worse than FPS on validation. Per-cloud free coordinates
+beat the best sampled subset by 15.60% while moving away from observed samples;
+the conditions used different random candidate pools and the current metric
+does not establish continuous-surface distance. See the
+[Experiment 004 result](docs/experiment-004-frozen-decoder-result.md).
+
+### Three constellation-inference prototypes
+
+The co-adaptation review produced three implemented experiment paths:
+
+```bash
+# Competitive semi-amortized refinement against a frozen decoder.
+.venv-train/bin/python -m pointconstellation.refiner_experiment \
+  --config configs/experiment_005_refiner_smoke.json --device cpu
+
+# Coordinate auto-decoder, noisy neighborhoods, and held-out amortization.
+.venv-train/bin/python -m pointconstellation.auto_decoder_experiment \
+  --config configs/experiment_006_auto_decoder_smoke.json --device cpu
+
+# Multimodality-gated conditional set diffusion from noisy FPS.
+.venv-train/bin/python -m pointconstellation.diffusion_experiment \
+  --config configs/experiment_007_set_diffusion_smoke.json --device cpu
+```
+
+All three are CPU-runnable and retain a coordinate-only transmitted message.
+The first smoke run favors the competitive refiner: its free-coordinate output
+improved validation at all tested points, whereas auto-decoder gains were small
+and diffusion remained worse than FPS. See the [prototype implementation
+report](docs/experiment-005-007-prototypes.md) for architectures, metrics, and
+caveats.
+
+The corrected [scaled refiner run](docs/experiment-005-refiner-scale-result.md)
+improved the primary `N=256, K=16` validation RMSE from `0.18261` to `0.14073`
+with free coordinates and `0.15625` after strict unique projection to input
+points. A no-decoder-gradient arm reached `0.17334`, isolating a smaller learned
+refinement gain from the larger, legal input-only gradient-feedback gain.
+
+Five more co-adaptation hypotheses are implemented in Experiments 008-012:
+balanced transport, compression homotopy, decoder populations/cross-play,
+gradient-free search, and autoregressive pointer selection. Their [fan-out
+report](docs/experiment-008-012-fanout.md) records matched contracts, corrected
+controls, smoke results, and the decision to keep the competitive refiner as
+the leading scale direction.
+
 ## EmpireAI GPUs
 
 The repository includes secret-free EmpireAI tooling adapted from HalluLens:
