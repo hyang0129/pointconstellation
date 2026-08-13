@@ -45,6 +45,7 @@ class RefinerExperimentConfig:
     maximum_update: float = 0.1
     use_decoder_gradient: bool = True
     decoder_checkpoint: str | None = None
+    data_seed: int | None = None
     seed: int = 7
     output_dir: str = "artifacts/local/experiment_005_refiner_smoke"
 
@@ -105,11 +106,12 @@ def _make_loaders(
     DataLoader[dict[str, Any]],
     DataLoader[dict[str, Any]],
 ]:
+    data_seed = config.seed if config.data_seed is None else config.data_seed
     datasets = {
         split: ProceduralPointCloudDataset(
             size,
             num_points=config.num_points,
-            seed=config.seed,
+            seed=data_seed,
             split=split,
         )
         for split, size in (
@@ -220,16 +222,18 @@ def _train_refiner(
     loader: DataLoader[dict[str, Any]],
     device: torch.device,
     config: RefinerExperimentConfig,
-) -> list[dict[str, float | int]]:
+) -> tuple[list[dict[str, float | int]], str]:
     decoder.eval().requires_grad_(False)
     optimizer = torch.optim.Adam(refiner.parameters(), lr=config.refiner_learning_rate)
     history: list[dict[str, float | int]] = []
+    order_digest = hashlib.sha256()
     global_step = 0
     for epoch in range(1, config.refiner_epochs + 1):
         refiner.train()
         total = 0.0
         count = 0
         for batch in loader:
+            order_digest.update(batch["sample_id"].cpu().numpy().tobytes())
             target = batch["points"].to(device)
             input_size = config.input_sizes[global_step % len(config.input_sizes)]
             constellation_size = config.constellation_sizes[
@@ -266,7 +270,7 @@ def _train_refiner(
         }
         history.append(record)
         print(json.dumps({"stage": "refiner", **record}))
-    return history
+    return history, order_digest.hexdigest()
 
 
 def _sample_metrics(
@@ -358,7 +362,7 @@ def run_refiner_experiment(
     device = select_device(device_name)
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    train_loader, validation_loader, ood_loader = _make_loaders(config)
+    decoder_train_loader, validation_loader, ood_loader = _make_loaders(config)
     decoder = VariableConstellationDecoder(
         config.num_points,
         max(config.constellation_sizes),
@@ -390,7 +394,7 @@ def run_refiner_experiment(
         decoder_history = checkpoint.get("history", [])
         decoder_source = str(checkpoint_path)
     else:
-        decoder_history = _train_decoder(decoder, train_loader, device, config)
+        decoder_history = _train_decoder(decoder, decoder_train_loader, device, config)
         torch.save(
             {"model": decoder.state_dict(), "history": decoder_history},
             output_dir / "decoder.pt",
@@ -398,7 +402,18 @@ def run_refiner_experiment(
 
     decoder.eval().requires_grad_(False)
     decoder_hash_before = _state_hash(decoder)
-    refiner_history = _train_refiner(refiner, decoder, train_loader, device, config)
+    refiner_hash_before = _state_hash(refiner)
+    # Decoder training consumes random numbers (including quantizer jitter).
+    # Reset here so a freshly trained decoder arm and a checkpoint-loaded
+    # control see the same refiner-time random stream.
+    set_seed(config.seed)
+    # Recreate the loader so decoder training cannot alter the refiner's batch
+    # order.  Checkpoint-loaded and freshly trained decoder arms are therefore
+    # matched under the same refiner seed.
+    refiner_train_loader, _, _ = _make_loaders(config)
+    refiner_history, refiner_training_order_hash = _train_refiner(
+        refiner, decoder, refiner_train_loader, device, config
+    )
     decoder_hash_after = _state_hash(decoder)
     decoder_unchanged = decoder_hash_before == decoder_hash_after
     if not decoder_unchanged:
@@ -439,6 +454,8 @@ def run_refiner_experiment(
         "decoder_hash_before_refiner": decoder_hash_before,
         "decoder_hash_after_refiner": decoder_hash_after,
         "decoder_unchanged": decoder_unchanged,
+        "refiner_hash_before_training": refiner_hash_before,
+        "refiner_training_order_hash": refiner_training_order_hash,
         "decoder_parameter_count": sum(
             parameter.numel() for parameter in decoder.parameters()
         ),

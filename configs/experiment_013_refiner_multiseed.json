@@ -1,0 +1,11 @@
+{
+  "base_experiment_config": "configs/experiment_005_refiner_scale.json",
+  "model_seeds": [7, 17, 29],
+  "data_seed": 7,
+  "primary_input_size": 256,
+  "primary_constellation_size": 16,
+  "bootstrap_samples": 10000,
+  "bootstrap_seed": 20260813,
+  "confidence_level": 0.95,
+  "output_dir": "artifacts/local/experiment_013_refiner_multiseed"
+}

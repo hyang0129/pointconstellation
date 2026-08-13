@@ -16,6 +16,12 @@ produce a variable-size reconstruction. A raw/pass-through mode is a required
 endpoint when constellation coding does not improve the rate-distortion trade.
 The [adaptive codec target](adaptive-codec.md) defines this direction.
 
+The immediate uncertainty-reduction program is the
+[month-one paper-viability sprint](month-1-paper-viability-sprint.md). It tests
+multi-seed reproducibility, underlying-surface semantics, external transfer,
+honest rate plausibility, and inference headroom before the full ICLR/NeurIPS
+benchmark campaign.
+
 ## Milestone 0: analytic primitives
 
 Validate the representation contract with deterministic codecs:
@@ -129,6 +135,13 @@ legal input-only decoder-gradient feedback from a no-feedback arm. The
 transport, homotopy, decoder populations, gradient-free search, and
 autoregressive pointer selection. These remain fixed-rate mechanism tests;
 adaptive cardinality stays behind the fixed-`K` inference gate.
+
+[Experiment 013](experiment-013-refiner-multiseed-result.md) is the first
+paper-quality benchmark slice of that direction. Three independently trained
+decoder/refiner seeds confirm a primary `N=256, K=16, q=12` gain over FPS with
+paired hierarchical-bootstrap intervals on validation and parameter OOD. It
+passes the primary procedural replication gate; precision scaling,
+fresh-surface semantics, external transfer, and actual coded rate remain open.
 
 ## Dataset ladder
 

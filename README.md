@@ -227,6 +227,14 @@ with free coordinates and `0.15625` after strict unique projection to input
 points. A no-decoder-gradient arm reached `0.17334`, isolating a smaller learned
 refinement gain from the larger, legal input-only gradient-feedback gain.
 
+The first [multi-seed benchmark](docs/experiment-013-refiner-multiseed-result.md)
+replicated that primary result with three independently trained decoders and
+paired statistics. At `N=256, K=16, q=12`, free input-gradient constellations
+beat FPS by 23.33% on validation (95% CI 20.44-26.62) and 25.13% on
+parameter OOD (20.73-29.50); post-hoc strict projection retained 14.51% and
+15.18% gains. This passes the procedural primary-point gate but is not yet an
+external-data or actual-rate compression claim.
+
 Five more co-adaptation hypotheses are implemented in Experiments 008-012:
 balanced transport, compression homotopy, decoder populations/cross-play,
 gradient-free search, and autoregressive pointer selection. Their [fan-out
@@ -246,10 +254,12 @@ is submitted automatically.
 
 ## Project status
 
-This repository is in research milestone 1. The plane codec, fixed-rate ML
-baselines, rate sweeps, and relation-aware architectural control are runnable;
-claims about competitive compression performance have not been made. Issues
-and small, reproducible experiments are welcome.
+This repository is in research milestone 1 and is working toward a
+theory-backed, comprehensively benchmarked ICLR/NeurIPS-quality paper. The
+plane codec, fixed-rate ML baselines, rate sweeps, and refiner benchmarks are
+runnable; claims about competitive general-purpose compression performance
+have not been made. The [paper benchmark epic](https://github.com/hyang0129/pointconstellation/issues/3)
+tracks the remaining evidence.
 
 ## License
 
