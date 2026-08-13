@@ -1,0 +1,11 @@
+{
+  "defaults": {
+    "python": "${HOME}/pointconstellation/.venv/bin/python",
+    "project_root": "${HOME}/pointconstellation",
+    "job_manifest": "artifacts/empire/gpu_jobs.json",
+    "max_concurrent_jobs": 1,
+    "kernel_name": "p311",
+    "jupyter_password_env": "POINTCONSTELLATION_JUPYTER_PASSWORD"
+  },
+  "nodes": []
+}

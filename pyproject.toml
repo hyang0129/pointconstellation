@@ -28,14 +28,22 @@ Homepage = "https://github.com/hyang0129/pointconstellation"
 Issues = "https://github.com/hyang0129/pointconstellation/issues"
 
 [project.optional-dependencies]
+cluster = [
+  "requests>=2.31",
+  "websocket-client>=1.7",
+]
 dev = [
   "pytest>=8",
   "ruff>=0.6",
+]
+train = [
+  "torch>=2.2",
 ]
 
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["tests"]
+pythonpath = ["src"]
 
 [tool.ruff]
 line-length = 88

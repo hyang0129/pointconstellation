@@ -10,7 +10,19 @@ The initial target is lossy static geometry without color. Attributes, temporal
 coding, and lossless reconstruction are out of scope until this question is
 answered.
 
-## Milestone 0: analytic primitives (current)
+The intended codec is not permanently fixed-rate. It must eventually accept a
+variable number of input points, select a variable constellation size, and
+produce a variable-size reconstruction. A raw/pass-through mode is a required
+endpoint when constellation coding does not improve the rate-distortion trade.
+The [adaptive codec target](adaptive-codec.md) defines this direction.
+
+The immediate uncertainty-reduction program is the
+[month-one paper-viability sprint](month-1-paper-viability-sprint.md). It tests
+multi-seed reproducibility, underlying-surface semantics, external transfer,
+honest rate plausibility, and inference headroom before the full ICLR/NeurIPS
+benchmark campaign.
+
+## Milestone 0: analytic primitives
 
 Validate the representation contract with deterministic codecs:
 
@@ -24,7 +36,7 @@ Validate the representation contract with deterministic codecs:
 Success means stable permutation-invariant decoding and transparent distortion
 measurements. It does not establish learned compression performance.
 
-## Milestone 1: learned fixed-rate autoencoder
+## Milestone 1: learned fixed-rate autoencoder (current)
 
 Use a fixed input size `N` and constellation size `K`.
 
@@ -74,6 +86,62 @@ Use identical train/test data and preprocessing.
 | Is it competitive? | Draco, MPEG G-PCC, and JPEG Pleno where runnable reference code is available |
 
 Compare rate-distortion curves, not a single `K`.
+
+The first fixed-rate sweep is recorded in the
+[rate sweep report](experiment-001-rate-sweep.md). The learned model beat FPS
+at every tested point but produced an essentially flat curve, so a
+relation-aware decoder is required before adaptive-`K` training.
+
+The next architectural gate is defined in the
+[Experiment 002 relation-aware plan](experiment-002-relation-aware-plan.md).
+It compares longer legacy, relation-aware learned, and matched-decoder FPS
+curves at selected rates on both in-distribution and parameter-OOD geometry.
+The [local result](experiment-002-relation-aware-result.md) passed the
+rate-utilization gate, corrected the earlier undertraining confound, and
+isolated learned anchor generation as the next bottleneck.
+
+[Experiment 003](experiment-003-encoder-isolation-plan.md) holds the
+relation-aware decoder controls constant and compares FPS, soft projection,
+and learned hard input-subset selection before adaptive-cardinality work.
+Its [local result](experiment-003-encoder-isolation-result.md) failed the
+predeclared gate and identified anchor collapse and missing input coverage as
+the next encoder objective.
+
+[Experiment 004](experiment-004-frozen-decoder-plan.md) decouples completion
+from selection by training one decoder across input sizes and coordinate rates,
+then freezing it for all encoder controls. Its
+[local result](experiment-004-frozen-decoder-result.md) established a monotonic
+shared-decoder FPS curve but rejected the progressive learned subset. A
+per-cloud free-coordinate oracle beat the best sampled subset by approximately
+15% while moving materially away from the finite target samples. The current
+metric does not establish distance to the underlying continuous surface, and
+the two conditions used different random candidate pools. The resulting
+[co-adaptation and constellation inference hypotheses](co-adaptation-hypotheses.md)
+separate amortization, decoder-basin, set-allocation, discrete-assignment, and
+private-protocol explanations before choosing the next gate. The next gate must
+target one or more of those mechanisms explicitly, not proceed directly to
+adaptive cardinality or a larger decoder.
+
+The three resulting implementation paths now have separate runnable prototypes:
+a competitive semi-amortized refiner, a noise-trained coordinate auto-decoder,
+and gated conditional set diffusion. Their [implementation report and CPU smoke
+results](experiment-005-007-prototypes.md) retain the refiner as the recommended
+next scaling target.
+
+That scale test and five additional fan-out mechanisms are now implemented.
+The [corrected scale result](experiment-005-refiner-scale-result.md) isolates
+legal input-only decoder-gradient feedback from a no-feedback arm. The
+[Experiments 008-012 report](experiment-008-012-fanout.md) covers balanced
+transport, homotopy, decoder populations, gradient-free search, and
+autoregressive pointer selection. These remain fixed-rate mechanism tests;
+adaptive cardinality stays behind the fixed-`K` inference gate.
+
+[Experiment 013](experiment-013-refiner-multiseed-result.md) is the first
+paper-quality benchmark slice of that direction. Three independently trained
+decoder/refiner seeds confirm a primary `N=256, K=16, q=12` gain over FPS with
+paired hierarchical-bootstrap intervals on validation and parameter OOD. It
+passes the primary procedural replication gate; precision scaling,
+fresh-surface semantics, external transfer, and actual coded rate remain open.
 
 ## Dataset ladder
 
@@ -126,3 +194,18 @@ Proceed if the coordinate-only model:
 Reframe the idea as learned simplification or hybrid primitive coding if it
 requires high-precision off-surface anchors, feature channels, or a category-
 specific decoder to work.
+
+## Milestone 2: adaptive variable-rate set codec
+
+Replace independently trained fixed-`K` models with one set-to-set model that:
+
+- accepts variable input cardinality `N`;
+- selects `K` per cloud under an explicit rate objective;
+- reconstructs a variable cardinality `M` without dropping transmitted points;
+- can choose quantized raw pass-through when compression is counterproductive;
+- exposes no per-point features at the bottleneck; and
+- counts mode, cardinality, precision, bounds, and entropy syntax in the rate.
+
+Begin with a masked point/set transformer and learned token halting. Treat a
+conditional diffusion decoder as a later reconstruction-quality ablation, not
+as a change to the coordinate-only message.

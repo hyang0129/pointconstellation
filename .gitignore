@@ -4,8 +4,10 @@ __pycache__/
 .coverage
 .pytest_cache/
 .ruff_cache/
-.venv/
+.venv*/
+.env
 build/
 dist/
 artifacts/
-data/
+configs/empire.nodes.json
+/data/
