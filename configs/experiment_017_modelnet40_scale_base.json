@@ -1,0 +1,111 @@
+{
+  "profile_name": "modelnet40_official_split_scale",
+  "evaluation_methods": ["fps", "free", "strict_subset"],
+  "distance_chunk_size": 256,
+  "sliced_directions": 32,
+  "peak_distance": 2.0,
+  "dataset_kind": "mesh_manifest",
+  "dataset_root": "data/modelnet40_official/ModelNet40",
+  "dataset_manifest": "configs/manifests/modelnet40_scale.local.json",
+  "mesh_ood_split": "category_ood",
+  "mesh_training_target": "source",
+  "verify_mesh_hashes": true,
+  "gpcc": {
+    "executable": "artifacts/tools/mpeg-pcc-tmc13/build/tmc3/tmc3",
+    "position_bits": 12,
+    "timeout_seconds": 120.0,
+    "encoder_args": [
+      "--neighbourAvailBoundaryLog2=8",
+      "--intra_pred_max_node_size_log2=6",
+      "--maxNumQtBtBeforeOt=4",
+      "--minQtbtSizeLog2=0",
+      "--planarEnabled=1",
+      "--planarModeIdcmUse=0",
+      "--trisoupNodeSizeLog2=0"
+    ],
+    "rate_points": [
+      {
+        "name": "octree_s1_4096",
+        "encoder_args": ["--positionQuantizationScale=0.000244140625"]
+      },
+      {
+        "name": "octree_s1_2048",
+        "encoder_args": ["--positionQuantizationScale=0.00048828125"]
+      },
+      {
+        "name": "octree_s1_1536",
+        "encoder_args": ["--positionQuantizationScale=0.0006510416666666666"]
+      },
+      {
+        "name": "octree_s1_1280",
+        "encoder_args": ["--positionQuantizationScale=0.00078125"]
+      },
+      {
+        "name": "octree_s1_1024",
+        "encoder_args": ["--positionQuantizationScale=0.0009765625"]
+      },
+      {
+        "name": "octree_s1_768",
+        "encoder_args": ["--positionQuantizationScale=0.0013020833333333333"]
+      },
+      {
+        "name": "octree_s1_640",
+        "encoder_args": ["--positionQuantizationScale=0.0015625"]
+      },
+      {
+        "name": "octree_s1_512",
+        "encoder_args": ["--positionQuantizationScale=0.001953125"]
+      },
+      {
+        "name": "octree_s1_256",
+        "encoder_args": ["--positionQuantizationScale=0.00390625"]
+      },
+      {
+        "name": "octree_s1_128",
+        "encoder_args": ["--positionQuantizationScale=0.0078125"]
+      },
+      {
+        "name": "octree_s1_64",
+        "encoder_args": ["--positionQuantizationScale=0.015625"]
+      },
+      {
+        "name": "octree_s1_32",
+        "encoder_args": ["--positionQuantizationScale=0.03125"]
+      },
+      {
+        "name": "octree_s1_16",
+        "encoder_args": ["--positionQuantizationScale=0.0625"]
+      }
+    ]
+  },
+  "official_metric_executable": "artifacts/tools/mpeg-pcc-dmetric/build/Release/pc_error",
+  "official_metric_position_bits": 12,
+  "official_metric_timeout_seconds": 120.0,
+  "output_dir": "artifacts/local/experiment_017_modelnet40_scale_base",
+  "experiment": {
+    "num_points": 2048,
+    "input_sizes": [2048],
+    "constellation_sizes": [4, 8, 16, 32],
+    "bits": 12,
+    "train_samples": 512,
+    "validation_samples": 128,
+    "parameter_ood_samples": 32,
+    "batch_size": 4,
+    "decoder_epochs": 1,
+    "refiner_epochs": 1,
+    "decoder_learning_rate": 0.001,
+    "refiner_learning_rate": 0.001,
+    "feature_width": 32,
+    "num_heads": 4,
+    "num_layers": 1,
+    "recurrent_steps": 2,
+    "responsibility_temperature": 0.2,
+    "maximum_update": 0.1,
+    "use_decoder_gradient": true,
+    "decoder_gradient_chunk_size": 256,
+    "run_internal_evaluation": false,
+    "seed": 7,
+    "data_seed": 1517,
+    "output_dir": "artifacts/local/experiment_017_modelnet40_scale_base/model"
+  }
+}

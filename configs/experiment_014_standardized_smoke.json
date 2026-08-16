@@ -1,0 +1,33 @@
+{
+  "profile_name": "cpu_smoke",
+  "evaluation_methods": ["fps", "free", "strict_subset"],
+  "distance_chunk_size": 16,
+  "sliced_directions": 8,
+  "peak_distance": 2.0,
+  "output_dir": "artifacts/local/experiment_014_standardized_smoke",
+  "experiment": {
+    "num_points": 32,
+    "input_sizes": [32],
+    "constellation_sizes": [2, 4],
+    "bits": 8,
+    "train_samples": 4,
+    "validation_samples": 2,
+    "parameter_ood_samples": 2,
+    "batch_size": 2,
+    "decoder_epochs": 1,
+    "refiner_epochs": 1,
+    "decoder_learning_rate": 0.001,
+    "refiner_learning_rate": 0.001,
+    "feature_width": 8,
+    "num_heads": 2,
+    "num_layers": 1,
+    "recurrent_steps": 1,
+    "responsibility_temperature": 0.2,
+    "maximum_update": 0.1,
+    "use_decoder_gradient": true,
+    "decoder_gradient_chunk_size": 16,
+    "run_internal_evaluation": false,
+    "seed": 1407,
+    "output_dir": "artifacts/local/experiment_014_standardized_smoke/model"
+  }
+}

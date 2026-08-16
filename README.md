@@ -235,6 +235,57 @@ parameter OOD (20.73-29.50); post-hoc strict projection retained 14.51% and
 15.18% gains. This passes the procedural primary-point gate but is not yet an
 external-data or actual-rate compression claim.
 
+Experiment 014 standardizes the toy task around a 2,048-point low-rate object
+protocol and a real fixed-width coordinate stream:
+
+```bash
+.venv-train/bin/python -m pointconstellation.standardized_benchmark \
+  --config configs/experiment_014_standardized_macbook.json --device mps
+```
+
+The six-rate, seven-family MacBook run finished in about 22 seconds and used
+469 MiB peak RSS. It records actual bpp, per-cloud D1/D2-style proxies, tail
+error, sliced-Wasserstein, runtime, model size, manifests, and monotonicity.
+The refiner beat matched-decoder FPS at all six rates in both procedural splits,
+with the largest gain at the lowest rates. See the [Experiment 014
+report](docs/experiment-014-standardized-toy-benchmark.md). This is a
+protocol-aligned procedural proxy, not a ShapeNet, MPEG, or SOTA codec claim.
+
+Experiment 015 adds manifest-backed mesh surfaces, independent fresh-surface
+resampling, actual MPEG G-PCC/TMC13 streams, and official `pc_error` D1/D2:
+
+```bash
+bash scripts/build_mpeg_tools.sh
+.venv-train/bin/python -m pointconstellation.standardized_benchmark \
+  --config configs/experiment_015_mesh_fixture_macbook.json --device mps
+```
+
+The checked-in fixture validates eight neural and seven overlapping G-PCC rate
+points in under a minute on a MacBook. Its [external-pilot
+report](docs/experiment-015-external-mesh-gpcc-pilot.md) documents the result
+and the local ShapeNetCore manifest workflow. The fixture is infrastructure
+evidence, not a real-data or SOTA claim; the licensed ShapeNetCore run remains
+the next decisive step.
+
+While ShapeNetCore access is pending, Experiment 016 runs the same protocol on
+the official ModelNet40 train/test distribution. Its one-seed, 40-category
+pilot found a 14--15% free-refiner gain over matched-decoder FPS at
+0.125--0.195 bpp on both validation and category OOD, but G-PCC overtook the
+constellation curve around 0.21 bpp. See the [ModelNet40 pilot
+report](docs/experiment-016-modelnet40-pilot.md). This supports a three-seed
+low-rate scale run, not a general codec or SOTA claim.
+
+Experiments 017-018 complete that three-seed scale slice on 672 selected
+ModelNet40 meshes and add an exactly byte-matched learned feature-latent codec.
+At the primary K=8 point, the refiner beats matched-decoder FPS by 16.13% on
+validation (95% CI 13.49-19.85) and 18.19% on held-out categories
+(13.37-24.59). It does not yet beat the feature codec reliably: the aggregate
+validation effect is -6.97% (-29.23-10.78), driven by one weak constellation
+seed. Official validation D2 nevertheless favors the constellation by 32.99%
+(12.03-54.99). The [scale report](docs/experiment-017-018-modelnet40-scale.md)
+documents the rates, G-PCC crossover, runtime, negative learned-codec result,
+and external codec replication path.
+
 Five more co-adaptation hypotheses are implemented in Experiments 008-012:
 balanced transport, compression homotopy, decoder populations/cross-play,
 gradient-free search, and autoregressive pointer selection. Their [fan-out

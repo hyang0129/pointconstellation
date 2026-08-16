@@ -1,0 +1,10 @@
+{
+  "base_benchmark_config": "configs/experiment_017_modelnet40_scale_base.json",
+  "model_seeds": [7, 17, 29],
+  "data_seed": 1517,
+  "primary_constellation_size": 8,
+  "bootstrap_samples": 10000,
+  "bootstrap_seed": 20260814,
+  "confidence_level": 0.95,
+  "output_dir": "artifacts/local/experiment_017_modelnet40_multiseed"
+}

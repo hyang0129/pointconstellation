@@ -20,6 +20,29 @@ def chamfer_squared(first: Tensor, second: Tensor) -> Tensor:
     return 0.5 * (distances.amin(dim=2).mean() + distances.amin(dim=1).mean())
 
 
+def chamfer_squared_chunked(
+    first: Tensor, second: Tensor, *, chunk_size: int
+) -> Tensor:
+    """Return exact Chamfer loss without one full pairwise-distance tensor.
+
+    Chunking the directed source dimension and using ``min`` keeps only nearest
+    indices for backward, which is useful for decoder-gradient inference on
+    laptop-sized clouds. This changes memory scheduling, not the objective.
+    """
+
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be positive")
+
+    def directed(source: Tensor, target: Tensor) -> Tensor:
+        minima = []
+        for start in range(0, source.shape[1], chunk_size):
+            distances = pairwise_squared(source[:, start : start + chunk_size], target)
+            minima.append(distances.min(dim=2).values)
+        return torch.cat(minima, dim=1).mean()
+
+    return 0.5 * (directed(first, second) + directed(second, first))
+
+
 def anchor_surface_loss(constellation: Tensor, points: Tensor) -> Tensor:
     return pairwise_squared(constellation, points).amin(dim=2).mean()
 

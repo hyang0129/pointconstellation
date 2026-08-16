@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "dataset": "pointconstellation-test-meshes",
+  "seed": 1507,
+  "sampling": {
+    "source_target": "independent_area_weighted_mesh_surface_samples",
+    "normalization": "mesh_bbox_center_then_unit_max_vertex_radius"
+  },
+  "categories": {
+    "train": ["000001"],
+    "heldout": ["000002"]
+  },
+  "splits": {
+    "train": [
+      {
+        "category": "000001",
+        "model_id": "train_a",
+        "mesh": "000001/train_a/models/model_normalized.obj",
+        "mesh_sha256": "e0ec180f6bba7f9471881489e0d26cf2189ca8c103d773c952aedc52d467acbc"
+      },
+      {
+        "category": "000001",
+        "model_id": "train_b",
+        "mesh": "000001/train_b/models/model_normalized.obj",
+        "mesh_sha256": "cd60033fd4d01589d25dc2bddb9f6d53ec33ed96b075d96f025b515a5aa0b473"
+      }
+    ],
+    "validation": [
+      {
+        "category": "000001",
+        "model_id": "validation_a",
+        "mesh": "000001/validation_a/models/model_normalized.obj",
+        "mesh_sha256": "12b81c52aec9da6465fb63af8e16291d17a56d9dc58a39060891f917c5747e21"
+      },
+      {
+        "category": "000001",
+        "model_id": "validation_b",
+        "mesh": "000001/validation_b/models/model_normalized.obj",
+        "mesh_sha256": "4bdabce7887bf5281149a06dc97a1d2e98c622472b4526d5ea05a324f23c5009"
+      }
+    ],
+    "category_ood": [
+      {
+        "category": "000002",
+        "model_id": "ood_a",
+        "mesh": "000002/ood_a/models/model_normalized.obj",
+        "mesh_sha256": "b355adfade110dc8f897bf066cb5fe68f51bd7baabff2d57a79742e2e6980509"
+      },
+      {
+        "category": "000002",
+        "model_id": "ood_b",
+        "mesh": "000002/ood_b/models/model_normalized.obj",
+        "mesh_sha256": "934674480be374ad805a8e4780483210f09a438d704ffc2a8d42fb86c3ee639e"
+      }
+    ]
+  }
+}
