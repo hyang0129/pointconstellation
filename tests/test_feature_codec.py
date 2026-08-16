@@ -1,7 +1,12 @@
+# ruff: noqa: E402
+
 from __future__ import annotations
 
 import numpy as np
 import pytest
+
+pytest.importorskip("torch")
+
 import torch
 
 from pointconstellation.feature_bitstream import (

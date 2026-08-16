@@ -84,6 +84,7 @@ def test_off_loader_rejects_out_of_range_indices(tmp_path: Path) -> None:
 
 
 def test_training_target_defaults_to_encoder_visible_source() -> None:
+    pytest.importorskip("torch")
     source_target = MeshSurfaceDataset(
         FIXTURE_ROOT,
         FIXTURE_MANIFEST,

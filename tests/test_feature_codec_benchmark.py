@@ -1,7 +1,13 @@
+# ruff: noqa: E402
+
 from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+
+import pytest
+
+pytest.importorskip("torch")
 
 from pointconstellation.feature_codec_benchmark import (
     FeatureCodecBenchmarkConfig,

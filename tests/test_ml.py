@@ -1,5 +1,8 @@
 # ruff: noqa: E402, I001
 
+from dataclasses import replace
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -9,6 +12,11 @@ from pointconstellation.data import FAMILIES, generate_sample
 from pointconstellation.encoder_isolation import (
     EncoderIsolationSpec,
     encoder_isolation_gate,
+)
+from pointconstellation.feature_bitstream import decode_features, encode_features
+from pointconstellation.feature_codec_benchmark import (
+    FeatureCodecBenchmarkConfig,
+    run_feature_codec_benchmark,
 )
 from pointconstellation.bottleneck_audit import (
     BottleneckAuditConfig,
@@ -31,6 +39,7 @@ from pointconstellation.quantization import (
     quantize_coordinates,
     quantize_ste,
 )
+from pointconstellation.models.feature_codec import VariableFeatureCodec
 from pointconstellation.selected_rate import SelectedRateSpec, rate_curve_gate
 from pointconstellation.sweep import SweepSpec, pareto_frontier
 from pointconstellation.train import TrainingConfig
@@ -235,6 +244,40 @@ def test_variable_decoder_preserves_anchors_and_accepts_variable_sizes() -> None
     assert torch.equal(large[:, :8], anchors)
     assert torch.equal(permuted[:, :8], permuted_anchors)
     assert torch.allclose(large[:, 8:], permuted[:, 8:], atol=2e-6)
+
+
+def test_feature_codec_contract_and_bitstream_round_trip() -> None:
+    torch.manual_seed(53)
+    codec = VariableFeatureCodec(32, 20, bits=8, feature_width=16).eval()
+    points = torch.rand(2, 32, 3) * 2.0 - 1.0
+
+    reconstruction, features = codec(points, 8)
+    permuted_reconstruction, permuted_features = codec(points[:, torch.randperm(32)], 8)
+    stream = encode_features(features[0].detach().numpy(), bits=8, output_points=32)
+    packet = decode_features(stream)
+    decoded = torch.from_numpy(packet.features).to(dtype=points.dtype)[None]
+
+    assert torch.equal(features, permuted_features)
+    assert torch.equal(reconstruction, permuted_reconstruction)
+    torch.testing.assert_close(codec.decoder(decoded), reconstruction[:1])
+
+
+def test_feature_codec_benchmark_contract(tmp_path: Path) -> None:
+    config = replace(
+        FeatureCodecBenchmarkConfig.from_json(
+            Path("configs/experiment_018_feature_codec_smoke.json")
+        ),
+        model_seeds=(3,),
+        output_dir=str(tmp_path / "feature"),
+    )
+
+    result = run_feature_codec_benchmark(config, device_name="cpu")
+
+    assert result["model_independence"]["all_unique"]
+    assert result["per_seed"][0]["model"]["optimizer_updates"] == 2
+    assert all(
+        row["fresh_chamfer_mse"] >= 0 for row in result["per_seed"][0]["per_cloud"]
+    )
 
 
 def test_bottleneck_audit_config_and_gate() -> None:
