@@ -10,4 +10,5 @@ build/
 dist/
 artifacts/
 configs/empire.nodes.json
+configs/manifests/*.local.json
 /data/

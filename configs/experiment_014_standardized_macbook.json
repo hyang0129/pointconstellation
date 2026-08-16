@@ -1,0 +1,33 @@
+{
+  "profile_name": "macbook_mps",
+  "evaluation_methods": ["fps", "free", "strict_subset"],
+  "distance_chunk_size": 256,
+  "sliced_directions": 32,
+  "peak_distance": 2.0,
+  "output_dir": "artifacts/local/experiment_014_standardized_macbook",
+  "experiment": {
+    "num_points": 2048,
+    "input_sizes": [2048],
+    "constellation_sizes": [4, 8, 16, 32, 64, 128],
+    "bits": 12,
+    "train_samples": 42,
+    "validation_samples": 7,
+    "parameter_ood_samples": 7,
+    "batch_size": 1,
+    "decoder_epochs": 1,
+    "refiner_epochs": 1,
+    "decoder_learning_rate": 0.001,
+    "refiner_learning_rate": 0.001,
+    "feature_width": 32,
+    "num_heads": 4,
+    "num_layers": 1,
+    "recurrent_steps": 2,
+    "responsibility_temperature": 0.2,
+    "maximum_update": 0.1,
+    "use_decoder_gradient": true,
+    "decoder_gradient_chunk_size": 256,
+    "run_internal_evaluation": false,
+    "seed": 1407,
+    "output_dir": "artifacts/local/experiment_014_standardized_macbook/model"
+  }
+}

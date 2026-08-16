@@ -9,7 +9,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from pointconstellation.data import generate_sample
-from pointconstellation.losses import chamfer_squared
+from pointconstellation.losses import chamfer_squared, chamfer_squared_chunked
 from pointconstellation.models.bottleneck import VariableConstellationDecoder
 from pointconstellation.models.refiner import CompetitiveConstellationRefiner
 from pointconstellation.quantization import quantization_step, quantize_coordinates
@@ -133,6 +133,7 @@ def test_decoder_gradient_feedback_is_finite_and_decoder_is_immutable() -> None:
         num_heads=2,
         recurrent_steps=2,
         use_decoder_gradient=True,
+        decoder_gradient_chunk_size=5,
     ).train()
 
     constellation = model(
@@ -155,6 +156,23 @@ def test_decoder_gradient_feedback_is_finite_and_decoder_is_immutable() -> None:
     assert all(
         torch.equal(before[name], value) for name, value in decoder.state_dict().items()
     )
+
+
+def test_chunked_chamfer_matches_full_loss_and_gradients() -> None:
+    torch.manual_seed(110)
+    first_full = torch.randn(2, 11, 3, requires_grad=True)
+    second_full = torch.randn(2, 13, 3, requires_grad=True)
+    first_chunked = first_full.detach().clone().requires_grad_(True)
+    second_chunked = second_full.detach().clone().requires_grad_(True)
+
+    full = chamfer_squared(first_full, second_full)
+    chunked = chamfer_squared_chunked(first_chunked, second_chunked, chunk_size=4)
+    full.backward()
+    chunked.backward()
+
+    assert torch.allclose(chunked, full, atol=1e-6)
+    assert torch.allclose(first_chunked.grad, first_full.grad, atol=1e-6)
+    assert torch.allclose(second_chunked.grad, second_full.grad, atol=1e-6)
 
 
 def test_tiny_refiner_experiment_runs_end_to_end(tmp_path) -> None:
@@ -182,6 +200,7 @@ def test_tiny_refiner_experiment_runs_end_to_end(tmp_path) -> None:
 
     assert result["decoder_unchanged"]
     assert saved["decoder_hash_before_refiner"] == saved["decoder_hash_after_refiner"]
+    assert saved["refiner_hash_before_training"] != saved["refiner_hash_after_training"]
     assert (tmp_path / "decoder.pt").exists()
     assert (tmp_path / "refiner.pt").exists()
     assert len(saved["evaluation"]["validation"]) == 4

@@ -8,7 +8,7 @@ from collections.abc import Callable
 import torch
 from torch import Tensor, nn
 
-from pointconstellation.losses import chamfer_squared
+from pointconstellation.losses import chamfer_squared, chamfer_squared_chunked
 from pointconstellation.quantization import quantize_coordinates, quantize_ste
 
 Decoder = Callable[..., Tensor]
@@ -63,6 +63,7 @@ class CompetitiveConstellationRefiner(nn.Module):
         responsibility_temperature: float = 0.2,
         maximum_update: float = 0.1,
         use_decoder_gradient: bool = False,
+        decoder_gradient_chunk_size: int | None = None,
     ) -> None:
         super().__init__()
         if max_constellation_size < 2:
@@ -77,6 +78,8 @@ class CompetitiveConstellationRefiner(nn.Module):
             raise ValueError("responsibility_temperature must be positive")
         if maximum_update <= 0:
             raise ValueError("maximum_update must be positive")
+        if decoder_gradient_chunk_size is not None and decoder_gradient_chunk_size < 1:
+            raise ValueError("decoder_gradient_chunk_size must be positive")
 
         self.max_constellation_size = max_constellation_size
         self.bits = bits
@@ -85,6 +88,7 @@ class CompetitiveConstellationRefiner(nn.Module):
         self.responsibility_temperature = responsibility_temperature
         self.maximum_update = maximum_update
         self.use_decoder_gradient = use_decoder_gradient
+        self.decoder_gradient_chunk_size = decoder_gradient_chunk_size
 
         self.point_embedding = nn.Sequential(
             nn.Linear(3, feature_width),
@@ -165,7 +169,14 @@ class CompetitiveConstellationRefiner(nn.Module):
             probe = coordinates.detach().requires_grad_(True)
             quantized = quantize_ste(probe, self.bits, training=False, jitter=False)
             reconstruction = decoder(quantized, num_output_points=num_output_points)
-            loss = chamfer_squared(reconstruction, target.detach())
+            if self.decoder_gradient_chunk_size is None:
+                loss = chamfer_squared(reconstruction, target.detach())
+            else:
+                loss = chamfer_squared_chunked(
+                    reconstruction,
+                    target.detach(),
+                    chunk_size=self.decoder_gradient_chunk_size,
+                )
             gradient = torch.autograd.grad(loss, probe, create_graph=False)[0]
         gradient = gradient.detach()
         scale = gradient.square().mean(dim=(1, 2), keepdim=True).sqrt()

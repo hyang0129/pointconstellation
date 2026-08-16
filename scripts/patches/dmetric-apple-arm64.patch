@@ -1,0 +1,32 @@
+diff --git a/source/CMakeLists.txt b/source/CMakeLists.txt
+index d5487bb..9755349 100644
+--- a/source/CMakeLists.txt
++++ b/source/CMakeLists.txt
+@@ -46,7 +46,11 @@ if (OPENMP_FOUND)
+   add_compile_options( -D OPENMP_FOUND )
+ endif()
+
+-if (NOT WIN32)
++if (APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
++  set(CMAKE_CXX_FLAGS_RELEASE "-Wno-unused-result -O3 -DNDEBUG -D_REENTRANT -fno-fast-math -ffp-contract=off -D__STDC_CONSTANT_MACROS")
++  set(CMAKE_C_FLAGS_RELEASE   "-Wno-unused-result -O3 -DNDEBUG -D_REENTRANT -fno-fast-math -ffp-contract=off")
++  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
++elseif (NOT WIN32)
+   if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -m64 -DNDEBUG -mfpmath=sse -ffp-contract=off -ffp-model=strict ")
+   endif()
+diff --git a/source/pcc_processing.cpp b/source/pcc_processing.cpp
+index be27fbb..4066105 100644
+--- a/source/pcc_processing.cpp
++++ b/source/pcc_processing.cpp
+@@ -677,8 +677,8 @@ PccPointCloud::load(string inFile, bool normalsOnly, int dropDuplicates, int nei
+   if (inFile == "")
+     return 0;
+
+-  struct stat64 bufferExist;
+-  if (stat64(inFile.c_str(), &bufferExist) != 0)
++  struct stat bufferExist;
++  if (stat(inFile.c_str(), &bufferExist) != 0)
+   {
+     cout << "File does not exist: " << inFile << endl;
+     return -1;

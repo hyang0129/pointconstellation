@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,13 @@ from pointconstellation.models.bottleneck import VariableConstellationDecoder
 from pointconstellation.models.refiner import CompetitiveConstellationRefiner
 from pointconstellation.quantization import quantize_ste
 from pointconstellation.train import select_device, set_seed
+
+LoaderTriplet = tuple[
+    DataLoader[dict[str, Any]],
+    DataLoader[dict[str, Any]],
+    DataLoader[dict[str, Any]],
+]
+LoaderFactory = Callable[[], LoaderTriplet]
 
 
 @dataclass(frozen=True)
@@ -44,6 +52,8 @@ class RefinerExperimentConfig:
     responsibility_temperature: float = 0.2
     maximum_update: float = 0.1
     use_decoder_gradient: bool = True
+    decoder_gradient_chunk_size: int | None = None
+    run_internal_evaluation: bool = True
     decoder_checkpoint: str | None = None
     data_seed: int | None = None
     seed: int = 7
@@ -89,6 +99,11 @@ class RefinerExperimentConfig:
             raise ValueError("learning rates must be positive")
         if self.responsibility_temperature <= 0 or self.maximum_update <= 0:
             raise ValueError("temperature and maximum update must be positive")
+        if (
+            self.decoder_gradient_chunk_size is not None
+            and self.decoder_gradient_chunk_size < 1
+        ):
+            raise ValueError("decoder_gradient_chunk_size must be positive")
 
     @classmethod
     def from_json(cls, path: Path) -> RefinerExperimentConfig:
@@ -101,11 +116,7 @@ class RefinerExperimentConfig:
 
 def _make_loaders(
     config: RefinerExperimentConfig,
-) -> tuple[
-    DataLoader[dict[str, Any]],
-    DataLoader[dict[str, Any]],
-    DataLoader[dict[str, Any]],
-]:
+) -> LoaderTriplet:
     data_seed = config.seed if config.data_seed is None else config.data_seed
     datasets = {
         split: ProceduralPointCloudDataset(
@@ -142,6 +153,24 @@ def _make_loaders(
             num_workers=0,
         ),
     )
+
+
+def _batch_clouds(
+    batch: dict[str, Any], input_size: int, device: torch.device
+) -> tuple[Tensor, Tensor]:
+    """Resolve legacy same-sample or independent mesh source/target batches."""
+
+    if "target_points" in batch:
+        target = batch["target_points"].to(device)
+        source_points = batch["source_points"].to(device)
+    else:
+        target = batch["points"].to(device)
+        source_points = target
+    if source_points.shape[1] < input_size:
+        raise ValueError("batch source cloud is smaller than requested input_size")
+    if target.shape[1] != source_points.shape[1]:
+        raise ValueError("source and target point counts must match")
+    return source_points[:, :input_size], target
 
 
 def _fps(points: Tensor, constellation_size: int, bits: int) -> Tensor:
@@ -191,12 +220,11 @@ def _train_decoder(
         total = 0.0
         count = 0
         for batch in loader:
-            target = batch["points"].to(device)
             input_size = config.input_sizes[global_step % len(config.input_sizes)]
             constellation_size = config.constellation_sizes[
                 global_step % len(config.constellation_sizes)
             ]
-            source = target[:, :input_size]
+            source, target = _batch_clouds(batch, input_size, device)
             constellation = _fps(source, constellation_size, config.bits)
             constellation = quantize_ste(constellation, config.bits, training=True)
             optimizer.zero_grad(set_to_none=True)
@@ -234,12 +262,11 @@ def _train_refiner(
         count = 0
         for batch in loader:
             order_digest.update(batch["sample_id"].cpu().numpy().tobytes())
-            target = batch["points"].to(device)
             input_size = config.input_sizes[global_step % len(config.input_sizes)]
             constellation_size = config.constellation_sizes[
                 global_step % len(config.constellation_sizes)
             ]
-            source = target[:, :input_size]
+            source, target = _batch_clouds(batch, input_size, device)
             optimizer.zero_grad(set_to_none=True)
             _, states = refiner(
                 source,
@@ -308,8 +335,7 @@ def _evaluate_curve(
     ]
     count = 0
     for batch in loader:
-        target = batch["points"].to(device)
-        source = target[:, :input_size]
+        source, target = _batch_clouds(batch, input_size, device)
         with torch.no_grad():
             _, states = refiner(
                 source,
@@ -355,6 +381,8 @@ def run_refiner_experiment(
     config: RefinerExperimentConfig,
     *,
     device_name: str = "auto",
+    loader_factory: LoaderFactory | None = None,
+    data_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Train/load the decoder, freeze it, train the refiner, and emit curves."""
 
@@ -362,7 +390,8 @@ def run_refiner_experiment(
     device = select_device(device_name)
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    decoder_train_loader, validation_loader, ood_loader = _make_loaders(config)
+    make_loaders = loader_factory or (lambda: _make_loaders(config))
+    decoder_train_loader, validation_loader, ood_loader = make_loaders()
     decoder = VariableConstellationDecoder(
         config.num_points,
         max(config.constellation_sizes),
@@ -379,6 +408,7 @@ def run_refiner_experiment(
         responsibility_temperature=config.responsibility_temperature,
         maximum_update=config.maximum_update,
         use_decoder_gradient=config.use_decoder_gradient,
+        decoder_gradient_chunk_size=config.decoder_gradient_chunk_size,
     ).to(device)
 
     started = time.perf_counter()
@@ -410,7 +440,7 @@ def run_refiner_experiment(
     # Recreate the loader so decoder training cannot alter the refiner's batch
     # order.  Checkpoint-loaded and freshly trained decoder arms are therefore
     # matched under the same refiner seed.
-    refiner_train_loader, _, _ = _make_loaders(config)
+    refiner_train_loader, _, _ = make_loaders()
     refiner_history, refiner_training_order_hash = _train_refiner(
         refiner, decoder, refiner_train_loader, device, config
     )
@@ -423,38 +453,43 @@ def run_refiner_experiment(
         "validation": [],
         "parameter_ood": [],
     }
-    for input_size in config.input_sizes:
-        for constellation_size in config.constellation_sizes:
-            for split, loader in (
-                ("validation", validation_loader),
-                ("parameter_ood", ood_loader),
-            ):
-                curve = _evaluate_curve(
-                    refiner,
-                    decoder,
-                    loader,
-                    device,
-                    config,
-                    input_size=input_size,
-                    constellation_size=constellation_size,
-                )
-                evaluation[split].append(
-                    {
-                        "input_size": input_size,
-                        "constellation_size": constellation_size,
-                        "coordinate_payload_bits": 3 * constellation_size * config.bits,
-                        "curve": curve,
-                    }
-                )
+    if config.run_internal_evaluation:
+        for input_size in config.input_sizes:
+            for constellation_size in config.constellation_sizes:
+                for split, loader in (
+                    ("validation", validation_loader),
+                    ("parameter_ood", ood_loader),
+                ):
+                    curve = _evaluate_curve(
+                        refiner,
+                        decoder,
+                        loader,
+                        device,
+                        config,
+                        input_size=input_size,
+                        constellation_size=constellation_size,
+                    )
+                    evaluation[split].append(
+                        {
+                            "input_size": input_size,
+                            "constellation_size": constellation_size,
+                            "coordinate_payload_bits": 3
+                            * constellation_size
+                            * config.bits,
+                            "curve": curve,
+                        }
+                    )
 
     result = {
         "config": asdict(config),
+        "data_identity": data_identity,
         "device": str(device),
         "decoder_source": decoder_source,
         "decoder_hash_before_refiner": decoder_hash_before,
         "decoder_hash_after_refiner": decoder_hash_after,
         "decoder_unchanged": decoder_unchanged,
         "refiner_hash_before_training": refiner_hash_before,
+        "refiner_hash_after_training": _state_hash(refiner),
         "refiner_training_order_hash": refiner_training_order_hash,
         "decoder_parameter_count": sum(
             parameter.numel() for parameter in decoder.parameters()

@@ -97,6 +97,20 @@ show a nonzero gain on at least one category-held-out split. Failure only on
 category-held-out data redirects the contribution toward domain-specific
 compression; failure on held-out instances stops architecture scaling.
 
+Status: ShapeNetCore execution is waiting on dataset-owner access approval.
+[Experiment 016](experiment-016-modelnet40-pilot.md) pivots the same protocol to
+the official ModelNet40 distribution and finds a 14--15% low-rate improvement
+over FPS on all 40 pilot test meshes, including eight held-out categories. This
+is encouraging external-transfer evidence, but its single model seed and tiny
+per-category training subset do not complete Gate C.
+
+[Experiment 017](experiment-017-018-modelnet40-scale.md) completes the fixed-data
+three-seed ModelNet40 substitute: K=8 improves over matched-decoder FPS by
+16.13% on validation (95% CI 13.49-19.85) and 18.19% on category OOD
+(13.37-24.59), with every seed positive. Gate C therefore passes for the
+declared ModelNet40 substitute, while the requested ShapeNetCore replication
+remains pending and must not be implied by this result.
+
 ## Work package D: honest rate sanity check
 
 Extend the existing bitstream to serialize the selected mode, bounds or
@@ -114,6 +128,24 @@ constellation representation is plausibly competitive, or quantify the bitrate
 gap that entropy modeling/variable `K` would have to close. If the gap is too
 large to close even under an oracle entropy bound, stop presenting the work as
 a general codec and emphasize representation or learned simplification.
+
+Status: [Experiment 014](experiment-014-standardized-toy-benchmark.md) completes
+the fixed-width stream and a MacBook-runnable 2,048-point procedural rehearsal
+with six actual-rate points and bounded-memory D1/D2-style proxy metrics. It
+does not complete Gate D by itself. [Experiment 015](experiment-015-external-mesh-gpcc-pilot.md)
+adds manifest-backed mesh sampling, seven overlapping TMC13 rate points, and
+official `pc_error` validation. The checked-in fixture exposes a possible
+0.2--0.3 bpp crossover but is not scientific data. At that stage, ShapeNetCore
+execution, three seeds, learned codecs, entropy coding, and a real-data rate
+conclusion were all open.
+
+[Experiments 017-018](experiment-017-018-modelnet40-scale.md) now provide three
+ModelNet40 seeds, 13 measured G-PCC points, official D1/D2, and an internal
+exact-byte-matched learned feature codec. They identify a plausible corridor
+below about 0.24 bpp, but G-PCC dominates by K=16 and the constellation does not
+reliably beat the feature codec on Chamfer/D1. Gate D therefore remains open:
+published entropy-coded learned codecs and a stable absolute learned result are
+still required.
 
 ## Work package E: inference headroom
 
@@ -184,3 +216,4 @@ These are paper-stage experiments only after the month-one gates justify them.
 - [#6: ShapeNetCore external-surface pilot](https://github.com/hyang0129/pointconstellation/issues/6)
 - [#7: actual bitstream and G-PCC rate sanity benchmark](https://github.com/hyang0129/pointconstellation/issues/7)
 - [#8: robust per-cloud inference headroom bound](https://github.com/hyang0129/pointconstellation/issues/8)
+- [#9: standardized MacBook toy benchmark](https://github.com/hyang0129/pointconstellation/issues/9)
