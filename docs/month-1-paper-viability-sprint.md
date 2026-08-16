@@ -143,9 +143,15 @@ conclusion were all open.
 ModelNet40 seeds, 13 measured G-PCC points, official D1/D2, and an internal
 exact-byte-matched learned feature codec. They identify a plausible corridor
 below about 0.24 bpp, but G-PCC dominates by K=16 and the constellation does not
-reliably beat the feature codec on Chamfer/D1. Gate D therefore remains open:
-published entropy-coded learned codecs and a stable absolute learned result are
-still required.
+reliably beat the feature codec on Chamfer.
+
+[Experiment 019](experiment-019-stability.md) resolves the unstable absolute
+learned result at the primary 50-byte point. Its six-decoder by three-refiner
+factorial reduces validation bad-seed Q90 by 42.73%, retains a 17.26% median
+gain over matched FPS, and beats the independently resampled three-seed feature
+codec by 29.90% (95% CI 23.26--35.77). Gate D nevertheless remains open:
+published entropy-coded learned codecs, a stabilized official D1/D2 pass, and
+the multi-rate common-test-condition comparison are still required.
 
 ## Work package E: inference headroom
 
@@ -157,6 +163,12 @@ amortized refiner.
 **Gate E:** quantify the fraction of robust oracle improvement recovered by the
 refiner. A small remaining gap favors scaling data and benchmarks; a large gap
 favors better amortized inference before decoder expansion.
+
+Status: Experiment 019's limited, fixed 16-cloud source-only Adam probe leaves
+the recurrent refiner 6.3% above the bound on validation and 9.7% above it on
+category OOD. This suggests that decoder stabilization was the larger immediate
+failure, but it does not complete Gate E's multi-start, substantially budgeted
+headroom study.
 
 ## Four-week schedule
 
@@ -217,3 +229,4 @@ These are paper-stage experiments only after the month-one gates justify them.
 - [#7: actual bitstream and G-PCC rate sanity benchmark](https://github.com/hyang0129/pointconstellation/issues/7)
 - [#8: robust per-cloud inference headroom bound](https://github.com/hyang0129/pointconstellation/issues/8)
 - [#9: standardized MacBook toy benchmark](https://github.com/hyang0129/pointconstellation/issues/9)
+- [#13: decoder/refiner stability decomposition](https://github.com/hyang0129/pointconstellation/issues/13)

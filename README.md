@@ -308,8 +308,12 @@ is submitted automatically.
 This repository is in research milestone 1 and is working toward a
 theory-backed, comprehensively benchmarked ICLR/NeurIPS-quality paper. The
 plane codec, fixed-rate ML baselines, rate sweeps, and refiner benchmarks are
-runnable; claims about competitive general-purpose compression performance
-have not been made. The [paper benchmark epic](https://github.com/hyang0129/pointconstellation/issues/3)
+runnable. [Experiment 019](docs/experiment-019-stability.md) reports a stable
+six-decoder by three-refiner ModelNet40 result at one 50-byte operating point,
+including a positive internal learned-feature-codec comparison. Claims about
+competitive general-purpose compression performance have not been made: the
+published entropy-coded codec and common-test-condition comparisons remain
+open. The [paper benchmark epic](https://github.com/hyang0129/pointconstellation/issues/3)
 tracks the remaining evidence.
 
 ## License
