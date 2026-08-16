@@ -1,5 +1,6 @@
 # ruff: noqa: E402, I001
 
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -17,6 +18,10 @@ from pointconstellation.feature_bitstream import decode_features, encode_feature
 from pointconstellation.feature_codec_benchmark import (
     FeatureCodecBenchmarkConfig,
     run_feature_codec_benchmark,
+)
+from pointconstellation.stability_experiment import (
+    StabilityExperimentConfig,
+    run_stability_experiment,
 )
 from pointconstellation.bottleneck_audit import (
     BottleneckAuditConfig,
@@ -278,6 +283,29 @@ def test_feature_codec_benchmark_contract(tmp_path: Path) -> None:
     assert all(
         row["fresh_chamfer_mse"] >= 0 for row in result["per_seed"][0]["per_cloud"]
     )
+
+
+def test_stability_experiment_factorial_and_contract(tmp_path: Path) -> None:
+    config = replace(
+        StabilityExperimentConfig.from_json(
+            Path("configs/experiment_019_stability_smoke.json")
+        ),
+        output_dir=str(tmp_path / "stability"),
+    )
+
+    result = run_stability_experiment(config, device_name="cpu")
+
+    assert result["factorial"]["complete"]
+    assert result["factorial"]["cells"] == 8
+    assert all(result["contract_checks"].values())
+    assert result["data_protocol"]["all_partitions_pairwise_disjoint"]
+    assert result["stability_gates"]["primary"]["decoder_marginals"] == 2
+    assert result["variance_components"][0]["analysis_scale"].startswith("natural_log")
+    selection = json.loads(
+        (tmp_path / "stability/decoders/seed_1901/selection.json").read_text()
+    )
+    assert selection["expected_stream_bytes"] == 20
+    assert "validation" not in selection and "ood" not in selection
 
 
 def test_bottleneck_audit_config_and_gate() -> None:

@@ -173,7 +173,7 @@ def test_modelnet_manifest_preserves_official_splits_and_category_ood(
 ) -> None:
     for category in ("alpha", "beta"):
         for official_split in ("train", "test"):
-            for index in range(2):
+            for index in range(3):
                 _write_off(
                     tmp_path
                     / category
@@ -188,6 +188,7 @@ def test_modelnet_manifest_preserves_official_splits_and_category_ood(
         train_categories=("alpha",),
         heldout_categories=("beta",),
         train_per_category=1,
+        calibration_per_category=1,
         validation_per_category=1,
         category_ood_per_category=1,
         seed=37,
@@ -198,6 +199,11 @@ def test_modelnet_manifest_preserves_official_splits_and_category_ood(
     assert manifest["dataset"] == "ModelNet40"
     assert manifest["source"]["archive_sha256"] == "a" * 64
     assert manifest["splits"]["train"][0]["official_split"] == "train"
+    assert manifest["splits"]["calibration"][0]["official_split"] == "train"
+    assert (
+        manifest["splits"]["train"][0]["model_id"]
+        != manifest["splits"]["calibration"][0]["model_id"]
+    )
     assert manifest["splits"]["validation"][0]["official_split"] == "test"
     assert manifest["splits"]["category_ood"][0]["category"] == "beta"
 

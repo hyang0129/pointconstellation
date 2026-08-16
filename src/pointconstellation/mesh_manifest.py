@@ -173,6 +173,7 @@ def create_modelnet40_manifest(
     train_categories: tuple[str, ...],
     heldout_categories: tuple[str, ...],
     train_per_category: int,
+    calibration_per_category: int = 0,
     validation_per_category: int,
     category_ood_per_category: int,
     seed: int,
@@ -187,6 +188,8 @@ def create_modelnet40_manifest(
         raise ValueError("train and held-out categories must be disjoint")
     if min(train_per_category, validation_per_category, category_ood_per_category) < 1:
         raise ValueError("per-category sample counts must be positive")
+    if calibration_per_category < 0:
+        raise ValueError("calibration_per_category cannot be negative")
 
     discovered = discover_modelnet40_meshes(root)
     available = set(discovered["train"])
@@ -200,6 +203,8 @@ def create_modelnet40_manifest(
         "validation": [],
         "category_ood": [],
     }
+    if calibration_per_category:
+        splits["calibration"] = []
     for category in train_categories:
         train_records = sorted(
             discovered["train"][category],
@@ -209,10 +214,11 @@ def create_modelnet40_manifest(
             discovered["test"][category],
             key=lambda record: _rank(seed, category, record["model_id"]),
         )
-        if len(train_records) < train_per_category:
+        required_train = train_per_category + calibration_per_category
+        if len(train_records) < required_train:
             raise ValueError(
                 f"category {category} has {len(train_records)} train meshes; "
-                f"need {train_per_category}"
+                f"need {required_train}"
             )
         if len(test_records) < validation_per_category:
             raise ValueError(
@@ -220,6 +226,10 @@ def create_modelnet40_manifest(
                 f"need {validation_per_category}"
             )
         splits["train"].extend(train_records[:train_per_category])
+        if calibration_per_category:
+            splits["calibration"].extend(
+                train_records[train_per_category:required_train]
+            )
         splits["validation"].extend(test_records[:validation_per_category])
     for category in heldout_categories:
         test_records = sorted(
@@ -247,7 +257,10 @@ def create_modelnet40_manifest(
             "source_target": "independent_area_weighted_mesh_surface_samples",
             "normalization": "mesh_bbox_center_then_unit_max_vertex_radius",
             "official_split_policy": (
-                "train uses official train; validation and category_ood use "
+                "train and calibration use disjoint official train meshes; "
+                "validation and category_ood use official test"
+                if calibration_per_category
+                else "train uses official train; validation and category_ood use "
                 "official test"
             ),
         },
@@ -279,6 +292,7 @@ def main() -> None:
     parser.add_argument("--heldout-categories", type=_categories)
     parser.add_argument("--heldout-category-count", type=int, default=8)
     parser.add_argument("--train-per-category", type=int, default=32)
+    parser.add_argument("--calibration-per-category", type=int, default=0)
     parser.add_argument("--validation-per-category", type=int, default=8)
     parser.add_argument("--category-ood-per-category", type=int, default=8)
     parser.add_argument("--seed", type=int, default=1507)
@@ -317,6 +331,7 @@ def main() -> None:
         archive_sha256 = file_sha256(args.archive) if args.archive else None
         manifest = create_modelnet40_manifest(
             **common,
+            calibration_per_category=args.calibration_per_category,
             archive_sha256=archive_sha256,
         )
     else:
@@ -327,9 +342,9 @@ def main() -> None:
         json.dumps(
             {
                 "manifest": str(args.output),
-                "train": len(manifest["splits"]["train"]),
-                "validation": len(manifest["splits"]["validation"]),
-                "category_ood": len(manifest["splits"]["category_ood"]),
+                **{
+                    split: len(records) for split, records in manifest["splits"].items()
+                },
             },
             indent=2,
         )
