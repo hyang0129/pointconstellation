@@ -10,6 +10,7 @@ from pointconstellation.published_codec_benchmark import (
     PccGeoCnnV2Manifest,
     PublishedCodecBenchmarkConfig,
     _rate_summaries,
+    _trained_checkpoint_bytes,
 )
 
 
@@ -77,3 +78,17 @@ def test_rate_summary_uses_actual_streams_and_aggregate_mse() -> None:
     assert summary["mean_actual_bpov"] == pytest.approx(0.25)
     assert summary["official_d1_rmse_grid_units"] == pytest.approx(26**0.5)
     assert summary["official_d2_rmse_grid_units"] == pytest.approx(17**0.5)
+
+
+def test_retrained_model_size_excludes_training_events(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "checkpoint").write_text('model_checkpoint_path: "model.ckpt-5000"\n')
+    (checkpoint / "model.ckpt-5000.index").write_bytes(b"index")
+    (checkpoint / "model.ckpt-5000.data-00000-of-00001").write_bytes(b"weights")
+    (checkpoint / "train").mkdir()
+    (checkpoint / "train" / "events").write_bytes(b"not deployment data")
+
+    assert _trained_checkpoint_bytes(checkpoint) == len(
+        (checkpoint / "checkpoint").read_bytes()
+    ) + len(b"indexweights")

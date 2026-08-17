@@ -138,6 +138,20 @@ def _directory_bytes(path: Path) -> int:
     return sum(candidate.stat().st_size for candidate in files)
 
 
+def _trained_checkpoint_bytes(path: Path) -> int:
+    state = path / "checkpoint"
+    if not state.is_file():
+        raise FileNotFoundError(f"TensorFlow checkpoint state is missing: {state}")
+    first_line = state.read_text().splitlines()[0]
+    if '"' not in first_line:
+        raise RuntimeError(f"TensorFlow checkpoint state is invalid: {state}")
+    prefix = first_line.split('"', 2)[1]
+    files = [state, *sorted(path.glob(f"{prefix}.*"))]
+    if len(files) < 3 or any(not candidate.is_file() for candidate in files):
+        raise RuntimeError(f"TensorFlow deployment checkpoint is incomplete: {path}")
+    return sum(candidate.stat().st_size for candidate in files)
+
+
 def _row_key(row: dict[str, Any]) -> tuple[Any, ...]:
     return (
         row["lambda"],
@@ -221,7 +235,11 @@ def _codec_spec(
     )
     if not python.is_file() or not python.stat().st_mode & 0o111:
         raise FileNotFoundError(f"external environment Python is missing: {python}")
-    model_bytes = _directory_bytes(checkpoint)
+    model_bytes = (
+        _trained_checkpoint_bytes(checkpoint)
+        if manifest.training_manifest_subpath is not None
+        else _directory_bytes(checkpoint)
+    )
     if manifest.training_manifest_subpath is not None:
         training_manifest = workspace / manifest.training_manifest_subpath
         if not training_manifest.is_file() or file_sha256(training_manifest) != (

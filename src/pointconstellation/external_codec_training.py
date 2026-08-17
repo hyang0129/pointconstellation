@@ -318,6 +318,94 @@ def export_training_archive(
     return metadata
 
 
+def export_evaluation_archive(
+    config: ExactExternalRetrainConfig,
+    output_path: Path,
+    *,
+    max_clouds_per_split: int,
+) -> dict[str, Any]:
+    """Seal fixed validation/OOD sources separately from all training data."""
+
+    if max_clouds_per_split < 1:
+        raise ValueError("max_clouds_per_split must be positive")
+    if output_path.exists():
+        raise FileExistsError(f"evaluation archive already exists: {output_path}")
+    stability_path = Path(config.stability_config)
+    stability = StabilityExperimentConfig.from_json(stability_path)
+    manifest_path = Path(stability.dataset_manifest)
+    if file_sha256(manifest_path) != config.expected_stability_manifest_sha256:
+        raise RuntimeError("stability mesh manifest SHA-256 differs from declaration")
+    datasets = _datasets(stability)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="pc-external-eval-") as temporary:
+        root = Path(temporary)
+        records = []
+        for split in ("validation", "ood"):
+            dataset = datasets[split]
+            count = min(len(dataset), max_clouds_per_split)
+            for sample_index in range(count):
+                sample = dataset[sample_index]
+                source = sample["source_points"].numpy().astype(np.float32, copy=False)
+                normals = (
+                    sample["source_normals"].numpy().astype(np.float32, copy=False)
+                )
+                identity = f"{sample['family']}_{sample['model_id']}"
+                source_relative = Path("arrays") / split / f"{identity}.source.npy"
+                normals_relative = Path("arrays") / split / f"{identity}.normals.npy"
+                source_path = root / source_relative
+                normals_path = root / normals_relative
+                source_path.parent.mkdir(parents=True, exist_ok=True)
+                np.save(source_path, source, allow_pickle=False)
+                np.save(normals_path, normals, allow_pickle=False)
+                records.append(
+                    {
+                        "split": split,
+                        "category": str(sample["family"]),
+                        "model_id": str(sample["model_id"]),
+                        "sample_id": int(sample["sample_id"]),
+                        "source_points": len(source),
+                        "source_path": source_relative.as_posix(),
+                        "source_sha256": file_sha256(source_path),
+                        "normals_path": normals_relative.as_posix(),
+                        "normals_sha256": file_sha256(normals_path),
+                    }
+                )
+        manifest = {
+            "version": 1,
+            "experiment": "020_exact_external_evaluation",
+            "stability_config_sha256": file_sha256(stability_path),
+            "stability_manifest_sha256": file_sha256(manifest_path),
+            "data_protocol": _data_protocol(stability, datasets),
+            "selection": {
+                "policy": "first_manifest_records",
+                "max_clouds_per_split": max_clouds_per_split,
+                "splits": ["validation", "ood"],
+                "created_after_training_launch": True,
+                "available_to_training_processes": False,
+            },
+            "records": records,
+        }
+        manifest_bytes = _json_bytes(manifest)
+        (root / "evaluation_manifest.json").write_bytes(manifest_bytes)
+        with (
+            output_path.open("wb") as raw,
+            gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as zipped,
+            tarfile.open(fileobj=zipped, mode="w") as tar,
+        ):
+            _add_tree_to_tar(tar, root)
+    result = {
+        "archive": str(output_path),
+        "archive_bytes": output_path.stat().st_size,
+        "archive_sha256": file_sha256(output_path),
+        "manifest_sha256": _bytes_sha256(manifest_bytes),
+        "records": len(records),
+    }
+    output_path.with_suffix(output_path.suffix + ".json").write_bytes(
+        _json_bytes(result)
+    )
+    return result
+
+
 def _safe_extract(archive: Path, destination: Path) -> None:
     if destination.exists() and any(destination.iterdir()):
         raise FileExistsError(f"dataset destination is not empty: {destination}")
@@ -527,6 +615,9 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="command", required=True)
     export_parser = subparsers.add_parser("export")
     export_parser.add_argument("--output", type=Path, required=True)
+    evaluation_parser = subparsers.add_parser("export-evaluation")
+    evaluation_parser.add_argument("--output", type=Path, required=True)
+    evaluation_parser.add_argument("--max-clouds-per-split", type=int, default=16)
     extract_parser = subparsers.add_parser("extract")
     extract_parser.add_argument("--archive", type=Path, required=True)
     extract_parser.add_argument("--destination", type=Path, required=True)
@@ -540,6 +631,12 @@ def main() -> None:
     if args.command == "export":
         result = export_training_archive(config, args.output)
         result.pop("manifest")
+    elif args.command == "export-evaluation":
+        result = export_evaluation_archive(
+            config,
+            args.output,
+            max_clouds_per_split=args.max_clouds_per_split,
+        )
     elif args.command == "extract":
         result = extract_training_archive(config, args.archive, args.destination)
     else:

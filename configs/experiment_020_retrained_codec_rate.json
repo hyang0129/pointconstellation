@@ -1,0 +1,9 @@
+{
+  "codec_manifest": "configs/external/pcc_geo_cnn_v2_exact_q6.json",
+  "evaluation_root": "/mnt/home/hyang1/LLM_research/pointconstellation-external/pcc_geo_cnn_v2/exact-evaluation/dataset",
+  "expected_evaluation_manifest_sha256": "990adefe060f539228603c10525260f2bddc2276bd51571bc6ee8b4be481dcf6",
+  "pc_error_executable": "/mnt/home/hyang1/LLM_research/pointconstellation-external/tools/mpeg-pcc-dmetric/build/Release/pc_error",
+  "output_dir": "/mnt/home/hyang1/LLM_research/pointconstellation-external/pcc_geo_cnn_v2/exact-evaluation/results",
+  "minimum_training_steps": 5000,
+  "metric_position_bits": 12
+}
