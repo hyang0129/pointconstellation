@@ -586,12 +586,17 @@ def run_training_point(
     files = _checkpoint_files(checkpoint)
     if not any(file["path"].startswith("model.ckpt-") for file in files):
         raise RuntimeError("external training produced no model checkpoint")
+    checkpoint_state = (checkpoint / "checkpoint").read_text().splitlines()[0]
+    checkpoint_prefix = checkpoint_state.split('"', 2)[1]
+    checkpoint_step = int(checkpoint_prefix.rsplit("-", 1)[1])
     result = {
         "version": 1,
         "experiment": "020_exact_external_retrain",
         "arm": arm.name,
         "lambda": rate_lambda,
         "max_steps": budget,
+        "checkpoint_step": checkpoint_step,
+        "stopped_before_max_steps": checkpoint_step < budget,
         "batch_size": arm.batch_size,
         "model_config": arm.model_config,
         "upstream_url": config.upstream_url,

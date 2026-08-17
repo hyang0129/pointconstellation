@@ -103,6 +103,9 @@ def run_retrained_codec_benchmark(
     training_run = json.loads(training_run_path.read_text())
     if int(training_run["max_steps"]) < config.minimum_training_steps:
         raise RuntimeError("checkpoint has not reached the declared evaluation budget")
+    checkpoint_state = (checkpoint / "checkpoint").read_text().splitlines()[0]
+    checkpoint_prefix = checkpoint_state.split('"', 2)[1]
+    checkpoint_step = int(checkpoint_prefix.rsplit("-", 1)[1])
     executable = Path(config.pc_error_executable)
     if not executable.is_file() or not os.access(executable, os.X_OK):
         raise FileNotFoundError(f"pc_error is missing or not executable: {executable}")
@@ -128,7 +131,7 @@ def run_retrained_codec_benchmark(
     (output_dir / "decompress.log").write_text(results[0].decompress_output)
     rows = []
     metric_scratch = output_dir / "metric_scratch"
-    metric_scratch.mkdir()
+    metric_scratch.mkdir(exist_ok=True)
     for record, codec_result in zip(records, results, strict=True):
         source = record["source"]
         normals = record["normals"]
@@ -203,6 +206,7 @@ def run_retrained_codec_benchmark(
         "config": asdict(config),
         "lambda": rate_lambda,
         "training_run_sha256": file_sha256(training_run_path),
+        "checkpoint_step": checkpoint_step,
         "model_bytes": spec.model_bytes,
         "rows": rows,
         "summaries": summaries,
