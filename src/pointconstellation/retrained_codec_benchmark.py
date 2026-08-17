@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import tempfile
 import time
@@ -82,6 +81,23 @@ def _load_evaluation(config: RetrainedCodecBenchmarkConfig) -> list[dict[str, An
     return loaded
 
 
+def _rmse_or_none(values: list[float | None]) -> float | None:
+    """Return aggregate RMSE only when every declared cloud is valid."""
+
+    if not values or any(value is None for value in values):
+        return None
+    return float(np.sqrt(np.mean(np.asarray(values, dtype=np.float64))))
+
+
+def _valid_only_rmse(values: list[float | None]) -> float | None:
+    """Return an explicitly diagnostic RMSE over non-failure rows only."""
+
+    valid = [value for value in values if value is not None]
+    if not valid:
+        return None
+    return float(np.sqrt(np.mean(np.asarray(valid, dtype=np.float64))))
+
+
 def run_retrained_codec_benchmark(
     config: RetrainedCodecBenchmarkConfig,
     *,
@@ -138,7 +154,7 @@ def run_retrained_codec_benchmark(
         empty_reconstruction = len(codec_result.reconstruction) == 0
         if empty_reconstruction:
             official_metrics = {
-                key: math.inf
+                key: None
                 for key in (
                     "d1_mse",
                     "d2_mse",
@@ -148,7 +164,7 @@ def run_retrained_codec_benchmark(
             }
             official_metrics.update(
                 {
-                    key: -math.inf
+                    key: None
                     for key in (
                         "d1_psnr_db",
                         "d2_psnr_db",
@@ -157,7 +173,7 @@ def run_retrained_codec_benchmark(
                     )
                 }
             )
-            chamfer_mse = math.inf
+            chamfer_mse = None
         else:
             with tempfile.TemporaryDirectory(
                 prefix=f"{record['split']}-{record['model_id']}-",
@@ -205,14 +221,19 @@ def run_retrained_codec_benchmark(
     for split in ("validation", "ood"):
         group = [row for row in rows if row["split"] == split]
         stream_bytes = np.asarray([row["stream_bytes"] for row in group])
+        empty_reconstructions = sum(
+            row["status"] == "empty_reconstruction" for row in group
+        )
+        chamfer_values = [row["chamfer_mse"] for row in group]
+        d1_values = [row["d1_mse"] for row in group]
+        d2_values = [row["d2_mse"] for row in group]
         summaries.append(
             {
                 "split": split,
                 "clouds": len(group),
                 "valid_clouds": sum(row["status"] == "valid" for row in group),
-                "empty_reconstructions": sum(
-                    row["status"] == "empty_reconstruction" for row in group
-                ),
+                "empty_reconstructions": empty_reconstructions,
+                "rate_point_valid": empty_reconstructions == 0,
                 "mean_stream_bytes": float(stream_bytes.mean()),
                 "median_stream_bytes": float(np.median(stream_bytes)),
                 "minimum_stream_bytes": int(stream_bytes.min()),
@@ -220,15 +241,12 @@ def run_retrained_codec_benchmark(
                 "mean_actual_bpp": float(
                     np.mean([row["actual_stream_bpp"] for row in group])
                 ),
-                "aggregate_chamfer_rmse": math.sqrt(
-                    float(np.mean([row["chamfer_mse"] for row in group]))
-                ),
-                "official_d1_rmse_grid_units": math.sqrt(
-                    float(np.mean([row["d1_mse"] for row in group]))
-                ),
-                "official_d2_rmse_grid_units": math.sqrt(
-                    float(np.mean([row["d2_mse"] for row in group]))
-                ),
+                "aggregate_chamfer_rmse": _rmse_or_none(chamfer_values),
+                "official_d1_rmse_grid_units": _rmse_or_none(d1_values),
+                "official_d2_rmse_grid_units": _rmse_or_none(d2_values),
+                "valid_only_chamfer_rmse_diagnostic": _valid_only_rmse(chamfer_values),
+                "valid_only_d1_rmse_grid_units_diagnostic": _valid_only_rmse(d1_values),
+                "valid_only_d2_rmse_grid_units_diagnostic": _valid_only_rmse(d2_values),
             }
         )
     result = {
@@ -262,7 +280,7 @@ def run_retrained_codec_benchmark(
     }
     if not all(result["contract_checks"].values()):
         raise RuntimeError("retrained external-codec evaluation contract failed")
-    metrics_path.write_text(json.dumps(result, indent=2) + "\n")
+    metrics_path.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
     return result
 
 

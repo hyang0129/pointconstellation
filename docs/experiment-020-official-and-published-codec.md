@@ -1,7 +1,8 @@
 # Experiment 020: official metrics and published learned codec
 
-Status: official-metric slice and published-codec pipeline/rate smoke complete;
-fair external retraining and full curves remain open under
+Status: official-metric slice, published-codec pipeline/rate smoke, and the
+5,000-step fair-retraining feasibility pilot are complete; a staged 20,000-step
+recovery test and full curves remain open under
 [issue #15](https://github.com/hyang0129/pointconstellation/issues/15).
 
 ## Decision summary
@@ -209,11 +210,42 @@ patch places those matrix operations and gradients on CPU while keeping 3D
 convolutions and the remaining optimization graph on GPU. A 500-step sealed
 checkpoint completed successfully before launching the five-point pilot.
 
-The first 5,000-step runs are rate-feasibility pilots. If at least three q6
-points approach the 50-byte interval, the declared 100,000-step budgets will
-be completed before distortion comparison. A non-overlap after q6 global
-coding would establish a stronger framing/entropy floor and direct the next
-work toward a new entropy model rather than more training.
+### Exact-split 5,000-step feasibility result
+
+The five q6/global pilots were trained only on the sealed train and calibration
+archive, then evaluated on a separately sealed set of 16 validation and 16
+category-OOD clouds. Every lambda emitted exactly 803 bytes for every cloud:
+3.1367 bits per source point and 16.06x the 50-byte Point Constellation stream.
+There is no rate separation across lambdas at this budget.
+
+| Lambda | Validation valid | OOD valid | Stream bytes | Rate-point status |
+|---:|---:|---:|---:|---|
+| 1.00e-05 | 2/16 | 5/16 | 803 | failed: empty decodes |
+| 3.00e-06 | 0/16 | 0/16 | 803 | failed: empty decodes |
+| 1.00e-06 | 0/16 | 0/16 | 803 | failed: empty decodes |
+| 3.00e-07 | 0/16 | 0/16 | 803 | failed: empty decodes |
+| 1.00e-07 | 0/16 | 0/16 | 803 | failed: empty decodes |
+
+An empty reconstruction invalidates the complete operating point; distortion
+is not averaged over only the successful clouds. Machine-readable output uses
+`null` for its aggregate distortion and records a separately labeled
+valid-only diagnostic when any valid rows exist. This prevents failure rows
+from becoming finite maxima or nonstandard JSON infinities.
+
+This pilot is evidence of an undertrained or collapsed entropy/reconstruction
+model, not evidence that the published codec loses to Point Constellation. Its
+calibration objective was still improving through step 5,000, and the released
+roughly 39,000-step q6 feasibility checkpoint emitted 111 bytes on the same
+diagnostic cloud. The predeclared response is therefore staged rather than an
+immediate five-way 100,000-step sweep:
+
+1. resume `1e-5` and `1e-6` from 5,000 to 20,000 steps in parallel;
+2. require nonempty reconstruction on all 32 sealed clouds and material stream
+   reduction, with lambda-dependent rate separation, before scaling; and
+3. only then resume all five declared lambdas to 100,000 steps and compute
+   distortion. If the recovery gate fails, stop training and attribute the
+   obstruction to low-rate framing/objective feasibility rather than codec
+   quality.
 
 Gate B still requires at least three genuinely overlapping actual-rate points;
 otherwise the nearest observed rate gap is reported without extrapolation.
