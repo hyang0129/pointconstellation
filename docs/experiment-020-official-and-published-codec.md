@@ -159,11 +159,47 @@ POINTCONSTELLATION_CODEC_GPU=0 \
 
 ## Next decision
 
-Train the external architecture on the exact Experiment 019 partition and
-determine whether more aggressive lambdas or a declared low-rate configuration
-can approach 50 bytes. Gate B requires at least three genuinely overlapping
-actual-rate points; otherwise the released smoke already establishes the
-nearest observed rate gap without extrapolation.
+### Exact-source retraining protocol
+
+The fair retraining slice is now fixed and executing. A deterministic exporter
+materializes the exact 2,048-point source sample for each of the 512 Experiment
+019 training meshes and 128 calibration meshes. It does not export validation
+or category-OOD records. The resulting 10,424,358-byte external artifact has
+SHA-256
+`f844433174b3843102adcc1b5de6417a9d6d748be94a24156b99843710a554aa`;
+its machine-readable training manifest has SHA-256
+`4808da615b332599a8f57c5d8f57de1ea9a5305d02f58920fea024b75d783ddb`.
+Regenerating the archive produces the same bytes.
+
+Two arms keep the published `c3p` network, entropy model, focal/rate objective,
+optimizer, and 64³ network input unchanged:
+
+- `native_q9_oct3` uses the upstream-aligned 512³ grid and level-three octree;
+  the exact sources produce 53,127 occupied training/calibration blocks;
+- `low_rate_q6_global` quantizes each entire object to one 64³ block and trains
+  five aggressive lambdas from `1e-5` through `1e-7`. This is explicitly a
+  low-rate protocol adaptation, not the paper's native ModelNet operating
+  point.
+
+The upstream container code does not handle octree level zero despite its
+format supporting a zero-length octree. The low-rate evaluator therefore uses
+a declared compatibility patch that returns the sole block unchanged during
+partition/departition and converts NumPy diagnostic values to JSON-compatible
+Python floats. Its Git binary-diff SHA-256 is
+`ffba367053a7037ce7b19dc3fea298e412f17970bcd0bd7e8f11152c760bee26`.
+The adapter rejects any clean or patched checkout whose exact diff identity
+does not match its manifest. The patch does not change neural layers, learned
+parameters, entropy tensors, thresholds, reconstruction, or the serialized
+block payload.
+
+The first 5,000-step runs are rate-feasibility pilots. If at least three q6
+points approach the 50-byte interval, the declared 100,000-step budgets will
+be completed before distortion comparison. A non-overlap after q6 global
+coding would establish a stronger framing/entropy floor and direct the next
+work toward a new entropy model rather than more training.
+
+Gate B still requires at least three genuinely overlapping actual-rate points;
+otherwise the nearest observed rate gap is reported without extrapolation.
 
 AnyPcc remains the next modern comparison on one of its native dense/LiDAR
 benchmarks. Its CUDA, TorchSparse, DeepCABAC, per-instance adaptation, and

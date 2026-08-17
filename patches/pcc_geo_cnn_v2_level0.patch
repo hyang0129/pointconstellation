@@ -28,3 +28,16 @@ index 6e32791..0e62494 100644
      bbox_min = np.asarray(bbox_min)
      bbox_max = np.asarray(bbox_max)
  
+diff --git a/src/compress_octree.py b/src/compress_octree.py
+index d1501dd..5294317 100644
+--- a/src/compress_octree.py
++++ b/src/compress_octree.py
+@@ -115,6 +115,7 @@ def compress():
+                 if decode_files:
+                     pc_io.write_df(cur_dec_files[j], pc_io.pa_to_df(cur_data['blocks_full']))
+                 with open(of + '.enc.metric.json', 'w') as f:
+-                    json.dump(cur_data['metrics'], f, sort_keys=True, indent=4)
++                    serializable_metrics = {key: float(value) for key, value in cur_data['metrics'].items()}
++                    json.dump(serializable_metrics, f, sort_keys=True, indent=4)
+                 if args.debug:
+                     pc_io.write_df(of + '.enc.ply', pc_io.pa_to_df(cur_data['blocks_full']))

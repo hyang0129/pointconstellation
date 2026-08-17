@@ -1,0 +1,20 @@
+diff --git a/src/tr_train.py b/src/tr_train.py
+index 2c23b5e..9864b9c 100644
+--- a/src/tr_train.py
++++ b/src/tr_train.py
+@@ -20,6 +20,15 @@ from model_configs import ModelConfigType
+ np.random.seed(42)
+ tf.set_random_seed(42)
+ 
++# CUDA 10 predates Hopper and its batched GEMM fails for TensorFlow
++# Compression's tiny entropy-bottleneck matrices. Keep only those linalg
++# matrix operations on CPU; 3D convolutions and optimization remain on GPU.
++_gpu_incompatible_matmul = tf.linalg.matmul
++def _cpu_entropy_matmul(*args, **kwargs):
++    with tf.device('/cpu:0'):
++        return _gpu_incompatible_matmul(*args, **kwargs)
++tf.linalg.matmul = _cpu_entropy_matmul
++
+ 
+ def train():
+     p_min, p_max, dense_tensor_shape = pc_io.get_shape_data(args.resolution, args.data_format)

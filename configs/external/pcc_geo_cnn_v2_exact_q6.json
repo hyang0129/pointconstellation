@@ -22,8 +22,8 @@
   "resolution": 64,
   "octree_level": 0,
   "timeout_seconds": 43200.0,
-  "protocol_note": "Low-rate adaptation of the published c3p architecture trained on the exact Experiment 019 train/calibration source clouds. The whole q6 object is one native 64^3 block. A declared two-line octree level-zero compatibility patch changes only container partition/departition behavior, not the neural architecture, entropy model, training objective, or arithmetic-coded tensors.",
-  "checkout_diff_sha256": "e2557c216d048328bf3f8253387502fd073e14426f53c2ad197365bb5c6e6162",
+  "protocol_note": "Low-rate adaptation of the published c3p architecture trained on the exact Experiment 019 train/calibration source clouds. The whole q6 object is one native 64^3 block. A declared compatibility patch enables octree level zero and converts NumPy diagnostic scalars to Python floats; it changes neither the neural architecture, entropy model, training objective, arithmetic-coded tensors, nor reconstructed geometry.",
+  "checkout_diff_sha256": "ffba367053a7037ce7b19dc3fea298e412f17970bcd0bd7e8f11152c760bee26",
   "training_manifest_subpath": "exact-retrain/dataset/training_dataset_manifest.json",
   "training_manifest_sha256": "4808da615b332599a8f57c5d8f57de1ea9a5305d02f58920fea024b75d783ddb",
   "training_arm": "low_rate_q6_global"

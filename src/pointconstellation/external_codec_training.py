@@ -95,6 +95,7 @@ class ExactExternalRetrainConfig:
     arms: tuple[ExternalTrainingArm, ...]
     expected_dataset_archive_sha256: str | None = None
     expected_dataset_manifest_sha256: str | None = None
+    checkout_diff_sha256: str | None = None
     timeout_seconds: float = 172800.0
 
     def __post_init__(self) -> None:
@@ -111,6 +112,7 @@ class ExactExternalRetrainConfig:
         for expected in (
             self.expected_dataset_archive_sha256,
             self.expected_dataset_manifest_sha256,
+            self.checkout_diff_sha256,
         ):
             if expected is not None and len(expected) != 64:
                 raise ValueError("expected dataset hashes must be SHA-256 values")
@@ -239,6 +241,9 @@ def _write_dataset_tree(
     # the export recipe stable before and after those hashes are pinned.
     export_config["expected_dataset_archive_sha256"] = None
     export_config["expected_dataset_manifest_sha256"] = None
+    # Training checkout portability does not affect source quantization.
+    export_config["upstream_subpath"] = "upstream"
+    export_config.pop("checkout_diff_sha256", None)
     manifest = {
         "version": 1,
         "experiment": "020_exact_external_retrain",
@@ -374,6 +379,15 @@ def _git_output(upstream: Path, *arguments: str) -> str:
     ).stdout.strip()
 
 
+def _git_diff_sha256(upstream: Path) -> str:
+    completed = subprocess.run(
+        ("git", "-C", str(upstream), "diff", "--binary", "HEAD"),
+        check=True,
+        capture_output=True,
+    )
+    return hashlib.sha256(completed.stdout).hexdigest()
+
+
 def _checkpoint_files(checkpoint: Path) -> list[dict[str, Any]]:
     return [
         {
@@ -412,8 +426,10 @@ def run_training_point(
     commit = _git_output(upstream, "rev-parse", "HEAD")
     if commit != config.upstream_commit:
         raise RuntimeError("external upstream commit differs from declaration")
-    if _git_output(upstream, "status", "--short"):
-        raise RuntimeError("training requires a clean pinned upstream checkout")
+    actual_diff = _git_diff_sha256(upstream)
+    expected_diff = config.checkout_diff_sha256 or hashlib.sha256(b"").hexdigest()
+    if actual_diff != expected_diff:
+        raise RuntimeError("external training checkout patch identity mismatch")
     dataset_manifest = training_root / "dataset" / "training_dataset_manifest.json"
     if (
         config.expected_dataset_manifest_sha256 is not None
@@ -492,6 +508,7 @@ def run_training_point(
         "model_config": arm.model_config,
         "upstream_url": config.upstream_url,
         "upstream_commit": commit,
+        "checkout_diff_sha256": actual_diff,
         "environment": json.loads(environment_path.read_text()),
         "dataset_manifest_sha256": file_sha256(dataset_manifest),
         "command": list(command),
