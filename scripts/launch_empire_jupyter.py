@@ -14,6 +14,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from pointconstellation.cluster.empire import (  # noqa: E402
     parse_all_jobs,
+    pointconstellation_jobs,
     validate_launch,
 )
 
@@ -74,7 +75,8 @@ def main() -> None:
         str(args.port),
     ]
     print(
-        f"Current state: {len(jobs)} total queued/running job(s).\n"
+        f"Current state: {len(pointconstellation_jobs(jobs))} Point "
+        f"Constellation 86xx job(s); {len(jobs)} total user job(s).\n"
         f"Command: {shlex_join(command)}"
     )
     if not args.submit:

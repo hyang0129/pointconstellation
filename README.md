@@ -300,6 +300,11 @@ a guarded Jupyter allocation launcher, live SLURM node discovery, remote
 Jupyter execution, GPU-aware dispatch, and job tracking. It assumes the local
 SSH alias `empire-ai`; keys and passwords stay outside Git.
 
+Point Constellation exclusively reserves the `86xx` Jupyter-port namespace and
+allows up to six logical allocations. Allocation identity is `hostname-port`,
+so shared physical GPU hosts do not merge workstreams. Compute must run through
+SLURM/Jupyter rather than direct GPU-node SSH.
+
 See the [EmpireAI guide](docs/empire-ai.md). No GPU allocation or training job
 is submitted automatically.
 
