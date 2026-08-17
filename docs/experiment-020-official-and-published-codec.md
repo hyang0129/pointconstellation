@@ -185,8 +185,10 @@ The upstream container code does not handle octree level zero despite its
 format supporting a zero-length octree. The low-rate evaluator therefore uses
 a declared compatibility patch that returns the sole block unchanged during
 partition/departition and converts NumPy diagnostic values to JSON-compatible
-Python floats. Its Git binary-diff SHA-256 is
-`ffba367053a7037ce7b19dc3fea298e412f17970bcd0bd7e8f11152c760bee26`.
+Python floats. It also records an explicitly empty reconstruction when the
+upstream failure policy selects threshold 255, instead of crashing while
+computing a diagnostic score for that empty set. Its Git binary-diff SHA-256 is
+`a08672f68e1c7bd680b8cba603447994ad9a89b7a469dc73e4909316fa6c8edc`.
 The adapter rejects any clean or patched checkout whose exact diff identity
 does not match its manifest. The patch does not change neural layers, learned
 parameters, entropy tensors, thresholds, reconstruction, or the serialized

@@ -320,6 +320,7 @@ def _codec_spec(
             ("TF_CUDNN_USE_AUTOTUNE", "0"),
         ),
         checkout_diff_sha256=manifest.checkout_diff_sha256,
+        allow_empty_reconstruction=manifest.training_manifest_subpath is not None,
     )
 
 

@@ -41,3 +41,21 @@ index d1501dd..5294317 100644
 +                    json.dump(serializable_metrics, f, sort_keys=True, indent=4)
                  if args.debug:
                      pc_io.write_df(of + '.enc.ply', pc_io.pa_to_df(cur_data['blocks_full']))
+diff --git a/src/model_types.py b/src/model_types.py
+index bf0308a..98ef76b 100644
+--- a/src/model_types.py
++++ b/src/model_types.py
+@@ -160,7 +160,11 @@ def select_best_per_opt_metric(binstr, x_hat_list, level, opt_metrics, points, r
+         cur_blocks_depart = [departition_octree(x, binstr, bbox_min, bbox_max, level) for x in cur_x_hat_list]
+         cur_blocks_full = [np.vstack(x) for x in cur_blocks_depart]
+-        cur_metrics_full = [compute_metrics(points[:, :3], x, resolution - 1, p1_n=get_normals_if(points, with_normals),
+-                                            t1=t1) for x in cur_blocks_full]
++        cur_metrics_full = [
++            compute_metrics(points[:, :3], x, resolution - 1,
++                            p1_n=get_normals_if(points, with_normals), t1=t1)
++            if len(x) else {metric_key: -np.inf}
++            for x in cur_blocks_full
++        ]
+         cur_metrics = [x[metric_key] for x in cur_metrics_full]
+         local_best_idx = np.argmax(cur_metrics)
+         best_idx = indexes[local_best_idx]

@@ -131,6 +131,20 @@ def test_external_codec_rejects_unregistered_checkout_patch(tmp_path: Path) -> N
         )
 
 
+def test_external_codec_can_record_declared_empty_reconstruction(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "empty.ply"
+    path.write_text(
+        "ply\nformat ascii 1.0\nelement vertex 0\n"
+        "property float x\nproperty float y\nproperty float z\nend_header\n"
+    )
+
+    assert _read_ply_xyz(path, allow_empty=True).shape == (0, 3)
+    with pytest.raises(ValueError, match="no vertices"):
+        _read_ply_xyz(path)
+
+
 def test_external_codec_refuses_to_overwrite_outputs(tmp_path: Path) -> None:
     spec = _spec(tmp_path)
     points = np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32)

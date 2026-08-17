@@ -45,7 +45,7 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _read_ply_xyz(path: Path) -> NDArray[np.float32]:
+def _read_ply_xyz(path: Path, *, allow_empty: bool = False) -> NDArray[np.float32]:
     """Read x/y/z from ASCII or scalar-property binary PLY vertex data."""
 
     with path.open("rb") as handle:
@@ -74,6 +74,8 @@ def _read_ply_xyz(path: Path) -> NDArray[np.float32]:
             elif fields[:1] == ["end_header"]:
                 data_offset = handle.tell()
                 break
+    if vertex_count == 0 and allow_empty:
+        return np.empty((0, 3), dtype=np.float32)
     if format_name == "ascii":
         return read_ascii_ply(path)
     if format_name not in {"binary_little_endian", "binary_big_endian"}:
@@ -137,6 +139,7 @@ class ExternalCodecSpec:
     environment_manifest: str | None = None
     environment_variables: tuple[tuple[str, str], ...] = ()
     checkout_diff_sha256: str | None = None
+    allow_empty_reconstruction: bool = False
 
     def __post_init__(self) -> None:
         if not self.name or any(character.isspace() for character in self.name):
@@ -425,8 +428,12 @@ def run_external_codec(
         raise RuntimeError("external codec produced no nonempty stream")
     if not reconstruction_path.is_file():
         raise RuntimeError("external codec produced no decoded PLY")
-    decoded_integer = _read_ply_xyz(reconstruction_path).astype(np.float64)
-    if np.any(decoded_integer < 0) or np.any(decoded_integer > levels):
+    decoded_integer = _read_ply_xyz(
+        reconstruction_path, allow_empty=spec.allow_empty_reconstruction
+    ).astype(np.float64)
+    if len(decoded_integer) and (
+        np.any(decoded_integer < 0) or np.any(decoded_integer > levels)
+    ):
         raise RuntimeError("external decoded coordinates lie outside the declared grid")
     reconstruction = (decoded_integer * (2.0 / levels) - 1.0).astype(np.float32)
     return ExternalCodecResult(
@@ -532,8 +539,12 @@ def run_external_codec_batch(
             raise RuntimeError("external codec produced no nonempty stream")
         if not reconstruction_path.is_file():
             raise RuntimeError("external codec produced no decoded PLY")
-        decoded_integer = _read_ply_xyz(reconstruction_path).astype(np.float64)
-        if np.any(decoded_integer < 0) or np.any(decoded_integer > levels):
+        decoded_integer = _read_ply_xyz(
+            reconstruction_path, allow_empty=spec.allow_empty_reconstruction
+        ).astype(np.float64)
+        if len(decoded_integer) and (
+            np.any(decoded_integer < 0) or np.any(decoded_integer > levels)
+        ):
             raise RuntimeError(
                 "external decoded coordinates lie outside the declared grid"
             )

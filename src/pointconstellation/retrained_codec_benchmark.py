@@ -135,23 +135,48 @@ def run_retrained_codec_benchmark(
     for record, codec_result in zip(records, results, strict=True):
         source = record["source"]
         normals = record["normals"]
-        with tempfile.TemporaryDirectory(
-            prefix=f"{record['split']}-{record['model_id']}-",
-            dir=metric_scratch,
-        ) as temporary:
-            official = run_pc_error(
-                executable,
-                source,
-                codec_result.reconstruction,
-                normals,
-                work_dir=Path(temporary),
-                position_bits=config.metric_position_bits,
+        empty_reconstruction = len(codec_result.reconstruction) == 0
+        if empty_reconstruction:
+            official_metrics = {
+                key: math.inf
+                for key in (
+                    "d1_mse",
+                    "d2_mse",
+                    "d1_hausdorff",
+                    "d2_hausdorff",
+                )
+            }
+            official_metrics.update(
+                {
+                    key: -math.inf
+                    for key in (
+                        "d1_psnr_db",
+                        "d2_psnr_db",
+                        "d1_hausdorff_psnr_db",
+                        "d2_hausdorff_psnr_db",
+                    )
+                }
             )
-        reconstruction = torch.from_numpy(codec_result.reconstruction).unsqueeze(0)
-        target = torch.from_numpy(source).unsqueeze(0)
-        chamfer_mse = float(
-            _per_cloud_chamfer(reconstruction, target, chunk_size=256)[0].item()
-        )
+            chamfer_mse = math.inf
+        else:
+            with tempfile.TemporaryDirectory(
+                prefix=f"{record['split']}-{record['model_id']}-",
+                dir=metric_scratch,
+            ) as temporary:
+                official = run_pc_error(
+                    executable,
+                    source,
+                    codec_result.reconstruction,
+                    normals,
+                    work_dir=Path(temporary),
+                    position_bits=config.metric_position_bits,
+                )
+            official_metrics = official.metrics
+            reconstruction = torch.from_numpy(codec_result.reconstruction).unsqueeze(0)
+            target = torch.from_numpy(source).unsqueeze(0)
+            chamfer_mse = float(
+                _per_cloud_chamfer(reconstruction, target, chunk_size=256)[0].item()
+            )
         codec_levels = (1 << manifest.position_bits) - 1
         unique_voxels = len(
             np.unique(np.rint((source + 1.0) * 0.5 * codec_levels), axis=0)
@@ -165,6 +190,7 @@ def run_retrained_codec_benchmark(
                 "source_points": len(source),
                 "codec_input_unique_voxels": unique_voxels,
                 "decoded_points": len(codec_result.reconstruction),
+                "status": ("empty_reconstruction" if empty_reconstruction else "valid"),
                 "stream_bytes": codec_result.stream_bytes,
                 "actual_stream_bpp": 8.0 * codec_result.stream_bytes / len(source),
                 "stream_sha256": codec_result.stream_sha256,
@@ -172,7 +198,7 @@ def run_retrained_codec_benchmark(
                 "chamfer_mse": chamfer_mse,
                 "encode_seconds": codec_result.encode_seconds,
                 "decode_seconds": codec_result.decode_seconds,
-                **official.metrics,
+                **official_metrics,
             }
         )
     summaries = []
@@ -183,6 +209,10 @@ def run_retrained_codec_benchmark(
             {
                 "split": split,
                 "clouds": len(group),
+                "valid_clouds": sum(row["status"] == "valid" for row in group),
+                "empty_reconstructions": sum(
+                    row["status"] == "empty_reconstruction" for row in group
+                ),
                 "mean_stream_bytes": float(stream_bytes.mean()),
                 "median_stream_bytes": float(np.median(stream_bytes)),
                 "minimum_stream_bytes": int(stream_bytes.min()),
@@ -223,6 +253,11 @@ def run_retrained_codec_benchmark(
             "minimum_training_budget_reached": True,
             "training_identity_pinned": True,
             "checkout_patch_pinned": True,
+            "empty_reconstructions_explicitly_recorded": all(
+                (row["decoded_points"] == 0)
+                == (row["status"] == "empty_reconstruction")
+                for row in rows
+            ),
         },
     }
     if not all(result["contract_checks"].values()):
