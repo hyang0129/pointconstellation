@@ -1,0 +1,15 @@
+{
+  "stability_config": "configs/experiment_019_stability_modelnet40.json",
+  "stability_artifact_dir": "artifacts/local/experiment_019_stability_modelnet40",
+  "pc_error_executable": "artifacts/tools/mpeg-pcc-dmetric/build/Release/pc_error",
+  "position_bits": 12,
+  "timeout_seconds": 120.0,
+  "decoder_seeds": [7, 17, 29, 41, 53, 67],
+  "refiner_seeds": [101, 211, 307],
+  "splits": ["validation", "ood"],
+  "max_clouds_per_split": null,
+  "bootstrap_samples": 10000,
+  "bootstrap_seed": 20260817,
+  "confidence_level": 0.95,
+  "output_dir": "artifacts/local/experiment_020_official_stability"
+}

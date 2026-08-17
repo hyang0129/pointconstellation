@@ -153,6 +153,14 @@ codec by 29.90% (95% CI 23.26--35.77). Gate D nevertheless remains open:
 published entropy-coded learned codecs, a stabilized official D1/D2 pass, and
 the multi-rate common-test-condition comparison are still required.
 
+[Experiment 020](experiment-020-official-and-published-codec.md) completes the
+stabilized official-metric pass at the primary rate: validation improves by
+16.52% D1 and 34.65% D2, category OOD improves by 18.80% and 33.78%, and all
+six decoder marginals are positive. Its pinned `pcc_geo_cnn_v2` harness is
+implemented and its released five-rate one-cloud smoke is 35--176x above the
+50-byte rate. A fair retrained, statistically evaluated curve with overlapping
+rates remains the open part of Gate D.
+
 ## Work package E: inference headroom
 
 At the primary operating points, run multi-start per-cloud Adam/STE from FPS and

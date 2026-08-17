@@ -310,10 +310,14 @@ theory-backed, comprehensively benchmarked ICLR/NeurIPS-quality paper. The
 plane codec, fixed-rate ML baselines, rate sweeps, and refiner benchmarks are
 runnable. [Experiment 019](docs/experiment-019-stability.md) reports a stable
 six-decoder by three-refiner ModelNet40 result at one 50-byte operating point,
-including a positive internal learned-feature-codec comparison. Claims about
-competitive general-purpose compression performance have not been made: the
-published entropy-coded codec and common-test-condition comparisons remain
-open. The [paper benchmark epic](https://github.com/hyang0129/pointconstellation/issues/3)
+including a positive internal learned-feature-codec comparison.
+[Experiment 020](docs/experiment-020-official-and-published-codec.md) confirms
+that result with official D1/D2 and adds a pinned complete-codec harness for
+`pcc_geo_cnn_v2` on its native ModelNet occupancy grid. Claims about competitive
+general-purpose compression performance have not been made: the executed
+released-checkpoint smoke is at least 35x above the 50-byte rate, while the fair
+retrained curve and common-test-condition comparisons remain open. The
+[paper benchmark epic](https://github.com/hyang0129/pointconstellation/issues/3)
 tracks the remaining evidence.
 
 ## License
