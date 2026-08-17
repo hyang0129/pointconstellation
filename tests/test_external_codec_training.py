@@ -70,7 +70,7 @@ def test_external_training_config_pins_exact_split() -> None:
     assert config.arm("low_rate_q6_global").octree_level == 0
     assert len(config.arm("low_rate_q6_global").lambdas) == 5
     assert config.checkout_diff_sha256 == (
-        "e7baed28f5cec01f192b40599049d80190db5858a5eff2ab5be9c9f181bc55ee"
+        "419ac2ca018fd7402a5624c075b9b660d1af7ce2ee2bdd5bc66edb0241e11666"
     )
 
 
