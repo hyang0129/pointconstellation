@@ -297,6 +297,9 @@ def _codec_spec(
         model_bytes=model_bytes,
         environment_manifest=str(environment),
         environment_variables=(
+            # The controller may use a separate Python environment. Never let
+            # its import path shadow the pinned legacy codec dependencies.
+            ("PYTHONPATH", ""),
             (
                 "LD_LIBRARY_PATH",
                 str(workspace / "env" / "lib")
