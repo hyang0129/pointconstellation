@@ -192,6 +192,21 @@ does not match its manifest. The patch does not change neural layers, learned
 parameters, entropy tensors, thresholds, reconstruction, or the serialized
 block payload.
 
+As a feasibility diagnostic, the released `1e-5` checkpoint encoded the same
+`airplane_0641` source as one q6 block into 111 actual bytes (0.4336 bits per
+source point, 2.22x the Point Constellation stream). Independent decompression
+matched the encoder reconstruction byte-for-byte and produced 2,095 points.
+On the common q12 metric grid it measured D1 MSE 12,054.75 and D2 MSE 5,060.20.
+This released-checkpoint row retains the leakage caveat and is not a fair
+comparison, but it establishes that removing block fragmentation can bring the
+published architecture close enough for an overlap search.
+
+The original CUDA 10 stack also failed on H200 during TensorFlow Compression's
+small batched entropy matrix gradient. The declared training-only portability
+patch places those matrix operations and gradients on CPU while keeping 3D
+convolutions and the remaining optimization graph on GPU. A 500-step sealed
+checkpoint completed successfully before launching the five-point pilot.
+
 The first 5,000-step runs are rate-feasibility pilots. If at least three q6
 points approach the 50-byte interval, the declared 100,000-step budgets will
 be completed before distortion comparison. A non-overlap after q6 global

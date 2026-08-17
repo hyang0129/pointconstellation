@@ -8,6 +8,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+pytest.importorskip("torch")
+
 from pointconstellation.external_codec_training import (
     ExactExternalRetrainConfig,
     ExternalTrainingArm,
