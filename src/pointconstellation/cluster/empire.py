@@ -186,13 +186,12 @@ def parse_all_jobs(output: str) -> list[dict[str, str]]:
         parts = [part.strip() for part in raw_line.split("|")]
         if len(parts) >= 4:
             jobs.append(
-                dict(
-                    zip(
-                        ("job_id", "name", "state", "hostname"),
-                        parts[:4],
-                        strict=True,
-                    )
-                )
+                {
+                    "job_id": parts[0],
+                    "name": parts[1],
+                    "state": parts[2],
+                    "hostname": parts[3],
+                }
             )
     return jobs
 
