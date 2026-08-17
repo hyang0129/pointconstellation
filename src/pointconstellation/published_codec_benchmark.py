@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import torch
 
 from pointconstellation.codecs import (
     ExternalCodecSpec,
@@ -21,12 +20,7 @@ from pointconstellation.codecs import (
     run_pc_error,
 )
 from pointconstellation.data import file_sha256
-from pointconstellation.stability_experiment import (
-    StabilityExperimentConfig,
-    _data_protocol,
-    _datasets,
-    _per_cloud_chamfer,
-)
+from pointconstellation.metrics import chamfer_rmse
 
 
 @dataclass(frozen=True)
@@ -329,6 +323,12 @@ def run_published_codec_benchmark(
 ) -> dict[str, Any]:
     """Run and resume all released-model rate points on fixed source clouds."""
 
+    from pointconstellation.stability_experiment import (
+        StabilityExperimentConfig,
+        _data_protocol,
+        _datasets,
+    )
+
     manifest_path = Path(config.codec_manifest)
     manifest = PccGeoCnnV2Manifest.from_json(manifest_path)
     stability_path = Path(config.stability_config)
@@ -437,14 +437,7 @@ def run_published_codec_benchmark(
             codec_levels = (1 << manifest.position_bits) - 1
             codec_input = np.rint((source + 1.0) * 0.5 * codec_levels)
             codec_input_unique_voxels = len(np.unique(codec_input, axis=0))
-            reconstruction = torch.from_numpy(codec_result.reconstruction).unsqueeze(0)
-            chamfer_mse = float(
-                _per_cloud_chamfer(
-                    reconstruction,
-                    sample["source_points"].unsqueeze(0),
-                    chunk_size=stability.distance_chunk_size,
-                )[0].item()
-            )
+            chamfer_mse = chamfer_rmse(codec_result.reconstruction, source) ** 2
             with tempfile.TemporaryDirectory(
                 prefix=f"{split}-{rate_lambda}-", dir=scratch
             ) as temporary:

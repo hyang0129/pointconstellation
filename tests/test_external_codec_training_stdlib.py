@@ -31,3 +31,19 @@ def test_checkpoint_step_reads_tensorflow_state(tmp_path: Path) -> None:
     (tmp_path / "checkpoint").write_text('model_checkpoint_path: "model.ckpt-20000"\n')
 
     assert _checkpoint_step(tmp_path) == 20000
+
+
+def test_retrained_benchmark_does_not_import_torch() -> None:
+    code = (
+        "import pointconstellation.retrained_codec_benchmark, sys; "
+        "assert 'torch' not in sys.modules"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr

@@ -12,15 +12,14 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import torch
 
 from pointconstellation.codecs import run_external_codec_batch, run_pc_error
 from pointconstellation.data import file_sha256
+from pointconstellation.metrics import chamfer_rmse
 from pointconstellation.published_codec_benchmark import (
     PccGeoCnnV2Manifest,
     _codec_spec,
 )
-from pointconstellation.stability_experiment import _per_cloud_chamfer
 
 
 @dataclass(frozen=True)
@@ -190,11 +189,7 @@ def run_retrained_codec_benchmark(
                     position_bits=config.metric_position_bits,
                 )
             official_metrics = official.metrics
-            reconstruction = torch.from_numpy(codec_result.reconstruction).unsqueeze(0)
-            target = torch.from_numpy(source).unsqueeze(0)
-            chamfer_mse = float(
-                _per_cloud_chamfer(reconstruction, target, chunk_size=256)[0].item()
-            )
+            chamfer_mse = chamfer_rmse(codec_result.reconstruction, source) ** 2
         codec_levels = (1 << manifest.position_bits) - 1
         unique_voxels = len(
             np.unique(np.rint((source + 1.0) * 0.5 * codec_levels), axis=0)
