@@ -57,6 +57,10 @@ class PccGeoCnnV2Manifest:
     octree_level: int
     timeout_seconds: float
     protocol_note: str
+    checkout_diff_sha256: str | None = None
+    training_manifest_subpath: str | None = None
+    training_manifest_sha256: str | None = None
+    training_arm: str | None = None
 
     def __post_init__(self) -> None:
         if self.name != "pcc_geo_cnn_v2":
@@ -77,6 +81,20 @@ class PccGeoCnnV2Manifest:
             raise ValueError("resolution must equal the declared coordinate grid size")
         if self.octree_level < 0 or self.timeout_seconds <= 0:
             raise ValueError("octree level and timeout are invalid")
+        training_fields = (
+            self.training_manifest_subpath,
+            self.training_manifest_sha256,
+            self.training_arm,
+        )
+        if any(field is not None for field in training_fields) and not all(
+            field is not None for field in training_fields
+        ):
+            raise ValueError("retrained codec must declare its full training identity")
+        if (
+            self.training_manifest_sha256 is not None
+            and len(self.training_manifest_sha256) != 64
+        ):
+            raise ValueError("training manifest must be pinned by SHA-256")
 
     @classmethod
     def from_json(cls, path: Path) -> PccGeoCnnV2Manifest:
@@ -204,6 +222,26 @@ def _codec_spec(
     if not python.is_file() or not python.stat().st_mode & 0o111:
         raise FileNotFoundError(f"external environment Python is missing: {python}")
     model_bytes = _directory_bytes(checkpoint)
+    if manifest.training_manifest_subpath is not None:
+        training_manifest = workspace / manifest.training_manifest_subpath
+        if not training_manifest.is_file() or file_sha256(training_manifest) != (
+            manifest.training_manifest_sha256
+        ):
+            raise RuntimeError("external retraining manifest identity mismatch")
+        training_run = checkpoint / "training_run.json"
+        if not training_run.is_file():
+            raise FileNotFoundError(
+                f"external training record is missing: {training_run}"
+            )
+        training_record = json.loads(training_run.read_text())
+        expected = {
+            "arm": manifest.training_arm,
+            "lambda": rate_lambda,
+            "upstream_commit": manifest.upstream_commit,
+            "dataset_manifest_sha256": manifest.training_manifest_sha256,
+        }
+        if any(training_record.get(key) != value for key, value in expected.items()):
+            raise RuntimeError("external checkpoint training identity mismatch")
     compress_command = (
         str(python),
         "{upstream_dir}/src/compress_octree.py",
@@ -263,6 +301,7 @@ def _codec_spec(
             ("CUDA_CACHE_MAXSIZE", str(2 * 1024**3)),
             ("TF_CUDNN_USE_AUTOTUNE", "0"),
         ),
+        checkout_diff_sha256=manifest.checkout_diff_sha256,
     )
 
 
@@ -419,6 +458,7 @@ def run_published_codec_benchmark(
                 "metric_position_bits": stability.coordinate_bits,
                 "stream_sha256": codec_result.stream_sha256,
                 "reconstruction_sha256": codec_result.reconstruction_sha256,
+                "checkout_diff_sha256": codec_result.checkout_diff_sha256,
                 "encode_seconds": codec_result.encode_seconds,
                 "decode_seconds": codec_result.decode_seconds,
                 "external_batch_clouds": len(pending),

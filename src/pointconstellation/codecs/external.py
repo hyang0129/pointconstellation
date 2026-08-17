@@ -136,6 +136,7 @@ class ExternalCodecSpec:
     model_bytes: int | None = None
     environment_manifest: str | None = None
     environment_variables: tuple[tuple[str, str], ...] = ()
+    checkout_diff_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if not self.name or any(character.isspace() for character in self.name):
@@ -154,6 +155,14 @@ class ExternalCodecSpec:
             raise ValueError("timeout_seconds must be positive")
         if self.model_bytes is not None and self.model_bytes < 0:
             raise ValueError("model_bytes cannot be negative")
+        if self.checkout_diff_sha256 is not None and (
+            len(self.checkout_diff_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.checkout_diff_sha256
+            )
+        ):
+            raise ValueError("checkout_diff_sha256 must be a lowercase SHA-256")
         names = [name for name, _ in self.environment_variables]
         if len(names) != len(set(names)) or any(not name for name in names):
             raise ValueError("environment variable names must be nonempty and unique")
@@ -196,6 +205,7 @@ class ExternalCodecResult:
     compress_output: str
     decompress_output: str
     upstream_commit: str
+    checkout_diff_sha256: str
     environment: dict[str, Any] | None
 
 
@@ -213,6 +223,21 @@ def _commit(path: Path) -> str:
             f"{(completed.stdout + completed.stderr)[-2000:]}"
         )
     return completed.stdout.strip()
+
+
+def _checkout_diff_sha256(path: Path) -> str:
+    completed = subprocess.run(
+        ("git", "-C", str(path), "diff", "--binary", "HEAD"),
+        check=False,
+        capture_output=True,
+        timeout=30,
+    )
+    if completed.returncode:
+        raise RuntimeError(
+            f"cannot resolve external codec patch in {path}: "
+            f"{completed.stderr[-2000:].decode(errors='replace')}"
+        )
+    return hashlib.sha256(completed.stdout).hexdigest()
 
 
 def _run(
@@ -301,7 +326,7 @@ def _render_batch(
 
 def _validate_checkout(
     spec: ExternalCodecSpec,
-) -> tuple[Path, Path, str, dict[str, Any] | None]:
+) -> tuple[Path, Path, str, str, dict[str, Any] | None]:
     upstream_dir = Path(spec.upstream_dir)
     checkpoint_dir = Path(spec.checkpoint_dir)
     if not upstream_dir.is_dir():
@@ -318,6 +343,13 @@ def _validate_checkout(
             f"external codec commit mismatch: expected {spec.upstream_commit}, "
             f"found {actual_commit}"
         )
+    actual_diff = _checkout_diff_sha256(upstream_dir)
+    expected_diff = spec.checkout_diff_sha256 or hashlib.sha256(b"").hexdigest()
+    if actual_diff != expected_diff:
+        raise RuntimeError(
+            f"external codec checkout patch mismatch: expected {expected_diff}, "
+            f"found {actual_diff}"
+        )
     environment = None
     if spec.environment_manifest is not None:
         manifest_path = Path(spec.environment_manifest)
@@ -326,7 +358,7 @@ def _validate_checkout(
                 f"external environment manifest is missing: {manifest_path}"
             )
         environment = json.loads(manifest_path.read_text())
-    return upstream_dir, checkpoint_dir, actual_commit, environment
+    return upstream_dir, checkpoint_dir, actual_commit, actual_diff, environment
 
 
 def _validate_points(points: ArrayLike) -> NDArray[np.float64]:
@@ -346,7 +378,9 @@ def run_external_codec(
 ) -> ExternalCodecResult:
     """Run a pinned external codec and return its measured decoded geometry."""
 
-    upstream_dir, checkpoint_dir, actual_commit, environment = _validate_checkout(spec)
+    upstream_dir, checkpoint_dir, actual_commit, actual_diff, environment = (
+        _validate_checkout(spec)
+    )
     array = _validate_points(points)
 
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -407,6 +441,7 @@ def run_external_codec(
         compress_output=compress_output,
         decompress_output=decompress_output,
         upstream_commit=actual_commit,
+        checkout_diff_sha256=actual_diff,
         environment=environment,
     )
 
@@ -435,7 +470,9 @@ def run_external_codec_batch(
             "batch commands require input and stream expansion plus a decoded "
             "reconstruction output"
         )
-    upstream_dir, checkpoint_dir, actual_commit, environment = _validate_checkout(spec)
+    upstream_dir, checkpoint_dir, actual_commit, actual_diff, environment = (
+        _validate_checkout(spec)
+    )
     arrays = tuple(_validate_points(points) for points in point_clouds)
     input_paths = tuple(path / "input.ply" for path in work_dirs)
     stream_paths = tuple(path / "stream.bin" for path in work_dirs)
@@ -514,6 +551,7 @@ def run_external_codec_batch(
                 compress_output=compress_output,
                 decompress_output=decompress_output,
                 upstream_commit=actual_commit,
+                checkout_diff_sha256=actual_diff,
                 environment=environment,
             )
         )

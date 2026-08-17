@@ -1,0 +1,30 @@
+diff --git a/src/utils/octree_coding.py b/src/utils/octree_coding.py
+index 6e32791..0e62494 100644
+--- a/src/utils/octree_coding.py
++++ b/src/utils/octree_coding.py
+@@ -57,7 +57,7 @@ def partition_octree_rec(points, bbox_min, bbox_max, level):
+     if len(points) == 0:
+         return [points], None
+     if level == 0:
+-        return [points], None
++        return [points], []
+     bbox_min = np.asarray(bbox_min)
+     bbox_max = np.asarray(bbox_max)
+     ret_points, binstr, bboxes = split_octree(points, bbox_min, bbox_max)
+@@ -74,7 +74,7 @@ def partition_octree(points, bbox_min, bbox_max, level):
+     if len(points) == 0:
+         return [points], None
+     if level == 0:
+-        return [points], None
++        return [points], []
+     bbox_min = np.asarray(bbox_min)
+     np.testing.assert_array_equal(bbox_min, [0, 0, 0])
+     bbox_max = np.asarray(bbox_max)
+@@ -116,5 +116,7 @@ def partition_octree(points, bbox_min, bbox_max, level):
+ 
+ def departition_octree(blocks, binstr_list, bbox_min, bbox_max, level):
++    if level == 0:
++        return blocks
+     bbox_min = np.asarray(bbox_min)
+     bbox_max = np.asarray(bbox_max)
+ 

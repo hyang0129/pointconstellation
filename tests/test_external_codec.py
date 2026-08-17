@@ -119,6 +119,18 @@ def test_external_codec_rejects_checkout_drift(tmp_path: Path) -> None:
         run_external_codec(spec, points, work_dir=tmp_path / "run")
 
 
+def test_external_codec_rejects_unregistered_checkout_patch(tmp_path: Path) -> None:
+    spec = _spec(tmp_path)
+    (Path(spec.upstream_dir) / "codec.py").write_text("print('drift')\n")
+
+    with pytest.raises(RuntimeError, match="patch mismatch"):
+        run_external_codec(
+            spec,
+            np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32),
+            work_dir=tmp_path / "run",
+        )
+
+
 def test_external_codec_refuses_to_overwrite_outputs(tmp_path: Path) -> None:
     spec = _spec(tmp_path)
     points = np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32)
