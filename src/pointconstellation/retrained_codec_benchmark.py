@@ -122,6 +122,8 @@ def run_retrained_codec_benchmark(
     checkpoint_state = (checkpoint / "checkpoint").read_text().splitlines()[0]
     checkpoint_prefix = checkpoint_state.split('"', 2)[1]
     checkpoint_step = int(checkpoint_prefix.rsplit("-", 1)[1])
+    if checkpoint_step < config.minimum_training_steps:
+        raise RuntimeError("actual checkpoint step is below the evaluation budget")
     executable = Path(config.pc_error_executable)
     if not executable.is_file() or not os.access(executable, os.X_OK):
         raise FileNotFoundError(f"pc_error is missing or not executable: {executable}")

@@ -19,17 +19,10 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import numpy as np
-
-from pointconstellation.codecs.gpcc import write_ascii_ply
-from pointconstellation.data import file_sha256
-from pointconstellation.stability_experiment import (
-    StabilityExperimentConfig,
-    _data_protocol,
-    _datasets,
-)
+if TYPE_CHECKING:
+    import numpy as np
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -40,7 +33,17 @@ def _bytes_sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _array_sha256(value: np.ndarray) -> str:
+    import numpy as np
+
     contiguous = np.ascontiguousarray(value)
     return _bytes_sha256(contiguous.view(np.uint8).tobytes())
 
@@ -139,6 +142,8 @@ class ExactExternalRetrainConfig:
 
 
 def _quantize_source(points: np.ndarray, position_bits: int) -> np.ndarray:
+    import numpy as np
+
     levels = (1 << position_bits) - 1
     if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError("source cloud must have shape N x 3")
@@ -148,6 +153,8 @@ def _quantize_source(points: np.ndarray, position_bits: int) -> np.ndarray:
 
 
 def _native_blocks(points: np.ndarray, arm: ExternalTrainingArm) -> list[np.ndarray]:
+    import numpy as np
+
     block_size = 64
     block_ids = points // block_size
     unique_ids = np.unique(block_ids, axis=0)
@@ -165,10 +172,19 @@ def _native_blocks(points: np.ndarray, arm: ExternalTrainingArm) -> list[np.ndar
 def _write_dataset_tree(
     config: ExactExternalRetrainConfig, root: Path
 ) -> dict[str, Any]:
+    import numpy as np
+
+    from pointconstellation.codecs.gpcc import write_ascii_ply
+    from pointconstellation.stability_experiment import (
+        StabilityExperimentConfig,
+        _data_protocol,
+        _datasets,
+    )
+
     stability_path = Path(config.stability_config)
     stability = StabilityExperimentConfig.from_json(stability_path)
     manifest_path = Path(stability.dataset_manifest)
-    if file_sha256(manifest_path) != config.expected_stability_manifest_sha256:
+    if _file_sha256(manifest_path) != config.expected_stability_manifest_sha256:
         raise RuntimeError("stability mesh manifest SHA-256 differs from declaration")
     datasets = _datasets(stability)
     protocol = _data_protocol(stability, datasets)
@@ -211,7 +227,7 @@ def _write_dataset_tree(
                         {
                             "path": relative.as_posix(),
                             "points": len(block),
-                            "sha256": file_sha256(path),
+                            "sha256": _file_sha256(path),
                         }
                     )
                 arm_records.append(
@@ -248,8 +264,8 @@ def _write_dataset_tree(
         "version": 1,
         "experiment": "020_exact_external_retrain",
         "stability_config": str(stability_path),
-        "stability_config_sha256": file_sha256(stability_path),
-        "stability_manifest_sha256": file_sha256(manifest_path),
+        "stability_config_sha256": _file_sha256(stability_path),
+        "stability_manifest_sha256": _file_sha256(manifest_path),
         "data_protocol": protocol,
         "split_contract": {
             "train_source_split": "train",
@@ -306,7 +322,7 @@ def export_training_archive(
         {
             "archive": str(output_path),
             "archive_bytes": output_path.stat().st_size,
-            "archive_sha256": file_sha256(output_path),
+            "archive_sha256": _file_sha256(output_path),
         }
     )
     sidecar = output_path.with_suffix(output_path.suffix + ".json")
@@ -326,6 +342,14 @@ def export_evaluation_archive(
 ) -> dict[str, Any]:
     """Seal fixed validation/OOD sources separately from all training data."""
 
+    import numpy as np
+
+    from pointconstellation.stability_experiment import (
+        StabilityExperimentConfig,
+        _data_protocol,
+        _datasets,
+    )
+
     if max_clouds_per_split < 1:
         raise ValueError("max_clouds_per_split must be positive")
     if output_path.exists():
@@ -333,7 +357,7 @@ def export_evaluation_archive(
     stability_path = Path(config.stability_config)
     stability = StabilityExperimentConfig.from_json(stability_path)
     manifest_path = Path(stability.dataset_manifest)
-    if file_sha256(manifest_path) != config.expected_stability_manifest_sha256:
+    if _file_sha256(manifest_path) != config.expected_stability_manifest_sha256:
         raise RuntimeError("stability mesh manifest SHA-256 differs from declaration")
     datasets = _datasets(stability)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -365,16 +389,16 @@ def export_evaluation_archive(
                         "sample_id": int(sample["sample_id"]),
                         "source_points": len(source),
                         "source_path": source_relative.as_posix(),
-                        "source_sha256": file_sha256(source_path),
+                        "source_sha256": _file_sha256(source_path),
                         "normals_path": normals_relative.as_posix(),
-                        "normals_sha256": file_sha256(normals_path),
+                        "normals_sha256": _file_sha256(normals_path),
                     }
                 )
         manifest = {
             "version": 1,
             "experiment": "020_exact_external_evaluation",
-            "stability_config_sha256": file_sha256(stability_path),
-            "stability_manifest_sha256": file_sha256(manifest_path),
+            "stability_config_sha256": _file_sha256(stability_path),
+            "stability_manifest_sha256": _file_sha256(manifest_path),
             "data_protocol": _data_protocol(stability, datasets),
             "selection": {
                 "policy": "first_manifest_records",
@@ -396,7 +420,7 @@ def export_evaluation_archive(
     result = {
         "archive": str(output_path),
         "archive_bytes": output_path.stat().st_size,
-        "archive_sha256": file_sha256(output_path),
+        "archive_sha256": _file_sha256(output_path),
         "manifest_sha256": _bytes_sha256(manifest_bytes),
         "records": len(records),
     }
@@ -428,7 +452,7 @@ def extract_training_archive(
 ) -> dict[str, Any]:
     """Verify and extract a generated dataset on the external host."""
 
-    archive_sha = file_sha256(archive)
+    archive_sha = _file_sha256(archive)
     if (
         config.expected_dataset_archive_sha256 is not None
         and archive_sha != config.expected_dataset_archive_sha256
@@ -436,7 +460,7 @@ def extract_training_archive(
         raise RuntimeError("external training archive SHA-256 differs from declaration")
     _safe_extract(archive, destination)
     manifest_path = destination / "training_dataset_manifest.json"
-    manifest_sha = file_sha256(manifest_path)
+    manifest_sha = _file_sha256(manifest_path)
     if (
         config.expected_dataset_manifest_sha256 is not None
         and manifest_sha != config.expected_dataset_manifest_sha256
@@ -481,11 +505,20 @@ def _checkpoint_files(checkpoint: Path) -> list[dict[str, Any]]:
         {
             "path": path.relative_to(checkpoint).as_posix(),
             "bytes": path.stat().st_size,
-            "sha256": file_sha256(path),
+            "sha256": _file_sha256(path),
         }
         for path in sorted(checkpoint.rglob("*"))
         if path.is_file() and path.name != "training_run.json"
     ]
+
+
+def _checkpoint_step(checkpoint: Path) -> int | None:
+    state = checkpoint / "checkpoint"
+    if not state.is_file():
+        return None
+    first_line = state.read_text().splitlines()[0]
+    prefix = first_line.split('"', 2)[1]
+    return int(prefix.rsplit("-", 1)[1])
 
 
 def run_training_point(
@@ -521,7 +554,7 @@ def run_training_point(
     dataset_manifest = training_root / "dataset" / "training_dataset_manifest.json"
     if (
         config.expected_dataset_manifest_sha256 is not None
-        and file_sha256(dataset_manifest) != config.expected_dataset_manifest_sha256
+        and _file_sha256(dataset_manifest) != config.expected_dataset_manifest_sha256
     ):
         raise RuntimeError("training dataset manifest differs from declaration")
     budget = arm.max_steps if max_steps is None else max_steps
@@ -532,9 +565,15 @@ def run_training_point(
     checkpoint = training_root / "checkpoints" / arm.name / rate_lambda
     checkpoint.mkdir(parents=True, exist_ok=True)
     run_path = checkpoint / "training_run.json"
+    prior_checkpoint_step = _checkpoint_step(checkpoint)
     if run_path.exists():
         existing = json.loads(run_path.read_text())
-        if int(existing["max_steps"]) >= budget and (checkpoint / "done").exists():
+        if (
+            int(existing["max_steps"]) >= budget
+            and prior_checkpoint_step is not None
+            and prior_checkpoint_step >= budget
+            and (checkpoint / "done").exists()
+        ):
             return existing
     command = (
         str(python),
@@ -568,27 +607,34 @@ def run_training_point(
     )
     log_path = checkpoint / "training.log"
     started_at = time.time()
-    with log_path.open("a") as log:
-        completed = subprocess.run(
-            command,
-            cwd=upstream / "src",
-            env=env,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            timeout=config.timeout_seconds,
-            check=False,
-        )
-    if completed.returncode != 0:
-        message = f"external training failed with status {completed.returncode}"
-        raise RuntimeError(f"{message}; see {log_path}")
+    checkpoint_already_complete = (
+        prior_checkpoint_step is not None and prior_checkpoint_step >= budget
+    )
+    if checkpoint_already_complete:
+        execution_mode = "seal_existing_checkpoint"
+    else:
+        execution_mode = "train_or_resume"
+        with log_path.open("a") as log:
+            completed = subprocess.run(
+                command,
+                cwd=upstream / "src",
+                env=env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                timeout=config.timeout_seconds,
+                check=False,
+            )
+        if completed.returncode != 0:
+            message = f"external training failed with status {completed.returncode}"
+            raise RuntimeError(f"{message}; see {log_path}")
     if not (checkpoint / "done").is_file():
         raise RuntimeError("upstream training returned without its done marker")
     files = _checkpoint_files(checkpoint)
     if not any(file["path"].startswith("model.ckpt-") for file in files):
         raise RuntimeError("external training produced no model checkpoint")
-    checkpoint_state = (checkpoint / "checkpoint").read_text().splitlines()[0]
-    checkpoint_prefix = checkpoint_state.split('"', 2)[1]
-    checkpoint_step = int(checkpoint_prefix.rsplit("-", 1)[1])
+    checkpoint_step = _checkpoint_step(checkpoint)
+    if checkpoint_step is None:
+        raise RuntimeError("external training produced no checkpoint state")
     result = {
         "version": 1,
         "experiment": "020_exact_external_retrain",
@@ -603,9 +649,10 @@ def run_training_point(
         "upstream_commit": commit,
         "checkout_diff_sha256": actual_diff,
         "environment": json.loads(environment_path.read_text()),
-        "dataset_manifest_sha256": file_sha256(dataset_manifest),
+        "dataset_manifest_sha256": _file_sha256(dataset_manifest),
         "command": list(command),
         "gpu": gpu,
+        "execution_mode": execution_mode,
         "elapsed_seconds": time.time() - started_at,
         "checkpoint_bytes": sum(file["bytes"] for file in files),
         "checkpoint_files": files,
