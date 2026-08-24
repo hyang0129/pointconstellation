@@ -67,6 +67,7 @@ def main() -> None:
         raise SystemExit(12)
     command = [
         "sbatch",
+        f"--job-name=jupyter_empire_{args.port}",
         "--cpus-per-task=16",
         "--mem-per-cpu=24g",
         "--time=0-72:00:00",
