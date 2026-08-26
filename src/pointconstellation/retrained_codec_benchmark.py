@@ -19,6 +19,7 @@ from pointconstellation.metrics import chamfer_rmse
 from pointconstellation.published_codec_benchmark import (
     PccGeoCnnV2Manifest,
     _codec_spec,
+    _diversity_contract_summary,
 )
 
 
@@ -31,6 +32,7 @@ class RetrainedCodecBenchmarkConfig:
     output_dir: str
     minimum_training_steps: int = 5000
     metric_position_bits: int = 12
+    minimum_unique_reconstruction_fraction: float = 0.9
 
     def __post_init__(self) -> None:
         if len(self.expected_evaluation_manifest_sha256) != 64:
@@ -39,6 +41,8 @@ class RetrainedCodecBenchmarkConfig:
             raise ValueError("minimum_training_steps must be at least 500")
         if not 2 <= self.metric_position_bits <= 24:
             raise ValueError("metric_position_bits must be between 2 and 24")
+        if not 0.0 < self.minimum_unique_reconstruction_fraction <= 1.0:
+            raise ValueError("minimum_unique_reconstruction_fraction must be in (0, 1]")
 
     @classmethod
     def from_json(cls, path: Path) -> RetrainedCodecBenchmarkConfig:
@@ -224,13 +228,22 @@ def run_retrained_codec_benchmark(
         chamfer_values = [row["chamfer_mse"] for row in group]
         d1_values = [row["d1_mse"] for row in group]
         d2_values = [row["d2_mse"] for row in group]
+        diversity = _diversity_contract_summary(
+            group,
+            minimum_unique_reconstruction_fraction=(
+                config.minimum_unique_reconstruction_fraction
+            ),
+        )
         summaries.append(
             {
                 "split": split,
                 "clouds": len(group),
                 "valid_clouds": sum(row["status"] == "valid" for row in group),
                 "empty_reconstructions": empty_reconstructions,
-                "rate_point_valid": empty_reconstructions == 0,
+                **diversity,
+                "rate_point_valid": (
+                    empty_reconstructions == 0 and diversity["rate_point_valid"]
+                ),
                 "mean_stream_bytes": float(stream_bytes.mean()),
                 "median_stream_bytes": float(np.median(stream_bytes)),
                 "minimum_stream_bytes": int(stream_bytes.min()),

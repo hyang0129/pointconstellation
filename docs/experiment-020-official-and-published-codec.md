@@ -1,8 +1,8 @@
 # Experiment 020: official metrics and published learned codec
 
 Status: official-metric slice, published-codec pipeline/rate smoke, and the
-5,000-step fair-retraining feasibility pilot are complete; a staged 20,000-step
-recovery test and full curves remain open under
+5,000-step feasibility pilot and staged 20,000-step recovery test are complete;
+the five-lambda 100,000-step sweep and full curves remain open under
 [issue #15](https://github.com/hyang0129/pointconstellation/issues/15).
 
 ## Decision summary
@@ -236,19 +236,32 @@ This pilot is evidence of an undertrained or collapsed entropy/reconstruction
 model, not evidence that the published codec loses to Point Constellation. Its
 calibration objective was still improving through step 5,000, and the released
 roughly 39,000-step q6 feasibility checkpoint emitted 111 bytes on the same
-diagnostic cloud. The predeclared response is therefore staged rather than an
-immediate five-way 100,000-step sweep:
+diagnostic cloud. The predeclared staged response was to resume `1e-5` and
+`1e-6` to 20,000 steps before deciding whether a longer sweep was warranted.
 
-1. resume `1e-5` and `1e-6` from 5,000 to 20,000 steps in parallel;
-2. require nonempty reconstruction on all 32 sealed clouds and material stream
-   reduction, with lambda-dependent rate separation, before scaling; and
-3. only then resume all five declared lambdas to 100,000 steps and compute
-   distortion. If the recovery gate fails, stop training and attribute the
-   obstruction to low-rate framing/objective feasibility rather than codec
-   quality.
+### Staged 20,000-step recovery
 
-Gate B still requires at least three genuinely overlapping actual-rate points;
-otherwise the nearest observed rate gap is reported without extrapolation.
+The exact-split 20,000-step retrain reduced the serialized rate, but it did not
+produce a valid codec operating point:
+
+| Lambda | Sealed-cloud status | Stream bytes | Bits/source point | Validation D1 / D2 RMSE | OOD D1 / D2 RMSE | Diversity diagnosis |
+|---:|---:|---:|---:|---:|---:|---|
+| 1.00e-05 | 32/32 `valid` | 46 on all clouds | 0.1797 | 645.97 / 540.68 | 623.86 / 564.39 | 13 streams, 2 reconstructions |
+| 1.00e-06 | 32/32 `empty_reconstruction` | 48 | 0.1875 | invalid | invalid | empty decode collapse |
+
+For `1e-5`, 31 of the 32 sealed inputs decode to the identical 12,636-point
+cloud. Only 13 stream SHA-256 values and two reconstruction SHA-256 values are
+unique across the combined validation and OOD evaluation. The reconstruction
+diversity is therefore 6.25%, far below the contract's 90% minimum. Despite its
+small serialized size and finite distortion, this is a near-constant-output
+collapse, not a functioning codec, and the rate point is excluded from every
+overlapping-rate comparison. The all-empty `1e-6` point is also invalid.
+
+Gate B of [issue #15](https://github.com/hyang0129/pointconstellation/issues/15)
+still requires at least three valid overlapping actual-rate points and remains
+open. The next predeclared step is the five-lambda 100,000-step sweep. Until it
+produces valid diverse reconstructions, the nearest valid observed rate gap is
+reported without extrapolation.
 
 AnyPcc remains the next modern comparison on one of its native dense/LiDAR
 benchmarks. Its CUDA, TorchSparse, DeepCABAC, per-instance adaptation, and
