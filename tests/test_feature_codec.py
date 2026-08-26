@@ -30,6 +30,10 @@ def test_feature_stream_round_trips_exact_lattice(bits: int) -> None:
     assert np.array_equal(actual, expected)
     assert packet.output_points == 2048
     assert packet.payload_bits == len(features) * bits
+    assert packet.header_bytes == HEADER.size
+    assert packet.header_bytes + packet.payload_bytes == (
+        expected_feature_stream_bytes(len(features), bits)
+    )
     assert len(stream) == expected_feature_stream_bytes(len(features), bits)
 
 

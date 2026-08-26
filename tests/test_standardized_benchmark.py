@@ -72,6 +72,12 @@ def test_gpcc_common_and_rate_arguments_must_not_overlap() -> None:
                 Tmc3RatePoint("duplicate", ("--positionQuantizationScale=0.5",)),
             ),
         )
+    with pytest.raises(ValueError, match="amortize_parameter_sets_over"):
+        GpccBenchmarkConfig(
+            executable="tmc3",
+            rate_points=(Tmc3RatePoint("one", ("--codingScale=1",)),),
+            amortize_parameter_sets_over=0,
+        )
 
 
 def test_rate_comparison_marks_dominated_points_without_interpolation() -> None:
@@ -157,6 +163,11 @@ def test_tiny_standardized_benchmark_runs_through_bitstreams(tmp_path) -> None:
         expected_stream_bytes(2, 8),
         expected_stream_bytes(4, 8),
     }
+    assert all(
+        row["header_bytes"] + row["payload_bytes"] == row["stream_bytes"]
+        and row["payload_bpp"] == row["payload_bytes"] * 8 / 16
+        for row in result["per_cloud"]
+    )
     assert saved["config"]["experiment"]["run_internal_evaluation"] is False
     assert saved["manifests"]["validation"]["sha256"]
 

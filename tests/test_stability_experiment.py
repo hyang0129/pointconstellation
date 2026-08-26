@@ -8,15 +8,37 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
 
 from pointconstellation.stability_experiment import (
     StabilityExperimentConfig,
     _data_protocol,
     _datasets,
     _feature_reference_comparison,
+    _serialized_coordinates,
     _two_way_components,
 )
+
+
+def test_serialized_coordinates_return_header_payload_packets() -> None:
+    config = StabilityExperimentConfig(
+        num_points=16,
+        constellation_size=2,
+        training_constellation_sizes=(2, 4),
+        coordinate_bits=7,
+    )
+    coordinates = torch.zeros((2, 2, 3), dtype=torch.float32)
+
+    _, packets, exact, lattice_exact = _serialized_coordinates(
+        coordinates, config=config, mode="free"
+    )
+
+    assert exact and lattice_exact
+    assert len(packets) == 2
+    assert all(
+        packet.header_bytes + packet.payload_bytes == packet.stream_bytes
+        for packet in packets
+    )
 
 
 def test_config_rejects_test_calibration_and_incomplete_rate_curriculum() -> None:

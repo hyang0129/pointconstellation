@@ -51,6 +51,7 @@ class GpccBenchmarkConfig:
     encoder_args: tuple[str, ...] = ()
     position_bits: int = 12
     timeout_seconds: float = 120.0
+    amortize_parameter_sets_over: int | None = None
 
     def __post_init__(self) -> None:
         if not self.rate_points:
@@ -61,6 +62,12 @@ class GpccBenchmarkConfig:
             raise ValueError("G-PCC position_bits must be between 2 and 24")
         if self.timeout_seconds <= 0:
             raise ValueError("G-PCC timeout_seconds must be positive")
+        if self.amortize_parameter_sets_over is not None and (
+            not isinstance(self.amortize_parameter_sets_over, int)
+            or isinstance(self.amortize_parameter_sets_over, bool)
+            or self.amortize_parameter_sets_over < 1
+        ):
+            raise ValueError("amortize_parameter_sets_over must be a positive integer")
         Tmc3RatePoint("common", self.encoder_args)
         common_options = {argument.split("=", 1)[0] for argument in self.encoder_args}
         for point in self.rate_points:
@@ -356,7 +363,10 @@ def _average_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     summaries = []
     scalar_fields = (
         "nominal_payload_bpp",
+        "payload_bpp",
         "actual_stream_bpp",
+        "header_bytes",
+        "payload_bytes",
         "stream_bytes",
         "encoder_inference_seconds",
         "bitstream_encode_seconds",
@@ -788,6 +798,11 @@ def run_standardized_benchmark(
                                 "payload_bits": packet.payload_bits,
                                 "nominal_payload_bpp": packet.payload_bits
                                 / experiment.num_points,
+                                "header_bytes": packet.header_bytes,
+                                "payload_bytes": packet.payload_bytes,
+                                "payload_bpp": packet.payload_bytes
+                                * 8
+                                / experiment.num_points,
                                 "stream_bytes": packet.stream_bytes,
                                 "actual_stream_bpp": packet.stream_bytes
                                 * 8
@@ -872,27 +887,48 @@ def run_standardized_benchmark(
                             gpcc_metrics["official_elapsed_seconds"] = (
                                 official.elapsed_seconds
                             )
-                        gpcc_rows.append(
-                            {
-                                "split": split,
-                                "sample_id": sample_id,
-                                "family": family,
-                                "model_id": model_id,
-                                "method": "gpcc_octree",
-                                "rate_point": rate_point.name,
-                                "encoder_args": list(effective_rate_point.encoder_args),
-                                "stream_bytes": gpcc_result.stream_bytes,
-                                "actual_stream_bpp": gpcc_result.stream_bytes
-                                * 8
-                                / experiment.num_points,
-                                "reconstruction_points": len(
-                                    gpcc_result.reconstruction
-                                ),
-                                "encode_seconds": gpcc_result.encode_seconds,
-                                "decode_seconds": gpcc_result.decode_seconds,
-                                **gpcc_metrics,
-                            }
-                        )
+                        breakdown = gpcc_result.stream_breakdown
+                        gpcc_row = {
+                            "split": split,
+                            "sample_id": sample_id,
+                            "family": family,
+                            "model_id": model_id,
+                            "method": "gpcc_octree",
+                            "rate_point": rate_point.name,
+                            "encoder_args": list(effective_rate_point.encoder_args),
+                            "sps_bytes": breakdown.sps_bytes,
+                            "gps_bytes": breakdown.gps_bytes,
+                            "slice_header_bytes": breakdown.slice_header_bytes,
+                            "header_bytes": breakdown.header_bytes,
+                            "payload_bytes": breakdown.payload_bytes,
+                            "payload_bpp": breakdown.payload_bytes
+                            * 8
+                            / experiment.num_points,
+                            "stream_bytes": gpcc_result.stream_bytes,
+                            "actual_stream_bpp": gpcc_result.stream_bytes
+                            * 8
+                            / experiment.num_points,
+                            "reconstruction_points": len(gpcc_result.reconstruction),
+                            "encode_seconds": gpcc_result.encode_seconds,
+                            "decode_seconds": gpcc_result.decode_seconds,
+                            **gpcc_metrics,
+                        }
+                        if config.gpcc.amortize_parameter_sets_over is not None:
+                            period = config.gpcc.amortize_parameter_sets_over
+                            amortized_bytes = breakdown.amortized_stream_bytes(period)
+                            gpcc_row.update(
+                                {
+                                    "amortize_parameter_sets_over": period,
+                                    "amortized_stream_bytes": amortized_bytes,
+                                    "amortized_stream_bpp": amortized_bytes
+                                    * 8
+                                    / experiment.num_points,
+                                    "amortized_stream_note": (
+                                        "accounting_only_not_a_decodable_stream"
+                                    ),
+                                }
+                            )
+                        gpcc_rows.append(gpcc_row)
 
     summary = _average_rows(rows)
     model_dir = Path(experiment.output_dir)
@@ -933,6 +969,12 @@ def run_standardized_benchmark(
             "executable_sha256": file_sha256(executable),
             "position_bits": config.gpcc.position_bits,
             "common_encoder_args": list(config.gpcc.encoder_args),
+            "amortize_parameter_sets_over": (config.gpcc.amortize_parameter_sets_over),
+            "amortized_stream_note": (
+                "SPS/GPS accounting only; reported bytes are not a decodable stream"
+                if config.gpcc.amortize_parameter_sets_over is not None
+                else None
+            ),
             "summary": gpcc_summary,
             "pareto_frontier": gpcc_frontier,
             "monotonicity": _gpcc_monotonicity(gpcc_summary),
@@ -963,6 +1005,10 @@ def run_standardized_benchmark(
             "fixed_header_bytes": expected_stream_bytes(1, experiment.bits)
             - ((3 * experiment.bits + 7) // 8),
             "rate_definition": "total serialized stream bits / input points",
+            "payload_rate_definition": (
+                "byte-aligned payload bits / input points; outer format headers "
+                "excluded"
+            ),
             "metric_note": (
                 "Unprefixed D1/D2 proxy fields use the declared normalized peak; "
                 "sliced Wasserstein is an EMD proxy. official_* fields are emitted "
