@@ -61,6 +61,49 @@ rate have higher distortion. After removing the outer headers, the G-PCC
 lower distortion (0.1058 versus 0.1445). This is a statement about these
 measured validation points, not a general codec claim.
 
+## Optional entropy-stream diagnostic
+
+The declared constellation stream remains mode 0: a lexicographically sorted,
+fixed-width lattice payload. Mode 1 is an exactly decodable diagnostic over the
+same coordinates. It stores the first sorted point at full precision, zigzag
+maps subsequent signed deltas, chooses the Rice parameter that minimizes coded
+length over the stream, and signals that parameter in one byte. Both modes use
+the same 14-byte header. New Experiment 019 and official Experiment 020 rows
+report mode 1 as `entropy_stream_bytes` and `entropy_bpp` alongside the unchanged
+mode-0 fields. `entropy_bound_bytes` is an oracle per-axis order-0 bound that
+includes the header, parameter byte, and full-precision first point, but does
+not include the cost of communicating the empirical delta distributions. It is
+therefore not a decodable rate.
+
+On the 128-cloud Experiment 019 validation split at `K=8`, `q=12`, the sealed
+stabilized refiner factorial contributes 2,304 streams. The fixed stream is
+50 bytes (0.1953 bpp) per cloud. The entropy variant averaged 51.888 bytes
+(0.2027 bpp; range 43--54), an expansion of 1.888 bytes or 3.776%. The matched
+768 FPS rows averaged 52.117 bytes (0.2036 bpp; range 45--54), an expansion of
+4.234%. The refiner oracle bound averaged 26.852 bytes (0.1049 bpp), leaving a
+25.036-byte mean gap between the implemented Rice stream and the optimistic
+bound. Thus this exact mode-1 coder realizes no coding gain on these messages;
+the oracle result only identifies distribution-modeling headroom and is not a
+compression result.
+
+These values were regenerated from the sealed Experiment 019 models, using the
+Experiment 020 official rows only to select the validation messages. The source
+hashes were:
+
+- `official_per_cloud.jsonl`: `03694b58ff00ff8c55fa9ce4adb4090afe9588e805cb4e76ba6ca2898b1c9b15`
+- `experiment_019_stability_modelnet40.json`: `1dba8d5b6e0533f6da6b6ce34d6837b0dbc0c22b6a1bda388b952c9203f08683`
+
+Reproduce the inference-only resummary without modifying either experiment:
+
+```bash
+python scripts/resummarize_entropy_headroom.py \
+  --config configs/experiment_020_official_stability.json \
+  --official-rows \
+    artifacts/local/experiment_020_official_stability/official_per_cloud.jsonl \
+  --split validation \
+  --output /tmp/experiment_019_validation_entropy_headroom.json
+```
+
 ## Reproduction
 
 The table was generated from `benchmark_metrics.json`, `per_cloud.jsonl`,

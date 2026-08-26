@@ -20,6 +20,7 @@ from torch import Tensor
 from torch.utils.data import DataLoader
 
 from pointconstellation.bitstream import (
+    MODE_FIXED,
     decode_constellation,
     encode_constellation,
     expected_stream_bytes,
@@ -720,7 +721,7 @@ def run_standardized_benchmark(
                         stream = encode_constellation(
                             constellation[0].detach().cpu().numpy(),
                             bits=experiment.bits,
-                            mode=method,
+                            mode=MODE_FIXED,
                             output_points=experiment.num_points,
                         )
                         bitstream_encode_seconds = (
