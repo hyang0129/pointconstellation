@@ -1,0 +1,23 @@
+{
+  "stability_config": "configs/experiment_019_stability_modelnet40.json",
+  "stability_artifact_dir": "artifacts/local/experiment_019_stability_modelnet40",
+  "decoder_seeds": [7, 17, 29, 41, 53, 67],
+  "refiner_seeds": [101, 211, 307],
+  "methods": ["fps", "random_best_of_16", "refiner", "adam_64"],
+  "splits": ["validation", "ood"],
+  "max_clouds_per_split": null,
+  "repeatability_radii_bins": [1, 4, 16, 64],
+  "transform_seed": 20260832,
+  "maximum_translation": 0.1,
+  "selection_seed": 20260832,
+  "adam_evaluations": 64,
+  "adam_learning_rate": 0.03,
+  "bootstrap_samples": 10000,
+  "bootstrap_seed": 20260832,
+  "confidence_level": 0.95,
+  "gate_radius_bins": 16,
+  "gate_minimum_repeatability": 0.5,
+  "gate_minimum_translation_repeatability": 0.75,
+  "gate_maximum_cross_decoder_rmse_degradation_percent": 50.0,
+  "output_dir": "artifacts/local/experiment_032_constellation_stability"
+}
