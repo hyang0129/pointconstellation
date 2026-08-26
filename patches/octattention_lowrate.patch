@@ -1,0 +1,386 @@
+diff --git a/pointconstellation_adapter.py b/pointconstellation_adapter.py
+new file mode 100644
+index 0000000..b464ad7
+--- /dev/null
++++ b/pointconstellation_adapter.py
+@@ -0,0 +1,380 @@
++"""Point Constellation batch adapter for the pinned OctAttention object model.
++
++This file is maintained as an external-checkout patch.  It adds no model layer
++and does not alter probability prediction or arithmetic coding.  Its stream
++header carries the metadata that the released decoder otherwise reads from the
++encoder-side MAT file.
++"""
++
++import argparse
++import hashlib
++import json
++import os
++import struct
++import subprocess
++import sys
++from pathlib import Path
++
++import numpy as np
++import torch
++
++# The upstream code opens model and data paths relative to its repository.
++UPSTREAM_ROOT = Path(__file__).resolve().parent
++sys.path.insert(0, str(UPSTREAM_ROOT))
++
++MAGIC = b"PCOCT026"
++VERSION = 1
++HEADER = struct.Struct(">8sBBBII")
++
++
++def _sha256(path):
++    digest = hashlib.sha256()
++    with Path(path).open("rb") as handle:
++        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def _load_model(checkpoint):
++    from networkTool import device
++    from octAttention import model
++
++    saved = torch.load(str(checkpoint), map_location=device)
++    state = saved["encoder"] if "encoder" in saved else saved
++    model.load_state_dict(state)
++    model.to(device)
++    model.eval()
++    return model
++
++
++def _read_q12(path, position_bits):
++    import pt
++
++    points = np.asarray(pt.ptread(str(path)), dtype=np.float64)
++    levels = (1 << position_bits) - 1
++    if points.ndim != 2 or points.shape[1] != 3 or not len(points):
++        raise ValueError("input PLY must contain N x 3 geometry")
++    if not np.isfinite(points).all() or np.any(points < 0) or np.any(points > levels):
++        raise ValueError("input PLY lies outside the declared position grid")
++    if not np.array_equal(points, np.rint(points)):
++        raise ValueError("input PLY coordinates must be integer grid locations")
++    return np.unique(np.rint(points).astype(np.int64), axis=0)
++
++
++def _depth_points(points, position_bits, depth):
++    source_levels = (1 << position_bits) - 1
++    depth_levels = (1 << depth) - 1
++    return np.unique(
++        np.rint(points * depth_levels / source_levels).astype(np.int64), axis=0
++    )
++
++
++def _features(points, depth):
++    from Octree import GenKparentSeq, GenOctree
++
++    _, octree, actual_depth = GenOctree(points)
++    if actual_depth != depth:
++        raise RuntimeError(
++            "the source does not occupy the declared global octree depth: "
++            "requested {}, generated {}".format(depth, actual_depth)
++        )
++    data = GenKparentSeq(octree, 4)
++    return np.concatenate(
++        (
++            np.expand_dims(data["Seq"], 2),
++            data["Level"],
++            data["Pos"],
++        ),
++        axis=2,
++    )[:, -4:, :6]
++
++
++def _encode_one(input_path, stream_path, model, position_bits, depth):
++    from encoderTool import compress
++
++    points = _read_q12(input_path, position_bits)
++    features = _features(_depth_points(points, position_bits, depth), depth)
++    stream_path = Path(stream_path)
++    stream_path.parent.mkdir(parents=True, exist_ok=True)
++    raw_path = stream_path.with_suffix(stream_path.suffix + ".arithmetic")
++    if raw_path.exists() or stream_path.exists():
++        raise FileExistsError("OctAttention output stream already exists")
++    _, symbol_count, _, _, _ = compress(
++        features,
++        str(raw_path),
++        model,
++        actualcode=True,
++        print=lambda *args: None,
++        showRelut=False,
++    )
++    payload = raw_path.read_bytes()
++    raw_path.unlink()
++    if not payload:
++        raise RuntimeError("OctAttention arithmetic coder emitted no payload")
++    stream_path.write_bytes(
++        HEADER.pack(
++            MAGIC,
++            VERSION,
++            position_bits,
++            depth,
++            int(symbol_count),
++            len(payload),
++        )
++        + payload
++    )
++
++
++class _AnyDecodedSymbol:
++    def __eq__(self, other):
++        return True
++
++
++class _LengthOnlySequence:
++    """Expose only the header's symbol count to the released decoder.
++
++    The upstream decoder uses its MAT argument for length and debug assertions,
++    not probability prediction.  This object makes those assertions inert
++    without exposing encoder or target data.
++    """
++
++    def __init__(self, length):
++        self.length = length
++
++    def __len__(self):
++        return self.length
++
++    def __getitem__(self, index):
++        if not 0 <= index < self.length:
++            raise IndexError(index)
++        return _AnyDecodedSymbol()
++
++
++def _decoder_modules():
++    # Import first because decoder imports encoder.py, which loads the released
++    # checkpoint as a module side effect.  Reload the declared checkpoint after
++    # that import so retrained checkpoints cannot be silently overwritten.
++    original_directory = Path.cwd()
++    try:
++        os.chdir(UPSTREAM_ROOT)
++        from decoder import decodeOct
++        from encoderTool import bptt
++        from Octree import DeOctree
++        import pt
++    finally:
++        os.chdir(original_directory)
++    return decodeOct, bptt, DeOctree, pt
++
++
++def _decode_one(stream_path, reconstruction_path, model, decoder_modules):
++    decodeOct, bptt, DeOctree, pt = decoder_modules
++    stream_path = Path(stream_path)
++    value = stream_path.read_bytes()
++    if len(value) < HEADER.size:
++        raise RuntimeError("OctAttention stream header is truncated")
++    magic, version, position_bits, depth, symbol_count, payload_bytes = HEADER.unpack(
++        value[: HEADER.size]
++    )
++    if magic != MAGIC or version != VERSION:
++        raise RuntimeError("OctAttention stream magic or version differs")
++    payload = value[HEADER.size :]
++    if len(payload) != payload_bytes or not payload:
++        raise RuntimeError("OctAttention stream payload length differs")
++    raw_path = stream_path.with_suffix(stream_path.suffix + ".decode.arithmetic")
++    if raw_path.exists():
++        raise FileExistsError("temporary arithmetic stream already exists")
++    raw_path.write_bytes(payload)
++    try:
++        codes, _ = decodeOct(
++            str(raw_path), _LengthOnlySequence(symbol_count), model, bptt
++        )
++    finally:
++        raw_path.unlink(missing_ok=True)
++    depth_points = np.asarray(DeOctree(codes), dtype=np.float64)
++    depth_levels = (1 << depth) - 1
++    position_levels = (1 << position_bits) - 1
++    reconstruction = np.rint(depth_points * position_levels / depth_levels)
++    reconstruction_path = Path(reconstruction_path)
++    reconstruction_path.parent.mkdir(parents=True, exist_ok=True)
++    if reconstruction_path.exists():
++        raise FileExistsError("OctAttention reconstruction already exists")
++    pt.write_ply_data(str(reconstruction_path), reconstruction)
++
++
++def _training_examples(manifest_path, source_root, depths):
++    manifest_path = Path(manifest_path)
++    manifest = json.loads(manifest_path.read_text())
++    records = manifest["records"]
++    if manifest.get("training_meshes") != 512 or len(records) != 512:
++        raise RuntimeError("training manifest must contain exactly 512 meshes")
++    if any(record.get("split") != "train" for record in records):
++        raise RuntimeError("training manifest contains a non-training record")
++    examples = []
++    for record in records:
++        path = Path(source_root) / record["relative_path"]
++        if _sha256(path) != record["ply_sha256"]:
++            raise RuntimeError("training source hash differs: {}".format(path))
++        for depth in depths:
++            examples.append((path, depth))
++    return manifest, examples
++
++
++def _batch_stream(examples, position_bits, batch_size, sequence_length, seed):
++    rng = np.random.default_rng(seed)
++    buffers = [np.empty((0, 4, 6), dtype=np.int64) for _ in range(batch_size)]
++    while True:
++        for example_index in rng.permutation(len(examples)):
++            path, depth = examples[int(example_index)]
++            points = _read_q12(path, position_bits)
++            feature = _features(
++                _depth_points(points, position_bits, depth), depth
++            ).astype(np.int64)
++            feature[:, :, 0] -= 1
++            shortest = min(range(batch_size), key=lambda index: len(buffers[index]))
++            buffers[shortest] = np.concatenate((buffers[shortest], feature), axis=0)
++            while min(len(buffer) for buffer in buffers) >= sequence_length + 1:
++                batch = np.stack(
++                    [buffer[: sequence_length + 1] for buffer in buffers], axis=1
++                )
++                buffers = [buffer[sequence_length:] for buffer in buffers]
++                yield batch
++
++
++def _train(args):
++    from networkTool import device
++    from octAttention import (
++        TransformerModel,
++        dropout,
++        get_batch,
++        nhid,
++        ninp,
++        nhead,
++        nlayers,
++        ntokens,
++    )
++
++    np.random.seed(args.seed)
++    torch.manual_seed(args.seed)
++    if torch.cuda.is_available():
++        torch.cuda.manual_seed_all(args.seed)
++    torch.backends.cudnn.benchmark = False
++    torch.backends.cudnn.deterministic = True
++    manifest, examples = _training_examples(
++        args.training_manifest, args.source_root, args.depths
++    )
++    model = TransformerModel(ntokens, ninp, nhead, nhid, nlayers, dropout).to(device)
++    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
++    criterion = torch.nn.CrossEntropyLoss()
++    batches = _batch_stream(
++        examples, args.position_bits, args.batch_size, args.bptt, args.seed
++    )
++    losses = []
++    model.train()
++    for step in range(1, args.max_steps + 1):
++        source = torch.as_tensor(next(batches), dtype=torch.long, device=device)
++        data, targets, features = get_batch(source, 0)
++        mask = model.generate_square_subsequent_mask(data.size(0)).to(device)
++        optimizer.zero_grad()
++        output = model(data, mask, features)
++        loss = criterion(output.reshape(-1, ntokens), targets) / np.log(2)
++        loss.backward()
++        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
++        optimizer.step()
++        losses.append(float(loss.detach().cpu()))
++        if step % args.log_interval == 0:
++            print(
++                json.dumps(
++                    {
++                        "step": step,
++                        "mean_loss_bits": float(np.mean(losses[-args.log_interval :])),
++                    }
++                ),
++                flush=True,
++            )
++    checkpoint = Path(args.output_checkpoint)
++    checkpoint.parent.mkdir(parents=True, exist_ok=True)
++    torch.save(
++        {
++            "encoder": model.state_dict(),
++            "step": args.max_steps,
++            "seed": args.seed,
++        },
++        checkpoint,
++    )
++    actual_commit = subprocess.run(
++        ["git", "rev-parse", "HEAD"],
++        check=True,
++        capture_output=True,
++        text=True,
++    ).stdout.strip()
++    diff = subprocess.run(
++        ["git", "diff", "--binary", "HEAD"], check=True, capture_output=True
++    ).stdout
++    record = {
++        "seed": args.seed,
++        "upstream_commit": actual_commit,
++        "checkout_diff_sha256": hashlib.sha256(diff).hexdigest(),
++        "training_manifest_sha256": _sha256(args.training_manifest),
++        "training_meshes": manifest["training_meshes"],
++        "depths": list(args.depths),
++        "position_bits": args.position_bits,
++        "max_steps": args.max_steps,
++        "batch_size": args.batch_size,
++        "bptt": args.bptt,
++        "learning_rate": args.learning_rate,
++        "final_loss_bits": losses[-1],
++        "checkpoint_sha256": _sha256(checkpoint),
++    }
++    checkpoint.parent.joinpath("training_run.json").write_text(
++        json.dumps(record, indent=2, sort_keys=True) + "\n"
++    )
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    subparsers = parser.add_subparsers(dest="command", required=True)
++    encode = subparsers.add_parser("encode")
++    encode.add_argument("--checkpoint", type=Path, required=True)
++    encode.add_argument("--position-bits", type=int, required=True)
++    encode.add_argument("--depth", type=int, required=True)
++    encode.add_argument("--inputs", nargs="+", type=Path, required=True)
++    encode.add_argument("--streams", nargs="+", type=Path, required=True)
++    decode = subparsers.add_parser("decode")
++    decode.add_argument("--checkpoint", type=Path, required=True)
++    decode.add_argument("--streams", nargs="+", type=Path, required=True)
++    decode.add_argument("--reconstructions", nargs="+", type=Path, required=True)
++    train = subparsers.add_parser("train")
++    train.add_argument("--checkpoint", dest="output_checkpoint", required=True)
++    train.add_argument("--training-manifest", type=Path, required=True)
++    train.add_argument("--source-root", type=Path, required=True)
++    train.add_argument("--position-bits", type=int, default=12)
++    train.add_argument("--depths", nargs="+", type=int, default=[4, 5, 6, 7])
++    train.add_argument("--seed", type=int, required=True)
++    train.add_argument("--max-steps", type=int, default=100000)
++    train.add_argument("--batch-size", type=int, default=32)
++    train.add_argument("--bptt", type=int, default=1024)
++    train.add_argument("--learning-rate", type=float, default=1e-3)
++    train.add_argument("--log-interval", type=int, default=100)
++    args = parser.parse_args()
++    if args.command == "encode":
++        if len(args.inputs) != len(args.streams):
++            raise ValueError("inputs and streams must have equal length")
++        model = _load_model(args.checkpoint)
++        for input_path, stream_path in zip(args.inputs, args.streams):
++            _encode_one(
++                input_path, stream_path, model, args.position_bits, args.depth
++            )
++    elif args.command == "decode":
++        if len(args.streams) != len(args.reconstructions):
++            raise ValueError("streams and reconstructions must have equal length")
++        decoder_modules = _decoder_modules()
++        model = _load_model(args.checkpoint)
++        for stream_path, reconstruction_path in zip(
++            args.streams, args.reconstructions
++        ):
++            _decode_one(stream_path, reconstruction_path, model, decoder_modules)
++    else:
++        _train(args)
++
++
++if __name__ == "__main__":
++    main()
