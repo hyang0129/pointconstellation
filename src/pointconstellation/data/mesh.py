@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -138,6 +139,120 @@ def load_off(path: Path) -> TriangleMesh:
     return TriangleMesh(vertex_array, np.asarray(faces, dtype=np.int64))
 
 
+def filter_degenerate_faces(
+    mesh: TriangleMesh, *, area_epsilon: float = 1e-12
+) -> TriangleMesh:
+    """Drop triangles whose doubled area is at most ``area_epsilon``.
+
+    Vertices are deliberately not compacted. Keeping the original vertex array
+    makes the operation auditable and avoids changing valid face indices.
+    """
+
+    if area_epsilon < 0:
+        raise ValueError("area_epsilon cannot be negative")
+    if mesh.vertices.ndim != 2 or mesh.vertices.shape[1:] != (3,):
+        raise ValueError("mesh vertices must have shape (N, 3)")
+    if mesh.faces.ndim != 2 or mesh.faces.shape[1:] != (3,):
+        raise ValueError("mesh faces must have shape (F, 3)")
+    if not np.isfinite(mesh.vertices).all():
+        raise ValueError("mesh contains non-finite vertices")
+    if len(mesh.faces) == 0:
+        return TriangleMesh(mesh.vertices.copy(), mesh.faces.copy())
+    if mesh.faces.min() < 0 or mesh.faces.max() >= len(mesh.vertices):
+        raise ValueError("mesh face index is out of range")
+    triangles = mesh.vertices[mesh.faces]
+    double_areas = np.linalg.norm(
+        np.cross(
+            triangles[:, 1] - triangles[:, 0],
+            triangles[:, 2] - triangles[:, 0],
+        ),
+        axis=1,
+    )
+    return TriangleMesh(
+        mesh.vertices.copy(), mesh.faces[double_areas > area_epsilon].copy()
+    )
+
+
+def _stl_mesh(triangles: NDArray[np.float32], path: Path) -> TriangleMesh:
+    if triangles.ndim != 3 or triangles.shape[1:] != (3, 3):
+        raise ValueError(f"STL triangles have an invalid shape: {path}")
+    if len(triangles) == 0:
+        raise ValueError(f"STL contains no triangles: {path}")
+    if not np.isfinite(triangles).all():
+        raise ValueError(f"STL contains non-finite vertices: {path}")
+    vertices = triangles.reshape(-1, 3).astype(np.float32, copy=True)
+    faces = np.arange(len(vertices), dtype=np.int64).reshape(-1, 3)
+    mesh = filter_degenerate_faces(TriangleMesh(vertices, faces))
+    if len(mesh.faces) == 0:
+        raise ValueError(f"STL contains no non-degenerate triangles: {path}")
+    return mesh
+
+
+def _load_binary_stl(data: bytes, path: Path) -> TriangleMesh:
+    if len(data) < 84:
+        raise ValueError(f"binary STL is truncated: {path}")
+    face_count = struct.unpack_from("<I", data, 80)[0]
+    expected_size = 84 + 50 * face_count
+    if len(data) != expected_size:
+        raise ValueError(f"binary STL size does not match its face count: {path}")
+    facet_dtype = np.dtype(
+        [
+            ("normal", "<f4", (3,)),
+            ("vertices", "<f4", (3, 3)),
+            ("attribute", "<u2"),
+        ]
+    )
+    facets = np.frombuffer(data, dtype=facet_dtype, count=face_count, offset=84)
+    return _stl_mesh(np.asarray(facets["vertices"], dtype=np.float32), path)
+
+
+def _load_ascii_stl(data: bytes, path: Path) -> TriangleMesh:
+    try:
+        lines = data.decode("utf-8", errors="strict").splitlines()
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"STL is neither valid binary nor ASCII: {path}") from exc
+    triangles: list[list[list[float]]] = []
+    facet_vertices: list[list[float]] | None = None
+    saw_solid = False
+    for line_number, raw_line in enumerate(lines, 1):
+        fields = raw_line.strip().split()
+        if not fields:
+            continue
+        keyword = fields[0].lower()
+        if keyword == "solid":
+            saw_solid = True
+        elif keyword == "facet":
+            if facet_vertices is not None:
+                raise ValueError(f"nested STL facet at {path}:{line_number}")
+            facet_vertices = []
+        elif keyword == "vertex":
+            if facet_vertices is None or len(fields) != 4:
+                raise ValueError(f"invalid STL vertex at {path}:{line_number}")
+            try:
+                facet_vertices.append([float(value) for value in fields[1:]])
+            except ValueError as exc:
+                raise ValueError(f"invalid STL vertex at {path}:{line_number}") from exc
+        elif keyword == "endfacet":
+            if facet_vertices is None or len(facet_vertices) != 3:
+                raise ValueError(f"invalid STL facet at {path}:{line_number}")
+            triangles.append(facet_vertices)
+            facet_vertices = None
+    if not saw_solid or not triangles or facet_vertices is not None:
+        raise ValueError(f"ASCII STL has incomplete triangle geometry: {path}")
+    return _stl_mesh(np.asarray(triangles, dtype=np.float32), path)
+
+
+def load_stl(path: Path) -> TriangleMesh:
+    """Load binary or ASCII STL and remove zero-area triangles."""
+
+    data = path.read_bytes()
+    if len(data) >= 84:
+        face_count = struct.unpack_from("<I", data, 80)[0]
+        if len(data) == 84 + 50 * face_count:
+            return _load_binary_stl(data, path)
+    return _load_ascii_stl(data, path)
+
+
 def load_mesh(path: Path) -> TriangleMesh:
     """Load one supported polygon mesh based on its filename suffix."""
 
@@ -146,6 +261,8 @@ def load_mesh(path: Path) -> TriangleMesh:
         return load_obj(path)
     if suffix == ".off":
         return load_off(path)
+    if suffix == ".stl":
+        return load_stl(path)
     raise ValueError(f"unsupported mesh format {suffix!r}: {path}")
 
 
@@ -204,6 +321,14 @@ def load_mesh_manifest(path: Path) -> dict[str, Any]:
     splits = manifest.get("splits")
     if not isinstance(splits, dict) or not splits:
         raise ValueError("mesh manifest must contain nonempty splits")
+    required_splits = manifest.get("required_splits", [])
+    if not isinstance(required_splits, list) or any(
+        not isinstance(split, str) for split in required_splits
+    ):
+        raise ValueError("mesh manifest required_splits must be a list")
+    missing_splits = set(required_splits) - splits.keys()
+    if missing_splits:
+        raise ValueError(f"mesh manifest is missing splits: {missing_splits}")
     seen: set[str] = set()
     for split, records in splits.items():
         if not isinstance(records, list) or not records:
@@ -212,6 +337,10 @@ def load_mesh_manifest(path: Path) -> dict[str, Any]:
             required = {"category", "model_id", "mesh", "mesh_sha256"}
             if not isinstance(record, dict) or not required <= record.keys():
                 raise ValueError(f"invalid record in manifest split: {split}")
+            if manifest["dataset"] == "Thingi10K" and not isinstance(
+                record.get("license"), str
+            ):
+                raise ValueError("Thingi10K records must declare a license")
             identity = f"{record['category']}/{record['model_id']}"
             if identity in seen:
                 raise ValueError(
