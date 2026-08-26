@@ -1,0 +1,30 @@
+{
+  "stability_config": "configs/experiment_019_stability_modelnet40.json",
+  "stability_artifact_dir": "artifacts/local/experiment_019_stability_modelnet40",
+  "decoder_seed": 7,
+  "refiner_seed": 101,
+  "splits": ["validation", "ood"],
+  "adam_evaluations": 64,
+  "adam_learning_rate": 0.03,
+  "selection_seed": 20260821,
+  "voxel_bins": 8,
+  "max_clouds_per_category": null,
+  "batch_size": 4,
+  "figure_categories": [
+    "airplane",
+    "car",
+    "chair",
+    "guitar",
+    "lamp",
+    "sofa",
+    "bed",
+    "table"
+  ],
+  "projection_axes": [0, 2],
+  "part_label_roots": [
+    "data/ShapeNetPart",
+    "data/shapenet_part_seg_hdf5_data",
+    "data/shapenetcore_partanno_segmentation_benchmark_v0_normal"
+  ],
+  "output_dir": "artifacts/local/experiment_034_placement_analysis"
+}
