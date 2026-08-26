@@ -136,12 +136,21 @@ its important limitations.
 
 ### Regenerate figures
 
-Rebuild the machine-readable registry, then regenerate Figure 1 and Table 1:
+Rebuild the machine-readable registry, then regenerate the selection figure,
+RD positioning figure, headline table, and gated BD-rate table:
 
 ```bash
 .venv-train/bin/python -m pointconstellation.benchmark_registry --rebuild
-.venv-train/bin/python scripts/figures/fig1_selection_baselines.py && .venv-train/bin/python scripts/figures/table1_headline.py
+.venv-train/bin/python scripts/figures/fig1_selection_baselines.py
+.venv-train/bin/python scripts/figures/fig_rd_positioning.py
+.venv-train/bin/python scripts/figures/table1_headline.py
+.venv-train/bin/python scripts/figures/table_bd_rate.py
 ```
+
+The RD figure contains only measured registry points. Hollow markers identify
+dominated measurements, and bands resample model seeds and paired clouds. The
+BD table prints `insufficient overlap` unless both curves have at least four
+measured points and a common integration interval; it does not extrapolate.
 
 The next fixed-rate control sweeps constellation size and precision:
 
