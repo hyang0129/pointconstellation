@@ -2,16 +2,7 @@
 
 ## Status
 
-This experiment is predeclared and not yet run at scale. It addresses the
-training-protocol confound in the Experiment 019 learned-codec comparison.
-Experiment 019 compared a four-epoch, EMA-selected constellation decoder with
-the two-epoch raw-final feature codecs from Experiment 018. The resulting
-29.90% validation Chamfer RMSE difference therefore does not isolate the
-representation.
-
-The feature latent is an explicit non-coordinate-only baseline. Its complete
-per-cloud message is an ordered, fixed-width feature vector plus its bitstream
-header. It is not evidence for the coordinate-only bottleneck contract.
+Complete; the predeclared gate passes (validation +27.63%, CI 21.41--33.46; OOD +25.45%, CI 15.54--33.89).
 
 ## Hypothesis and primary gate
 
@@ -95,6 +86,31 @@ hashes, data seed, point count, sample counts, batch size, rate curriculum,
 primary rate, coordinate precision, epoch count, EMA decay, selection start,
 and factorial completeness against the saved Experiment 019 artifact. A
 protocol mismatch stops the comparison.
+
+## Results
+
+Executed on an EmpireAI H200 (`cuda`) in 224 seconds: six feature-codec seeds
+(7, 17, 29, 41, 53, 67) trained under the exact Experiment 019 stabilized protocol
+(every protocol check in `stability_reference.protocol_checks` is true), at the four byte-matched rates.
+
+**The predeclared gate passes.** At 50 bytes the stabilized constellation (6 decoders x 3 refiners) beats the
+equal-protocol feature codec with confidence intervals that exclude zero on both splits and on both the
+source-sample and fresh-resample Chamfer metrics:
+
+| Split | Metric | Feature codec RMSE | Constellation RMSE | Improvement | 95% CI |
+|---|---|---:|---:|---:|---|
+| validation | chamfer_mse | 0.1509 | 0.1092 | +27.63% | [21.41, 33.46] |
+| validation | fresh_chamfer_mse | 0.1508 | 0.1097 | +27.24% | [21.00, 33.23] |
+| ood | chamfer_mse | 0.1636 | 0.1219 | +25.45% | [15.54, 33.89] |
+| ood | fresh_chamfer_mse | 0.1639 | 0.1223 | +25.38% | [15.43, 33.65] |
+
+Intervals resample coordinate-decoder, coordinate-refiner, and feature seeds independently with paired
+hierarchical category/cloud draws. The Experiment 019 comparison (29.90%, CI 23.26--35.77) was therefore
+not an artifact of unequal training: equalising epochs, EMA, and calibration selection moves the
+validation gap from 29.9% to 27.6% and leaves the conclusion unchanged. The representation claim
+("coordinates beat a byte-matched feature latent") survives; the title need not soften.
+
+Numbers come from `artifacts/local/experiment_023_feature_codec_equal_protocol/multiseed_metrics.json`.
 
 ## Commands and artifacts
 
