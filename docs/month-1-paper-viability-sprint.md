@@ -6,6 +6,10 @@ This sprint is not the full ICLR/NeurIPS experimental program. It resolves the
 uncertainties most likely to invalidate or redirect the paper before expensive
 model and benchmark scaling.
 
+The [related-work table](related-work-table.md) records the adjacent mechanism,
+representation, decoder, and codec families that bound the paper claim and its
+required comparisons.
+
 The central candidate claim is that an unordered, quantized `K x 3` same-space
 latent can outperform ordinary point selection because semi-amortized recurrent
 inference finds decoder-useful geometric constellations. Experiment 005 supports

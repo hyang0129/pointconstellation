@@ -13,6 +13,10 @@ an unordered, quantized set of 3D coordinates with no feature channels.
 This is a novelty hypothesis, not a novelty claim. A formal literature review
 and patent search would be required before publication.
 
+The [related-work table](related-work-table.md) expands this landscape into
+method-level comparisons of transmitted information, decoder type, rate regime,
+and the boundary with Point Constellation.
+
 ## The field in six families
 
 ### 1. Spatial-tree and predictive geometry codecs
