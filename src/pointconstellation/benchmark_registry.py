@@ -33,10 +33,14 @@ HEADLINE_METHODS = (
 _IDENTIFIER_FIELDS = {
     "actual_stream_bpp",
     "actual_bpp",
+    "amortized_stream_bpp",
+    "amortized_stream_bytes",
+    "amortize_parameter_sets_over",
     "adam_decoder_evaluations",
     "arm",
     "arm_label",
     "bits",
+    "budget",
     "bytes",
     "clouds",
     "constellation_size",
@@ -45,9 +49,12 @@ _IDENTIFIER_FIELDS = {
     "dataset",
     "decoder_evaluations",
     "decoder_seed",
+    "draco_quantization_bits",
     "evaluation_budget",
     "family",
     "feature_bits",
+    "gps_bytes",
+    "header_bytes",
     "input_points",
     "lambda",
     "latent_dim",
@@ -57,7 +64,12 @@ _IDENTIFIER_FIELDS = {
     "model_id",
     "model_seed",
     "nominal_payload_bpp",
+    "normalization_bpp",
+    "normalization_bytes",
+    "normalization_metadata_bytes",
     "pair_id",
+    "payload_bpp",
+    "payload_bytes",
     "payload_bits",
     "rate_bpp",
     "rate_bytes",
@@ -69,8 +81,15 @@ _IDENTIFIER_FIELDS = {
     "sample_id",
     "samples",
     "seed",
+    "selection_trials",
+    "selected_start",
+    "slice_header_bytes",
+    "source_points",
     "split",
+    "sps_bytes",
+    "start",
     "stream_bytes",
+    "transform_bytes",
     "value",
 }
 _RATE_BYTE_FIELDS = (
@@ -86,6 +105,19 @@ _RATE_BPP_FIELDS = (
     "actual_stream_bpp",
     "mean_actual_bpp",
     "actual_bpp",
+)
+_RATE_COMPONENT_FIELDS = (
+    "header_bytes",
+    "payload_bytes",
+    "payload_bpp",
+    "normalization_bytes",
+    "normalization_bpp",
+    "sps_bytes",
+    "gps_bytes",
+    "slice_header_bytes",
+    "amortized_stream_bytes",
+    "amortized_stream_bpp",
+    "amortize_parameter_sets_over",
 )
 _OFFICIAL_METRIC_ALIASES = {
     "d1_mse": "official_d1_mse",
@@ -206,11 +238,14 @@ def _context_from_document(
         fallback_dataset,
     )
     if dataset is None:
-        dataset = "ModelNet40" if "modelnet40" in str(path).lower() else "unknown"
+        stability_config = _nested(document, "config", "stability_config")
+        dataset_hint = f"{path} {stability_config or ''}".lower()
+        dataset = "ModelNet40" if "modelnet40" in dataset_hint else "unknown"
     input_points = _first_integer(
         _nested(document, "protocol", "input_points"),
         _nested(document, "config", "num_points"),
         _nested(document, "config", "experiment", "num_points"),
+        _nested(document, "data_protocol", "input_points"),
         document.get("input_points"),
     )
     model_seed = _first_integer(
@@ -220,6 +255,12 @@ def _context_from_document(
         _nested(document, "config", "decoder_seed"),
         _nested(document, "config", "experiment", "seed"),
     )
+    if model_seed is None:
+        for part in reversed(path.parts):
+            match = re.fullmatch(r"seed_(\d+)", part)
+            if match:
+                model_seed = int(match.group(1))
+                break
     arm = next(
         (
             str(candidate)
@@ -269,6 +310,18 @@ def canonical_method(method: str, row: dict[str, Any] | None = None) -> str:
         "k_means": "kmeans",
     }
     normalized = aliases.get(normalized, normalized)
+    if normalized.startswith("draco_adam_"):
+        return (
+            "draco_adam_subset_frozen_decoder"
+            if normalized.endswith("_frozen_decoder")
+            else "draco_adam_subset"
+        )
+    if normalized.startswith("draco_fps_"):
+        return (
+            "draco_fps_subset_frozen_decoder"
+            if normalized.endswith("_frozen_decoder")
+            else "draco_fps_subset"
+        )
     if re.fullmatch(r"random_best_of_(?:n|\d+)", normalized) or re.fullmatch(
         r"best_of_\d+_random", normalized
     ):
@@ -324,14 +377,60 @@ def _metric_values(row: dict[str, Any]) -> list[tuple[str, float]]:
     return sorted(set(values))
 
 
+def _input_points(row: dict[str, Any], context: _SourceContext) -> int | None:
+    return _first_integer(
+        row.get("input_points"), row.get("source_points"), context.input_points
+    )
+
+
 def _rate(row: dict[str, Any], context: _SourceContext) -> tuple[float | None, ...]:
     rate_bytes = _number(row, _RATE_BYTE_FIELDS)
     rate_bpp = _number(row, _RATE_BPP_FIELDS)
-    if rate_bytes is None and rate_bpp is not None and context.input_points:
-        rate_bytes = rate_bpp * context.input_points / 8.0
-    if rate_bpp is None and rate_bytes is not None and context.input_points:
-        rate_bpp = 8.0 * rate_bytes / context.input_points
+    input_points = _input_points(row, context)
+    if rate_bytes is None and rate_bpp is not None and input_points:
+        rate_bytes = rate_bpp * input_points / 8.0
+    if rate_bpp is None and rate_bytes is not None and input_points:
+        rate_bpp = 8.0 * rate_bytes / input_points
     return rate_bytes, rate_bpp
+
+
+def _rate_components(
+    row: dict[str, Any], context: _SourceContext
+) -> dict[str, float | int | None]:
+    """Preserve byte accounting without treating it as distortion metrics."""
+
+    result: dict[str, float | int | None] = {
+        field: _number(row, (field,)) for field in _RATE_COMPONENT_FIELDS
+    }
+    input_points = _input_points(row, context)
+    payload_bytes = result["payload_bytes"]
+    payload_bits = _number(row, ("payload_bits",))
+    if payload_bytes is None and payload_bits is not None:
+        payload_bytes = float(math.ceil(payload_bits / 8.0))
+        result["payload_bytes"] = payload_bytes
+    if result["payload_bpp"] is None and payload_bytes is not None and input_points:
+        result["payload_bpp"] = 8.0 * payload_bytes / input_points
+
+    normalization_bytes = result["normalization_bytes"]
+    if normalization_bytes is None:
+        normalization_bytes = _number(
+            row, ("normalization_metadata_bytes", "transform_bytes")
+        )
+        result["normalization_bytes"] = normalization_bytes
+    if (
+        result["normalization_bpp"] is None
+        and normalization_bytes is not None
+        and input_points
+    ):
+        result["normalization_bpp"] = 8.0 * normalization_bytes / input_points
+    amortized_bytes = result["amortized_stream_bytes"]
+    if (
+        result["amortized_stream_bpp"] is None
+        and amortized_bytes is not None
+        and input_points
+    ):
+        result["amortized_stream_bpp"] = 8.0 * amortized_bytes / input_points
+    return result
 
 
 def _rate_label(row: dict[str, Any], rate_bytes: float | None) -> str:
@@ -339,6 +438,8 @@ def _rate_label(row: dict[str, Any], rate_bytes: float | None) -> str:
         if row.get(field) is not None:
             return str(row[field])
     if row.get("constellation_size") is not None:
+        if row.get("draco_quantization_bits") is not None:
+            return f"draco_q_{int(row['draco_quantization_bits'])}"
         return f"k_{int(row['constellation_size'])}"
     if rate_bytes is not None:
         return f"{rate_bytes:g}B"
@@ -369,12 +470,16 @@ def _normalize_observation(
     source_path: Path,
     source_sha256: str,
 ) -> list[dict[str, Any]]:
-    raw_method = observation.get("method")
+    raw_method = observation.get("method", observation.get("codec"))
+    codec_family = observation.get("codec_family")
+    if codec_family in {"octattention", "pcc_geo_cnn_v2", "pcgcv2"}:
+        raw_method = codec_family
     split = observation.get("split")
     if not isinstance(raw_method, str) or not isinstance(split, str):
         return []
     method = canonical_method(raw_method, observation)
     rate_bytes, rate_bpp = _rate(observation, context)
+    rate_components = _rate_components(observation, context)
     decoder_seed, refiner_seed = _seed_fields(
         observation, context, raw_method=raw_method
     )
@@ -396,8 +501,24 @@ def _normalize_observation(
         # Familiar aliases make the actual-rate definition explicit to readers.
         "stream_bytes": rate_bytes,
         "actual_stream_bpp": rate_bpp,
+        **rate_components,
+        "input_points": _input_points(observation, context),
         "decoder_seed": decoder_seed,
         "refiner_seed": refiner_seed,
+        "model_seed": _first_integer(
+            observation.get("model_seed"),
+            observation.get("seed"),
+            context.model_seed,
+        ),
+        "pair_id": observation.get("pair_id"),
+        "latent_dim": observation.get("latent_dim"),
+        "feature_bits": observation.get("feature_bits"),
+        "budget": observation.get("budget"),
+        "start": observation.get("start"),
+        "selected_start": observation.get("selected_start"),
+        "selection_trials": observation.get("selection_trials"),
+        "draco_quantization_bits": observation.get("draco_quantization_bits"),
+        "eligible_for_rd": observation.get("eligible_for_rd", observation.get("valid")),
         "sample_id": observation.get("sample_id"),
         "family": observation.get("family"),
         "model_id": observation.get("model_id"),
@@ -454,7 +575,23 @@ def _import_experiment_017(root: Path) -> list[dict[str, Any]]:
         document = _read_json(path)
         if not isinstance(document, dict):
             raise ValueError(f"benchmark metrics must be a JSON object: {path}")
-        context = _context_from_document(document, path)
+        context = _context_from_document(document, path, fallback_dataset="ModelNet40")
+        rows.extend(
+            _rows_from_source(
+                _embedded_per_cloud(document), context=context, source_path=path
+            )
+        )
+    return rows
+
+
+def _import_experiment_018(root: Path) -> list[dict[str, Any]]:
+    rows = []
+    experiment = root / "experiment_018_feature_codec_multiseed"
+    for path in sorted(experiment.glob("*/benchmark_metrics.json")):
+        document = _read_json(path)
+        if not isinstance(document, dict):
+            raise ValueError(f"benchmark metrics must be a JSON object: {path}")
+        context = _context_from_document(document, path, fallback_dataset="ModelNet40")
         rows.extend(
             _rows_from_source(
                 _embedded_per_cloud(document), context=context, source_path=path
@@ -518,7 +655,11 @@ def _import_experiment_020(
 
 
 def _find_context_document(directory: Path) -> tuple[dict[str, Any], Path | None]:
-    for path in sorted(directory.glob("*metrics.json")):
+    for pattern in ("*metrics.json", "run_manifest.json"):
+        paths = sorted(directory.glob(pattern))
+        if not paths:
+            continue
+        path = paths[0]
         value = _read_json(path)
         if isinstance(value, dict):
             return value, path
@@ -536,7 +677,9 @@ def _generic_per_cloud(document: Any) -> list[dict[str, Any]]:
         if (
             isinstance(value, list)
             and all(isinstance(row, dict) for row in value)
-            and any("method" in row and "split" in row for row in value)
+            and any(
+                ("method" in row or "codec" in row) and "split" in row for row in value
+            )
         ):
             rows.extend(value)
     return rows
@@ -546,7 +689,14 @@ def _import_future_experiments(root: Path) -> list[dict[str, Any]]:
     rows = []
     directories = sorted(
         path
-        for pattern in ("experiment_021*", "experiment_022*")
+        for pattern in (
+            "experiment_021*",
+            "experiment_022*",
+            "experiment_023*",
+            "experiment_025*",
+            "experiment_026*",
+            "experiment_027*",
+        )
         for path in root.glob(pattern)
         if path.is_dir()
     )
@@ -556,8 +706,17 @@ def _import_future_experiments(root: Path) -> list[dict[str, Any]]:
         context = _context_from_document(document, context_path)
         jsonl_paths = sorted(directory.rglob("*per_cloud*.jsonl"))
         for path in jsonl_paths:
+            local_document, local_document_path = _find_context_document(path.parent)
+            local_context = _context_from_document(
+                local_document or document,
+                local_document_path or path,
+                fallback_dataset=context.dataset,
+                default_arm=context.default_arm,
+            )
             rows.extend(
-                _rows_from_source(_read_jsonl(path), context=context, source_path=path)
+                _rows_from_source(
+                    _read_jsonl(path), context=local_context, source_path=path
+                )
             )
         if not jsonl_paths:
             for path in sorted(directory.rglob("*metrics.json")):
@@ -590,8 +749,19 @@ def _row_identity(row: dict[str, Any]) -> tuple[Any, ...]:
         "rate_point",
         "rate_bytes",
         "rate_bpp",
+        "payload_bytes",
+        "payload_bpp",
+        "normalization_bytes",
+        "normalization_bpp",
+        "amortized_stream_bytes",
+        "amortized_stream_bpp",
+        "budget",
+        "start",
+        "selected_start",
+        "selection_trials",
         "decoder_seed",
         "refiner_seed",
+        "pair_id",
         "sample_id",
         "family",
         "model_id",
@@ -628,6 +798,7 @@ def collect_registry_rows(artifact_root: Path) -> list[dict[str, Any]]:
     """Read supported experiment artifacts and return stable long-form rows."""
 
     rows = _import_experiment_017(artifact_root)
+    rows.extend(_import_experiment_018(artifact_root))
     stability_rows, stability_dataset = _import_experiment_019(artifact_root)
     rows.extend(stability_rows)
     rows.extend(
