@@ -45,7 +45,7 @@ DEFAULT_BUDGETS = (16, 64, 256)
 DEFAULT_START_METHODS = ("fps", "kmeans")
 DEFAULT_RANDOM_START_SEEDS = (101, 211)
 SUPPORTED_SPLITS = ("validation", "ood")
-SUPPORTED_TIMING_DEVICES = ("mps", "cpu")
+SUPPORTED_TIMING_DEVICES = ("mps", "cpu", "cuda")
 SUMMARY_METRICS = (
     "source_chamfer_mse",
     "fresh_chamfer_mse",
@@ -133,7 +133,7 @@ class HeadroomExperimentConfig:
             or set(self.timing_devices) - set(SUPPORTED_TIMING_DEVICES)
         ):
             raise ValueError(
-                "timing_devices must contain unique cpu and/or mps entries"
+                "timing_devices must contain unique cpu, mps, and/or cuda entries"
             )
         if self.bootstrap_samples < 100:
             raise ValueError("bootstrap_samples must be at least 100")
@@ -1033,7 +1033,7 @@ def run_headroom_experiment(
 
     quality_device = select_device(device_name or config.timing_devices[0])
     if quality_device.type not in SUPPORTED_TIMING_DEVICES:
-        raise ValueError("Experiment 022 quality device must be cpu or mps")
+        raise ValueError("Experiment 022 quality device must be cpu, mps, or cuda")
     if quality_device.type not in config.timing_devices:
         config = replace(
             config,
