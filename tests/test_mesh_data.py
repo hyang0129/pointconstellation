@@ -47,6 +47,10 @@ def test_obj_loading_normalization_and_surface_sampling_are_deterministic() -> N
     assert np.linalg.norm(first.source_points, axis=1).max() <= 1.0 + 1e-6
     assert np.allclose(np.linalg.norm(first.source_normals, axis=1), 1.0)
     assert np.allclose(np.linalg.norm(first.target_normals, axis=1), 1.0)
+    assert np.allclose(
+        first.original_source_points,
+        first.source_points * first.normalization_scale + first.normalization_center,
+    )
 
 
 def test_off_loader_triangulates_polygons_and_accepts_inline_counts(

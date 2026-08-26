@@ -15,7 +15,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from pointconstellation.bitstream import expected_stream_bytes
+from pointconstellation.bitstream import NORMALIZATION, expected_stream_bytes
 from pointconstellation.codecs import run_pc_error
 from pointconstellation.data import MeshSurfaceDataset, file_sha256, load_mesh_manifest
 from pointconstellation.feature_bitstream import (
@@ -26,6 +26,7 @@ from pointconstellation.feature_bitstream import (
 )
 from pointconstellation.losses import chamfer_squared_chunked
 from pointconstellation.models.feature_codec import VariableFeatureCodec
+from pointconstellation.rate_accounting import model_amortization
 from pointconstellation.refiner_benchmark import paired_hierarchical_bootstrap
 from pointconstellation.refiner_experiment import _state_hash
 from pointconstellation.standardized_benchmark import (
@@ -224,7 +225,27 @@ def _train_seed(
         )
     output_dir.mkdir(parents=True, exist_ok=True)
     torch.save(codec.encoder.state_dict(), output_dir / "encoder.pt")
-    torch.save(codec.decoder.state_dict(), output_dir / "decoder.pt")
+    decoder_files = {}
+    decoder_state = codec.decoder.state_dict()
+    torch.save(decoder_state, output_dir / "decoder.pt")
+    for precision, dtype in (("fp32", torch.float32), ("fp16", torch.float16)):
+        path = output_dir / f"decoder_state_dict_{precision}.pt"
+        torch.save(
+            {
+                name: (
+                    value.detach().cpu().to(dtype)
+                    if value.is_floating_point()
+                    else value.detach().cpu()
+                )
+                for name, value in decoder_state.items()
+            },
+            path,
+        )
+        decoder_files[precision] = {
+            "path": str(path),
+            "bytes": path.stat().st_size,
+            "sha256": file_sha256(path),
+        }
     return codec.eval(), {
         "history": history,
         "optimizer_updates": update_count,
@@ -233,6 +254,7 @@ def _train_seed(
         "state_hash": _state_hash(codec),
         "encoder_checkpoint_bytes": (output_dir / "encoder.pt").stat().st_size,
         "decoder_checkpoint_bytes": (output_dir / "decoder.pt").stat().st_size,
+        "decoder_state_dicts": decoder_files,
     }
 
 
@@ -254,6 +276,7 @@ def _evaluate_seed(
                 normals_cpu = torch.from_numpy(sample.source_normals)
                 fresh_cpu = torch.from_numpy(sample.target_points)
                 fresh_normals_cpu = torch.from_numpy(sample.target_normals)
+                original_source_cpu = torch.from_numpy(sample.original_source_points)
                 source = source_cpu.to(device)[None]
                 for latent_dim, constellation_size in zip(
                     config.latent_dims,
@@ -271,6 +294,8 @@ def _evaluate_seed(
                         features[0].cpu().numpy(),
                         bits=config.feature_bits,
                         output_points=config.num_points,
+                        normalization_center=sample.normalization_center,
+                        normalization_scale=sample.normalization_scale,
                     )
                     bitstream_encode_seconds = (
                         time.perf_counter() - serialization_started
@@ -290,6 +315,12 @@ def _evaluate_seed(
 
                     reconstruction, decode_seconds = _timed(device, decode)
                     packet = decode_features(stream)
+                    center = torch.from_numpy(packet.normalization_center).to(
+                        device=device, dtype=reconstruction.dtype
+                    )
+                    original_reconstruction = (
+                        reconstruction * packet.normalization_scale + center
+                    )
                     metrics = standardized_geometry_metrics(
                         reconstruction[0].cpu(),
                         source_cpu,
@@ -335,6 +366,32 @@ def _evaluate_seed(
                             }
                         )
                         metrics["official_elapsed_seconds"] = official.elapsed_seconds
+                        original_official = run_pc_error(
+                            Path(config.official_metric_executable),
+                            original_source_cpu.numpy(),
+                            original_reconstruction[0].cpu().numpy(),
+                            normals_cpu.numpy(),
+                            work_dir=(
+                                output_dir
+                                / "official_metric_original_frame_work"
+                                / split
+                                / f"sample_{sample_id:05d}"
+                                / f"d_{latent_dim:04d}"
+                            ),
+                            position_bits=config.official_metric_position_bits,
+                            timeout_seconds=config.official_metric_timeout_seconds,
+                            normalization_center=sample.normalization_center,
+                            normalization_scale=sample.normalization_scale,
+                        )
+                        metrics.update(
+                            {
+                                f"original_frame_official_{name}": value
+                                for name, value in original_official.metrics.items()
+                            }
+                        )
+                        metrics["original_frame_official_elapsed_seconds"] = (
+                            original_official.elapsed_seconds
+                        )
                     rows.append(
                         {
                             "split": split,
@@ -350,6 +407,7 @@ def _evaluate_seed(
                             / config.num_points,
                             "header_bytes": packet.header_bytes,
                             "payload_bytes": packet.payload_bytes,
+                            "normalization_bytes": packet.normalization_bytes,
                             "payload_bpp": packet.payload_bytes * 8 / config.num_points,
                             "stream_bytes": packet.stream_bytes,
                             "actual_stream_bpp": packet.stream_bytes
@@ -437,6 +495,11 @@ def _reference_comparisons(
                     if any(
                         feature_index[key]["stream_bytes"]
                         != reference_index[key]["stream_bytes"]
+                        + (
+                            0
+                            if "normalization_bytes" in reference_index[key]
+                            else NORMALIZATION.size
+                        )
                         for key in keys
                     ):
                         raise RuntimeError(
@@ -570,7 +633,22 @@ def run_feature_codec_benchmark(
                 "model_seed": model_seed,
                 "data_seed": config.data_seed,
                 "model": model,
-                "summary": _average_rows(rows),
+                "summary": [
+                    {
+                        **row,
+                        **model_amortization(
+                            row["stream_bytes"],
+                            config.num_points,
+                            {
+                                precision: record["bytes"]
+                                for precision, record in model[
+                                    "decoder_state_dicts"
+                                ].items()
+                            },
+                        ),
+                    }
+                    for row in _average_rows(rows)
+                ],
                 "monotonicity": _monotonicity(_average_rows(rows)),
                 "per_cloud": rows,
                 "evaluation_elapsed_seconds": evaluation_seconds,
@@ -615,9 +693,13 @@ def run_feature_codec_benchmark(
             "payload_rate_definition": (
                 "byte-aligned feature payload bits / input points"
             ),
-            "rate_match": "exact bytes including each format's complete header",
+            "rate_match": (
+                "exact bytes including each format's header and normalization"
+            ),
             "feature_latent_is_not_coordinate_only": True,
+            "normalization_payload_bytes_per_object": 8,
             "shared_model_cost_excluded_from_per_cloud_rate": True,
+            "shared_model_cost_reported_as_amortized_bpp": True,
         },
         "device": str(device),
         "environment": {

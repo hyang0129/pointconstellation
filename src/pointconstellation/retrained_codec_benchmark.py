@@ -22,6 +22,7 @@ from pointconstellation.published_codec_benchmark import (
     PccGeoCnnV2Manifest,
     _codec_spec,
 )
+from pointconstellation.rate_accounting import amortized_bpp_table
 
 
 @dataclass(frozen=True)
@@ -318,6 +319,12 @@ def run_retrained_codec_benchmark(
                 ),
                 "mean_payload_bpp": float(
                     np.mean([row["payload_bpp"] for row in group])
+                ),
+                "model_bytes": spec.model_bytes,
+                "amortized_bpp": amortized_bpp_table(
+                    float(stream_bytes.mean()),
+                    spec.model_bytes or 0,
+                    int(group[0]["source_points"]),
                 ),
                 "aggregate_chamfer_rmse": _rmse_or_none(chamfer_values),
                 "official_d1_rmse_grid_units": _rmse_or_none(d1_values),

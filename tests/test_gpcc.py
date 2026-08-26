@@ -138,4 +138,27 @@ print('h.,PSNR   (p2plane): 38.0')
     assert result.metrics["d1_mse"] == pytest.approx(1.25)
     assert result.metrics["d2_psnr_db"] == pytest.approx(45.0)
     assert result.metrics["d2_hausdorff_psnr_db"] == pytest.approx(38.0)
+
+    original_frame = points * 4.0 + np.asarray([10.0, -3.0, 2.0])
+    transformed = run_pc_error(
+        executable,
+        original_frame,
+        original_frame,
+        normals,
+        work_dir=tmp_path / "original_metric",
+        position_bits=10,
+        normalization_center=[10.0, -3.0, 2.0],
+        normalization_scale=4.0,
+    )
+    assert transformed.metrics == result.metrics
+
+    with pytest.raises(ValueError, match="supplied together"):
+        run_pc_error(
+            executable,
+            points,
+            points,
+            normals,
+            work_dir=tmp_path / "bad_metric",
+            normalization_center=[0.0, 0.0, 0.0],
+        )
     assert os.path.samefile(result.command[0], executable)

@@ -1,6 +1,7 @@
 """Procedural data used to test geometry-only compression."""
 
 from pointconstellation.data.mesh import (
+    MeshNormalization,
     MeshSurfaceDataset,
     MeshSurfaceSample,
     TriangleMesh,
@@ -9,6 +10,7 @@ from pointconstellation.data.mesh import (
     load_mesh_manifest,
     load_obj,
     load_off,
+    mesh_normalization,
     normalize_mesh,
     sample_mesh_surface,
 )
@@ -20,6 +22,7 @@ from pointconstellation.data.procedural import (
 
 __all__ = [
     "FAMILIES",
+    "MeshNormalization",
     "MeshSurfaceDataset",
     "MeshSurfaceSample",
     "ProceduralPointCloudDataset",
@@ -30,6 +33,7 @@ __all__ = [
     "load_mesh_manifest",
     "load_obj",
     "load_off",
+    "mesh_normalization",
     "normalize_mesh",
     "sample_mesh_surface",
 ]

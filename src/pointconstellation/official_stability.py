@@ -17,6 +17,7 @@ import torch
 from pointconstellation.bitstream import HEADER
 from pointconstellation.codecs import run_pc_error
 from pointconstellation.data import file_sha256
+from pointconstellation.rate_accounting import model_amortization
 from pointconstellation.refiner_experiment import _fps, _state_hash
 from pointconstellation.stability_experiment import (
     StabilityExperimentConfig,
@@ -120,7 +121,11 @@ def _load_rows(path: Path) -> list[dict[str, Any]]:
         raise RuntimeError("official metric artifact contains duplicate rows")
     for row in rows:
         row.setdefault("header_bytes", HEADER.size)
-        row.setdefault("payload_bytes", row["stream_bytes"] - row["header_bytes"])
+        row.setdefault("normalization_bytes", 0)
+        row.setdefault(
+            "payload_bytes",
+            row["stream_bytes"] - row["header_bytes"] - row["normalization_bytes"],
+        )
         row.setdefault(
             "payload_bpp",
             row["actual_stream_bpp"] * row["payload_bytes"] / row["stream_bytes"],
@@ -240,7 +245,10 @@ def summarize_official_rows(
         if not cloud_keys:
             raise RuntimeError(f"no official rows for split={split}")
         categories = np.asarray([key[0] for key in cloud_keys])
-        for metric_index, metric in enumerate(METRICS):
+        metrics = list(METRICS)
+        if f"original_frame_{METRICS[0]}" in indexed[next(iter(indexed))]:
+            metrics.extend(f"original_frame_{metric}" for metric in METRICS)
+        for metric_index, metric in enumerate(metrics):
             fps = np.asarray(
                 [
                     [
@@ -293,8 +301,24 @@ def summarize_official_rows(
             ):
                 per_decoder["decoder_seed"] = decoder_seed
                 per_decoder.pop("decoder_index")
-            comparisons.append({"split": split, "metric": metric, **comparison})
-    validation = [row for row in comparisons if row["split"] == "validation"]
+            comparisons.append(
+                {
+                    "split": split,
+                    "coordinate_frame": (
+                        "original_mesh"
+                        if metric.startswith("original_frame_")
+                        else "shared_normalized"
+                    ),
+                    "metric": metric,
+                    **comparison,
+                }
+            )
+    validation = [
+        row
+        for row in comparisons
+        if row["split"] == "validation"
+        and row["coordinate_frame"] == "shared_normalized"
+    ]
     return {
         "comparison_definition": (
             "paired hierarchical category/cloud bootstrap with paired decoder and "
@@ -374,6 +398,34 @@ def _load_models(
     return decoder, refiner, metadata
 
 
+def _save_decoder_state_dicts(
+    decoder: torch.nn.Module, output_dir: Path, *, decoder_seed: int
+) -> dict[str, Any]:
+    directory = output_dir / "decoder_models" / f"seed_{decoder_seed}"
+    directory.mkdir(parents=True, exist_ok=True)
+    source = decoder.state_dict()
+    files = {}
+    for precision, dtype in (("fp32", torch.float32), ("fp16", torch.float16)):
+        path = directory / f"decoder_state_dict_{precision}.pt"
+        torch.save(
+            {
+                name: (
+                    value.detach().cpu().to(dtype)
+                    if value.is_floating_point()
+                    else value.detach().cpu()
+                )
+                for name, value in source.items()
+            },
+            path,
+        )
+        files[precision] = {
+            "path": str(path),
+            "bytes": path.stat().st_size,
+            "sha256": file_sha256(path),
+        }
+    return {"decoder_seed": decoder_seed, "state_dicts": files}
+
+
 def _evaluate_method(
     stability: StabilityExperimentConfig,
     official: OfficialStabilityConfig,
@@ -389,6 +441,8 @@ def _evaluate_method(
 ) -> dict[str, Any]:
     source = sample["source_points"].unsqueeze(0).to(device)
     normals = sample["source_normals"].cpu().numpy()
+    normalization_center = sample.get("normalization_center")
+    normalization_scale = sample.get("normalization_scale")
     method = "fps" if refiner is None else "refiner"
     encode_started = time.perf_counter()
     if refiner is None:
@@ -407,11 +461,27 @@ def _evaluate_method(
         coordinates,
         config=stability,
         mode="fps" if refiner is None else "free",
+        normalization_centers=(
+            None if normalization_center is None else normalization_center.unsqueeze(0)
+        ),
+        normalization_scales=(
+            None
+            if normalization_scale is None
+            else torch.as_tensor([normalization_scale])
+        ),
     )
     encode_seconds = time.perf_counter() - encode_started
     decode_started = time.perf_counter()
     with torch.no_grad():
         reconstruction = decoder(decoded, num_output_points=stability.num_points)
+        original_reconstruction = reconstruction
+        if packets[0].normalization_center is not None:
+            center = torch.from_numpy(packets[0].normalization_center).to(
+                device=device, dtype=reconstruction.dtype
+            )
+            original_reconstruction = (
+                reconstruction * packets[0].normalization_scale + center
+            )
     decode_seconds = time.perf_counter() - decode_started
     with tempfile.TemporaryDirectory(
         prefix=(
@@ -429,6 +499,19 @@ def _evaluate_method(
             position_bits=official.position_bits,
             timeout_seconds=official.timeout_seconds,
         )
+        original_metric = None
+        if normalization_center is not None:
+            original_metric = run_pc_error(
+                Path(official.pc_error_executable),
+                sample["original_source_points"].cpu().numpy(),
+                original_reconstruction[0].detach().cpu().numpy(),
+                normals,
+                work_dir=Path(temporary) / "original_frame",
+                position_bits=official.position_bits,
+                timeout_seconds=official.timeout_seconds,
+                normalization_center=normalization_center.cpu().numpy(),
+                normalization_scale=float(normalization_scale),
+            )
     if not exact or not lattice_exact:
         raise RuntimeError("official evaluation message failed exact stream checks")
     if len(packets) != 1:
@@ -446,6 +529,7 @@ def _evaluate_method(
         "coordinate_bits": stability.coordinate_bits,
         "header_bytes": packet.header_bytes,
         "payload_bytes": packet.payload_bytes,
+        "normalization_bytes": packet.normalization_bytes,
         "payload_bpp": 8.0 * packet.payload_bytes / stability.num_points,
         "stream_bytes": packet.stream_bytes,
         "actual_stream_bpp": 8.0 * packet.stream_bytes / stability.num_points,
@@ -456,6 +540,19 @@ def _evaluate_method(
         "decode_seconds": decode_seconds,
         "official_metric_seconds": metric.elapsed_seconds,
         **metric.metrics,
+        **(
+            {
+                f"original_frame_{name}": value
+                for name, value in original_metric.metrics.items()
+            }
+            if original_metric is not None
+            else {}
+        ),
+        **(
+            {"original_frame_official_metric_seconds": original_metric.elapsed_seconds}
+            if original_metric is not None
+            else {}
+        ),
     }
 
 
@@ -519,6 +616,7 @@ def run_official_stability(
     device = select_device(device_name)
     started = time.perf_counter()
     model_records = []
+    decoder_model_records = []
     expected_bytes = next(iter(existing_sizes), None)
     for decoder_seed in config.decoder_seeds:
         decoder, _, decoder_metadata = _load_models(
@@ -529,6 +627,9 @@ def run_official_stability(
             device=device,
         )
         decoder_hash_before = _state_hash(decoder)
+        decoder_model_records.append(
+            _save_decoder_state_dicts(decoder, output_dir, decoder_seed=decoder_seed)
+        )
         for split in config.splits:
             dataset = datasets[split]
             count = (
@@ -635,6 +736,21 @@ def run_official_stability(
             raise RuntimeError("decoder state drifted during official FPS evaluation")
 
     summary = summarize_official_rows(rows, config)
+    if expected_bytes is None:
+        raise RuntimeError("official evaluation produced no streams")
+    precision_sizes = {
+        precision: max(
+            record["state_dicts"][precision]["bytes"]
+            for record in decoder_model_records
+        )
+        for precision in ("fp32", "fp16")
+    }
+    for comparison in summary["comparisons"]:
+        comparison.update(
+            model_amortization(
+                float(expected_bytes), stability.num_points, precision_sizes
+            )
+        )
     result = {
         "experiment": "020_official_stability",
         "config": _json_ready(asdict(config)),
@@ -656,7 +772,10 @@ def run_official_stability(
             "header_payload_splits_exact": bool(
                 rows
                 and all(
-                    row["header_bytes"] + row["payload_bytes"] == row["stream_bytes"]
+                    row["header_bytes"]
+                    + row["payload_bytes"]
+                    + row.get("normalization_bytes", 0)
+                    == row["stream_bytes"]
                     for row in rows
                 )
             ),
@@ -676,6 +795,7 @@ def run_official_stability(
             "position_bits": config.position_bits,
         },
         "model_records": model_records,
+        "decoder_model_records": decoder_model_records,
         "official_statistics": summary,
         "elapsed_seconds": time.perf_counter() - started,
         "per_cloud_path": str(rows_path),

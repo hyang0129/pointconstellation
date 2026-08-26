@@ -22,6 +22,20 @@ class TriangleMesh:
 
 
 @dataclass(frozen=True)
+class MeshNormalization:
+    """Isotropic transform between a mesh's source and normalized frames."""
+
+    center: FloatArray
+    scale: float
+
+    def normalize(self, points: NDArray[np.floating[Any]]) -> FloatArray:
+        return ((points - self.center) / self.scale).astype(np.float32)
+
+    def restore(self, points: NDArray[np.floating[Any]]) -> FloatArray:
+        return (points * self.scale + self.center).astype(np.float32)
+
+
+@dataclass(frozen=True)
 class MeshSurfaceSample:
     source_points: FloatArray
     source_normals: FloatArray
@@ -30,6 +44,10 @@ class MeshSurfaceSample:
     category: str
     model_id: str
     sample_id: int
+    normalization_center: FloatArray
+    normalization_scale: float
+    original_source_points: FloatArray
+    original_target_points: FloatArray
 
 
 def file_sha256(path: Path) -> str:
@@ -149,16 +167,24 @@ def load_mesh(path: Path) -> TriangleMesh:
     raise ValueError(f"unsupported mesh format {suffix!r}: {path}")
 
 
-def normalize_mesh(mesh: TriangleMesh) -> TriangleMesh:
-    """Map a mesh into the benchmark's declared unit-radius coordinate domain."""
+def mesh_normalization(mesh: TriangleMesh) -> MeshNormalization:
+    """Return the benchmark's bounding-box-center, unit-radius transform."""
 
     lower = mesh.vertices.min(axis=0)
     upper = mesh.vertices.max(axis=0)
-    centered = mesh.vertices - 0.5 * (lower + upper)
+    center = (0.5 * (lower + upper)).astype(np.float32)
+    centered = mesh.vertices - center
     scale = float(np.linalg.norm(centered, axis=1).max())
     if scale <= 1e-12:
         raise ValueError("mesh has zero spatial extent")
-    return TriangleMesh((centered / scale).astype(np.float32), mesh.faces.copy())
+    return MeshNormalization(center, scale)
+
+
+def normalize_mesh(mesh: TriangleMesh) -> TriangleMesh:
+    """Map a mesh into the benchmark's declared unit-radius coordinate domain."""
+
+    normalization = mesh_normalization(mesh)
+    return TriangleMesh(normalization.normalize(mesh.vertices), mesh.faces.copy())
 
 
 def sample_mesh_surface(
@@ -250,7 +276,7 @@ class MeshSurfaceDataset:
         if training_target not in {"source", "independent"}:
             raise ValueError("training_target must be source or independent")
         self.training_target = training_target
-        self._mesh_cache: dict[Path, TriangleMesh] = {}
+        self._mesh_cache: dict[Path, tuple[TriangleMesh, MeshNormalization]] = {}
 
     def __len__(self) -> int:
         return len(self.records)
@@ -266,17 +292,27 @@ class MeshSurfaceDataset:
             raise FileNotFoundError(f"manifest mesh does not exist: {path}")
         return path
 
-    def _load_mesh(self, record: dict[str, str]) -> TriangleMesh:
+    def _load_mesh(
+        self, record: dict[str, str]
+    ) -> tuple[TriangleMesh, MeshNormalization]:
         path = self._mesh_path(record)
         if path not in self._mesh_cache:
             if self.verify_hashes and file_sha256(path) != record["mesh_sha256"]:
                 raise ValueError(f"mesh hash differs from manifest: {path}")
-            self._mesh_cache[path] = normalize_mesh(load_mesh(path))
+            source_mesh = load_mesh(path)
+            normalization = mesh_normalization(source_mesh)
+            self._mesh_cache[path] = (
+                TriangleMesh(
+                    normalization.normalize(source_mesh.vertices),
+                    source_mesh.faces.copy(),
+                ),
+                normalization,
+            )
         return self._mesh_cache[path]
 
     def sample(self, index: int) -> MeshSurfaceSample:
         record = self.records[index]
-        mesh = self._load_mesh(record)
+        mesh, normalization = self._load_mesh(record)
         source, source_normals = sample_mesh_surface(
             mesh,
             self.num_points,
@@ -299,6 +335,10 @@ class MeshSurfaceDataset:
             str(record["category"]),
             str(record["model_id"]),
             index,
+            normalization.center.copy(),
+            normalization.scale,
+            normalization.restore(source),
+            normalization.restore(target),
         )
 
     def __getitem__(self, index: int) -> dict[str, object]:
@@ -322,6 +362,16 @@ class MeshSurfaceDataset:
             "target_normals": torch.from_numpy(target_normals.copy()),
             "fresh_points": torch.from_numpy(sample.target_points.copy()),
             "fresh_normals": torch.from_numpy(sample.target_normals.copy()),
+            "normalization_center": torch.from_numpy(
+                sample.normalization_center.copy()
+            ),
+            "normalization_scale": sample.normalization_scale,
+            "original_source_points": torch.from_numpy(
+                sample.original_source_points.copy()
+            ),
+            "original_target_points": torch.from_numpy(
+                sample.original_target_points.copy()
+            ),
             "category": sample.category,
             "family": sample.category,
             "model_id": sample.model_id,
