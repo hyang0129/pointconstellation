@@ -31,6 +31,7 @@ def test_feature_stream_round_trips_exact_lattice(bits: int) -> None:
     assert packet.output_points == 2048
     assert packet.payload_bits == len(features) * bits
     assert packet.header_bytes == HEADER.size
+    assert packet.normalization_bytes == 0
     assert packet.header_bytes + packet.payload_bytes == (
         expected_feature_stream_bytes(len(features), bits)
     )
@@ -47,6 +48,25 @@ def test_feature_stream_rejects_malformed_inputs() -> None:
         decode_features(stream[:-1] + bytes([stream[-1] | 1]))
     with pytest.raises(ValueError, match="header"):
         decode_features(stream[: HEADER.size - 1])
+
+
+def test_feature_stream_counts_optional_normalization() -> None:
+    stream = encode_features(
+        [0.0, 0.5],
+        bits=8,
+        output_points=32,
+        normalization_center=[2.0, -1.0, 0.25],
+        normalization_scale=3.0,
+    )
+    packet = decode_features(stream)
+
+    assert packet.normalization_bytes == 8
+    assert packet.header_bytes + packet.payload_bytes + packet.normalization_bytes == (
+        packet.stream_bytes
+    )
+    assert packet.stream_bytes == expected_feature_stream_bytes(
+        2, 8, normalization=True
+    )
 
 
 def test_feature_codec_is_permutation_invariant_and_variable_rate() -> None:

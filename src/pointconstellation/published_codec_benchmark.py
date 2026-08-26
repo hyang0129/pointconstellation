@@ -14,6 +14,7 @@ from typing import Any
 
 import numpy as np
 
+from pointconstellation.bitstream import decode_normalization, encode_normalization
 from pointconstellation.codecs import (
     ExternalCodecSpec,
     run_external_codec_batch,
@@ -21,6 +22,7 @@ from pointconstellation.codecs import (
 )
 from pointconstellation.data import file_sha256
 from pointconstellation.metrics import chamfer_rmse
+from pointconstellation.rate_accounting import amortized_bpp_table
 
 
 @dataclass(frozen=True)
@@ -178,14 +180,19 @@ def _rate_summaries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         groups.setdefault((row["lambda"], row["split"]), []).append(row)
     summaries = []
     for (rate_lambda, split), group in sorted(groups.items()):
+        mean_stream_bytes = float(np.mean([row["stream_bytes"] for row in group]))
+        input_points = int(
+            group[0].get(
+                "source_points",
+                round(8.0 * group[0]["stream_bytes"] / group[0]["actual_stream_bpp"]),
+            )
+        )
         summaries.append(
             {
                 "lambda": rate_lambda,
                 "split": split,
                 "clouds": len(group),
-                "mean_stream_bytes": float(
-                    np.mean([row["stream_bytes"] for row in group])
-                ),
+                "mean_stream_bytes": mean_stream_bytes,
                 "mean_actual_bpp": float(
                     np.mean([row["actual_stream_bpp"] for row in group])
                 ),
@@ -210,6 +217,9 @@ def _rate_summaries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     np.mean([row["official_metric_seconds"] for row in group])
                 ),
                 "model_bytes": group[0]["model_bytes"],
+                "amortized_bpp": amortized_bpp_table(
+                    mean_stream_bytes, group[0]["model_bytes"], input_points
+                ),
             }
         )
     return summaries
@@ -416,6 +426,9 @@ def run_published_codec_benchmark(
                         "cloud_dir": cloud_dir,
                         "source": sample["source_points"].numpy(),
                         "normals": sample["source_normals"].numpy(),
+                        "normalization_center": sample["normalization_center"].numpy(),
+                        "normalization_scale": float(sample["normalization_scale"]),
+                        "original_source": sample["original_source_points"].numpy(),
                     }
                 )
         if not pending:
@@ -437,6 +450,14 @@ def run_published_codec_benchmark(
             cloud_dir = item["cloud_dir"]
             source = item["source"]
             normals = item["normals"]
+            normalization_payload = encode_normalization(
+                item["normalization_center"], item["normalization_scale"]
+            )
+            (cloud_dir / "normalization.bin").write_bytes(normalization_payload)
+            decoded_center, decoded_scale = decode_normalization(normalization_payload)
+            original_reconstruction = (
+                codec_result.reconstruction * decoded_scale + decoded_center
+            ).astype(np.float32)
             codec_levels = (1 << manifest.position_bits) - 1
             codec_input = np.rint((source + 1.0) * 0.5 * codec_levels)
             codec_input_unique_voxels = len(np.unique(codec_input, axis=0))
@@ -452,6 +473,17 @@ def run_published_codec_benchmark(
                     work_dir=Path(temporary),
                     position_bits=stability.coordinate_bits,
                 )
+                original_official = run_pc_error(
+                    executable,
+                    item["original_source"],
+                    original_reconstruction,
+                    normals,
+                    work_dir=Path(temporary) / "original_frame",
+                    position_bits=stability.coordinate_bits,
+                    normalization_center=item["normalization_center"],
+                    normalization_scale=item["normalization_scale"],
+                )
+            total_stream_bytes = codec_result.stream_bytes + len(normalization_payload)
             row = {
                 "codec": manifest.name,
                 "model_mode": manifest.model_mode,
@@ -464,10 +496,13 @@ def run_published_codec_benchmark(
                 "source_points": len(source),
                 "codec_input_unique_voxels": codec_input_unique_voxels,
                 "decoded_points": len(codec_result.reconstruction),
-                "stream_bytes": codec_result.stream_bytes,
-                "actual_stream_bpp": (8.0 * codec_result.stream_bytes / len(source)),
+                "codec_stream_bytes": codec_result.stream_bytes,
+                "normalization_bytes": len(normalization_payload),
+                "normalization_sha256": file_sha256(cloud_dir / "normalization.bin"),
+                "stream_bytes": total_stream_bytes,
+                "actual_stream_bpp": (8.0 * total_stream_bytes / len(source)),
                 "actual_stream_bpov": (
-                    8.0 * codec_result.stream_bytes / codec_input_unique_voxels
+                    8.0 * total_stream_bytes / codec_input_unique_voxels
                 ),
                 "codec_input_position_bits": manifest.position_bits,
                 "metric_position_bits": stability.coordinate_bits,
@@ -481,6 +516,10 @@ def run_published_codec_benchmark(
                 "model_bytes": spec.model_bytes,
                 "chamfer_mse": chamfer_mse,
                 **official.metrics,
+                **{
+                    f"original_frame_{name}": value
+                    for name, value in original_official.metrics.items()
+                },
             }
             (cloud_dir / "row.json").write_text(json.dumps(row, indent=2) + "\n")
             _append_row(rows_path, row)

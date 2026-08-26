@@ -78,6 +78,8 @@ def test_rate_summary_uses_actual_streams_and_aggregate_mse() -> None:
     assert summary["mean_actual_bpov"] == pytest.approx(0.25)
     assert summary["official_d1_rmse_grid_units"] == pytest.approx(26**0.5)
     assert summary["official_d2_rmse_grid_units"] == pytest.approx(17**0.5)
+    assert summary["model_bytes"] == 1000
+    assert summary["amortized_bpp"]["128"] > summary["mean_actual_bpp"]
 
 
 def test_retrained_model_size_excludes_training_events(tmp_path: Path) -> None:

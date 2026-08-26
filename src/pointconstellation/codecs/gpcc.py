@@ -393,8 +393,16 @@ def run_pc_error(
     work_dir: Path,
     position_bits: int = 12,
     timeout_seconds: float = 120.0,
+    normalization_center: ArrayLike | None = None,
+    normalization_scale: float | None = None,
 ) -> OfficialMetricResult:
-    """Run MPEG ``pc_error`` on the declared integer coordinate grid."""
+    """Run MPEG ``pc_error`` on a declared normalized or original-frame grid.
+
+    When a normalization is supplied, inputs remain in original mesh
+    coordinates and the common integer grid is defined by
+    ``normalized = (original - center) / scale``.  Reconstruction coordinates
+    restored with a rounded serialized transform therefore retain that loss.
+    """
 
     if not executable.is_file() or not os.access(executable, os.X_OK):
         raise FileNotFoundError(
@@ -407,13 +415,27 @@ def run_pc_error(
     normal_array = _points(normals)
     if original_array.shape != normal_array.shape:
         raise ValueError("original points and normals must have matching shapes")
-    if np.any(original_array < -1.0) or np.any(original_array > 1.0):
+    if (normalization_center is None) != (normalization_scale is None):
+        raise ValueError("normalization center and scale must be supplied together")
+    if normalization_center is None:
+        center = np.zeros(3, dtype=np.float64)
+        scale = 1.0
+    else:
+        center = np.asarray(normalization_center, dtype=np.float64)
+        scale = float(normalization_scale)
+        if center.shape != (3,) or not np.isfinite(center).all():
+            raise ValueError("normalization center must contain three finite values")
+        if not np.isfinite(scale) or scale <= 0:
+            raise ValueError("normalization scale must be finite and positive")
+    normalized_original = (original_array - center) / scale
+    if np.any(normalized_original < -1.0) or np.any(normalized_original > 1.0):
         raise ValueError("pc_error original must lie in the declared [-1, 1] domain")
 
     levels = (1 << position_bits) - 1
 
     def quantize(array: NDArray[np.float64]) -> NDArray[np.float64]:
-        return np.rint((array + 1.0) * 0.5 * levels)
+        normalized = (array - center) / scale
+        return np.rint((normalized + 1.0) * 0.5 * levels)
 
     work_dir.mkdir(parents=True, exist_ok=True)
     original_path = work_dir / "original.ply"
