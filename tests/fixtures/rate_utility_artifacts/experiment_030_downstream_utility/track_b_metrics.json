@@ -1,0 +1,8 @@
+{
+  "dataset": "FixtureNet",
+  "config": {
+    "num_points": 2048,
+    "training_objective": "geometry_only",
+    "evaluation_regime": "frozen_probe"
+  }
+}

@@ -136,12 +136,21 @@ its important limitations.
 
 ### Regenerate figures
 
-Rebuild the machine-readable registry, then regenerate Figure 1 and Table 1:
+Rebuild the machine-readable registry, then regenerate the registry-backed
+figures and tables:
 
 ```bash
 .venv-train/bin/python -m pointconstellation.benchmark_registry --rebuild
-.venv-train/bin/python scripts/figures/fig1_selection_baselines.py && .venv-train/bin/python scripts/figures/table1_headline.py
+.venv-train/bin/python scripts/figures/fig1_selection_baselines.py
+.venv-train/bin/python scripts/figures/table1_headline.py
+.venv-train/bin/python scripts/figures/fig_rate_utility.py
+.venv-train/bin/python scripts/figures/fig_objective_pareto.py
+.venv-train/bin/python scripts/figures/table_representation.py
 ```
+
+The Track B outputs use actual serialized bytes, preserve representation,
+objective, and evaluation-regime labels from the source artifacts, and report
+missing utility metrics explicitly rather than filling them from another arm.
 
 The next fixed-rate control sweeps constellation size and precision:
 
