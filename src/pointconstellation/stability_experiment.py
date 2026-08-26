@@ -29,6 +29,7 @@ from pointconstellation.bitstream import (
     HEADER,
     MODE_ENTROPY,
     MODE_FIXED,
+    MODE_LEARNED,
     ConstellationPacket,
     decode_constellation,
     encode_constellation,
@@ -40,6 +41,10 @@ from pointconstellation.data import (
     ProceduralPointCloudDataset,
     file_sha256,
     load_mesh_manifest,
+)
+from pointconstellation.learned_entropy import (
+    LearnedEntropyModel,
+    default_octree_model,
 )
 from pointconstellation.losses import pairwise_squared
 from pointconstellation.models.bottleneck import VariableConstellationDecoder
@@ -805,8 +810,11 @@ def _serialized_coordinates(
 
 
 def _entropy_rate_fields(
-    packet: ConstellationPacket, *, num_points: int
-) -> dict[str, float | int]:
+    packet: ConstellationPacket,
+    *,
+    num_points: int,
+    learned_model: LearnedEntropyModel | None = None,
+) -> dict[str, float | int | str]:
     """Return exact optional-stream rates without changing the declared packet."""
 
     entropy_stream = encode_constellation(
@@ -818,11 +826,29 @@ def _entropy_rate_fields(
     entropy_packet = decode_constellation(entropy_stream)
     if not np.array_equal(packet.coordinates, entropy_packet.coordinates):
         raise RuntimeError("entropy stream changed the fixed-stream lattice")
+    model = learned_model or default_octree_model(packet.bits, len(packet.coordinates))
+    learned_stream = encode_constellation(
+        packet.coordinates,
+        bits=packet.bits,
+        mode=MODE_LEARNED,
+        output_points=packet.output_points,
+        learned_model=model,
+    )
+    learned_packet = decode_constellation(learned_stream, learned_model=model)
+    if not np.array_equal(packet.coordinates, learned_packet.coordinates):
+        raise RuntimeError("learned stream changed the fixed-stream lattice")
     return {
         "entropy_stream_bytes": len(entropy_stream),
         "entropy_bpp": 8.0 * len(entropy_stream) / num_points,
         "entropy_bound_bytes": entropy_bound_bytes(
             packet.coordinates, bits=packet.bits
+        ),
+        "learned_stream_bytes": len(learned_stream),
+        "learned_bpp": 8.0 * len(learned_stream) / num_points,
+        "learned_model_candidate": model.config.candidate,
+        "learned_model_hash": model.model_hash,
+        "learned_shared_model_bytes": (
+            model.parameter_bytes if model.training_streams else 0
         ),
     }
 
@@ -1865,6 +1891,13 @@ def run_stability_experiment(
                 and row["entropy_bpp"]
                 == 8.0 * row["entropy_stream_bytes"] / config.num_points
                 and row["entropy_bound_bytes"] <= row["entropy_stream_bytes"]
+                for row in all_rows
+            ),
+            "all_learned_stream_rates_present": all(
+                row["learned_stream_bytes"] >= HEADER.size + 5
+                and row["learned_bpp"]
+                == 8.0 * row["learned_stream_bytes"] / config.num_points
+                and row["learned_shared_model_bytes"] >= 0
                 for row in all_rows
             ),
             "all_header_payload_splits_exact": all(

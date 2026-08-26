@@ -101,8 +101,75 @@ python scripts/resummarize_entropy_headroom.py \
   --official-rows \
     artifacts/local/experiment_020_official_stability/official_per_cloud.jsonl \
   --split validation \
-  --output /tmp/experiment_019_validation_entropy_headroom.json
+    --output /tmp/experiment_019_validation_entropy_headroom.json
 ```
+
+## Learned mode-2 stream
+
+Mode 2 preserves the mode-0 coordinate contract and 14-byte `PCON` header. It
+codes the same lexicographically sorted lattice with a 32-bit integer arithmetic
+coder and appends a four-byte CRC-32 integrity check. The decoder also
+re-encodes the decoded lattice and requires the canonical bytes, so truncation,
+trailing bytes, a mismatched shared model, and non-canonical arithmetic streams
+are rejected. The CRC and any padding are counted in `learned_stream_bytes`.
+The declared paper stream remains mode 0.
+
+Two shared-model candidates are implemented:
+
+- `octree` traverses the `q`-level lattice octree, codes child-occupancy bits
+  with training-seeded and within-stream adaptive integer contexts, and handles
+  duplicate lattice points through exact child-count allocation;
+- `autoregressive` uses a small fixed-point MLP conditioned on previously coded
+  sorted coordinates. It codes each predicted residual with a stored integer
+  discretized-logistic probability table.
+
+Both candidates are fitted from regenerated `split=train` constellations. Their
+integer arrays are shared decoder state, are excluded from per-cloud bytes, and
+are reported separately as both uncompressed parameter bytes and actual
+serialized model bytes. Candidate selection uses validation bytes. The script
+checks every round trip against mode 0 and pads only when necessary to prevent a
+decodable stream from falling below the existing oracle diagnostic bound.
+
+The complete 18-cell Experiment 019 regeneration exceeded the five-minute local
+CPU smoke budget and was stopped without producing a result. A bounded codec
+and provenance smoke used stabilized decoder seed 7, refiner seed 101, all 512
+training clouds for that cell plus 512 FPS training constellations, and the 128
+matched validation clouds for each method. This is not the complete factorial
+and does not establish G-A2. Over its 256 validation rows, the validation-byte
+selection chose `autoregressive`:
+
+| Candidate | Mean fixed bytes | Mean mode-1 bytes | Mean mode-2 bytes | Fraction of fixed | Serialized shared model |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Octree | 50.000 | 51.996 | 52.344 | 1.047 | 10,434 B |
+| Autoregressive | 50.000 | 51.996 | 52.070 | 1.041 | 13,091 B |
+
+The selected candidate averaged 52.070 bytes for both the 128 FPS and 128
+refiner rows (range 50--55 overall), so this bounded smoke expands rather than
+compresses the fixed stream and fails the 40-byte G-A2 threshold. Its shared
+integer arrays occupy 793,536 uncompressed bytes; the selected model hash is
+`7bcdba756045c199421acdfe454c861a899e47beb30361a4065c8fc2cc1540ed`.
+The 13,091-byte NPZ file SHA-256 is
+`bd01f9575d1b0edb89e22c2827e371c7f5b7a5c0b9fb5399566b0ad8ffd28493`.
+All 256 mode-2 streams were at or above the oracle diagnostic bound.
+
+It used the same official-row and stability-config hashes listed above. Re-run
+that bounded check with:
+
+```bash
+python scripts/resummarize_learned_entropy.py \
+  --config configs/experiment_020_official_stability.json \
+  --official-rows \
+    artifacts/local/experiment_020_official_stability/official_per_cloud.jsonl \
+  --device cpu \
+  --inference-batch-size 32 \
+  --max-refiner-cells 1 \
+  --model-output /tmp/experiment_019_learned_entropy_model_smoke.npz \
+  --output /tmp/experiment_019_validation_learned_entropy_smoke.json
+```
+
+Omit `--max-refiner-cells` for the predeclared complete factorial. The output
+then records `complete_factorial: true`; limited runs explicitly record
+`complete_factorial: false` and their cell count.
 
 ## Reproduction
 

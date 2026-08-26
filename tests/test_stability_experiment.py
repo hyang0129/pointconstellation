@@ -48,6 +48,12 @@ def test_serialized_coordinates_return_header_payload_packets() -> None:
         8.0 * entropy["entropy_stream_bytes"] / config.num_points
     )
     assert entropy["entropy_bound_bytes"] <= entropy["entropy_stream_bytes"]
+    assert entropy["learned_stream_bytes"] >= packets[0].header_bytes + 5
+    assert entropy["learned_bpp"] == (
+        8.0 * entropy["learned_stream_bytes"] / config.num_points
+    )
+    assert entropy["learned_model_candidate"] == "octree"
+    assert entropy["learned_shared_model_bytes"] == 0
 
 
 def test_config_rejects_test_calibration_and_incomplete_rate_curriculum() -> None:
