@@ -1,0 +1,11 @@
+{
+  "final_slice_manifest": "configs/manifests/modelnet40_final_slice.local.json",
+  "official_stability_config": "configs/experiment_020_official_stability.json",
+  "output_root": "artifacts/local/final_slice",
+  "method_sources": {
+    "fps": "src/pointconstellation/official_stability.py",
+    "experiment_019_stabilized_refiner": "artifacts/local/experiment_019_stability_modelnet40",
+    "experiment_021_selection_baselines": "configs/experiment_021_selection_baselines.json",
+    "experiment_022_feature_codec_equal_protocol": "configs/experiment_022_feature_codec_equal_protocol.json"
+  }
+}

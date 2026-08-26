@@ -15,13 +15,18 @@ import numpy as np
 import torch
 
 from pointconstellation.codecs import run_pc_error
-from pointconstellation.data import file_sha256
+from pointconstellation.data import (
+    MeshSurfaceDataset,
+    file_sha256,
+    load_mesh_manifest,
+)
 from pointconstellation.refiner_experiment import _fps, _state_hash
 from pointconstellation.stability_experiment import (
     StabilityExperimentConfig,
     _data_protocol,
     _datasets,
     _decoder,
+    _membership,
     _refiner,
     _serialized_coordinates,
 )
@@ -48,6 +53,10 @@ class OfficialStabilityConfig:
     bootstrap_seed: int = 20_260_817
     confidence_level: float = 0.95
     output_dir: str = "artifacts/local/experiment_020_official_stability"
+    experiment_name: str = "020_official_stability"
+    evaluation_manifest: str | None = None
+    expected_evaluation_manifest_sha256: str | None = None
+    evaluation_split_map: dict[str, str] | None = None
 
     def __post_init__(self) -> None:
         if not 2 <= self.position_bits <= 24:
@@ -72,6 +81,28 @@ class OfficialStabilityConfig:
             raise ValueError("bootstrap_samples must be at least 100")
         if not 0.5 < self.confidence_level < 1.0:
             raise ValueError("confidence_level must be between 0.5 and 1")
+        if not self.experiment_name:
+            raise ValueError("experiment_name must be nonempty")
+        if self.evaluation_manifest is None:
+            if self.expected_evaluation_manifest_sha256 is not None:
+                raise ValueError("expected evaluation hash requires a manifest")
+            if self.evaluation_split_map is not None:
+                raise ValueError("evaluation split map requires a manifest")
+        else:
+            split_map = self.evaluation_split_map or {
+                "validation": "validation",
+                "ood": "category_ood",
+            }
+            if set(split_map) != set(self.splits):
+                raise ValueError("evaluation split map must match configured splits")
+            if len(set(split_map.values())) != len(split_map):
+                raise ValueError("evaluation manifest splits must be unique")
+        expected_hash = self.expected_evaluation_manifest_sha256
+        if expected_hash is not None and (
+            len(expected_hash) != 64
+            or any(character not in "0123456789abcdef" for character in expected_hash)
+        ):
+            raise ValueError("expected evaluation manifest SHA-256 is invalid")
 
     @classmethod
     def from_json(cls, path: Path) -> OfficialStabilityConfig:
@@ -84,6 +115,130 @@ class OfficialStabilityConfig:
 
 def _json_ready(value: Any) -> Any:
     return json.loads(json.dumps(value))
+
+
+def _evaluation_datasets(
+    stability: StabilityExperimentConfig,
+    official: OfficialStabilityConfig,
+    training_datasets: dict[str, Any],
+    training_protocol: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if official.evaluation_manifest is None:
+        return training_datasets, training_protocol
+    if stability.dataset_kind != "mesh_manifest" or stability.dataset_root is None:
+        raise ValueError("evaluation manifest override requires a mesh dataset")
+
+    manifest_path = Path(official.evaluation_manifest)
+    manifest = load_mesh_manifest(manifest_path)
+    manifest_sha256 = file_sha256(manifest_path)
+    if (
+        official.expected_evaluation_manifest_sha256 is not None
+        and manifest_sha256 != official.expected_evaluation_manifest_sha256
+    ):
+        raise ValueError("evaluation manifest hash differs from expected SHA-256")
+    split_map = official.evaluation_split_map or {
+        "validation": "validation",
+        "ood": "category_ood",
+    }
+    datasets = {
+        split: MeshSurfaceDataset(
+            Path(stability.dataset_root),
+            manifest_path,
+            split=manifest_split,
+            num_points=stability.num_points,
+            seed=stability.data_seed,
+            verify_hashes=stability.verify_mesh_hashes,
+            training_target="source",
+        )
+        for split, manifest_split in split_map.items()
+    }
+    records_by_split = {
+        split: manifest["splits"][manifest_split]
+        for split, manifest_split in split_map.items()
+    }
+    if any(
+        record.get("official_split") != "test"
+        for records in records_by_split.values()
+        for record in records
+    ):
+        raise ValueError("final evaluation records must be official test data")
+    categories = manifest.get("categories")
+    if not isinstance(categories, dict):
+        raise ValueError("final evaluation manifest must declare categories")
+    trained_categories = {
+        record.split(":", 1)[0]
+        for record in training_protocol["partitions"]["train"]["records"]
+    }
+    heldout_categories = {
+        record.split(":", 1)[0]
+        for record in training_protocol["partitions"]["ood"]["records"]
+    }
+    if set(categories.get("train", ())) != trained_categories:
+        raise ValueError("final manifest training categories changed")
+    if set(categories.get("heldout", ())) != heldout_categories:
+        raise ValueError("final manifest held-out categories changed")
+    if "validation" in records_by_split and {
+        record["category"] for record in records_by_split["validation"]
+    } != set(categories.get("train", ())):
+        raise ValueError("final validation does not cover the training categories")
+    if "ood" in records_by_split and {
+        record["category"] for record in records_by_split["ood"]
+    } != set(categories.get("heldout", ())):
+        raise ValueError("final OOD does not cover the held-out categories")
+
+    evaluated_meshes = {
+        record["mesh"] for records in records_by_split.values() for record in records
+    }
+    excluded_meshes = manifest.get("excluded_meshes")
+    if not isinstance(excluded_meshes, list) or not excluded_meshes:
+        raise ValueError("final evaluation manifest must record excluded meshes")
+    excluded_paths = {record.get("mesh") for record in excluded_meshes}
+    if evaluated_meshes & excluded_paths:
+        raise ValueError("final evaluation includes a previously excluded mesh")
+    input_manifests = manifest.get("input_manifests")
+    if not isinstance(input_manifests, list) or not input_manifests:
+        raise ValueError("final evaluation manifest must record input manifests")
+    prior_test_meshes = set()
+    for identity in input_manifests:
+        if not isinstance(identity, dict) or set(identity) != {"path", "sha256"}:
+            raise ValueError("final evaluation input-manifest identity is invalid")
+        input_path = Path(identity["path"])
+        if file_sha256(input_path) != identity["sha256"]:
+            raise ValueError(f"final-slice input manifest hash differs: {input_path}")
+        input_manifest = load_mesh_manifest(input_path)
+        prior_test_meshes.update(
+            record["mesh"]
+            for records in input_manifest["splits"].values()
+            for record in records
+            if record.get("official_split") == "test"
+        )
+    if excluded_paths != prior_test_meshes:
+        raise ValueError("excluded meshes differ from recorded input manifests")
+    partitions = {name: _membership(dataset) for name, dataset in datasets.items()}
+    record_sets = {
+        name: set(partition["records"]) for name, partition in partitions.items()
+    }
+    disjoint = {
+        f"{left}_vs_{right}": not bool(record_sets[left] & record_sets[right])
+        for index, left in enumerate(partitions)
+        for right in tuple(partitions)[index + 1 :]
+    }
+    return datasets, {
+        "dataset_kind": "mesh_manifest",
+        "dataset": manifest["dataset"],
+        "data_seed": stability.data_seed,
+        "manifest_sha256": manifest_sha256,
+        "manifest_splits": split_map,
+        "partitions": partitions,
+        "all_partitions_pairwise_disjoint": all(disjoint.values()),
+        "pairwise_disjoint": disjoint,
+        "verify_mesh_hashes": stability.verify_mesh_hashes,
+        "official_split_checks": {
+            "evaluation_records_are_official_test": True,
+            "evaluation_records_exclude_prior_manifests": True,
+            "input_manifest_hashes_match": True,
+        },
+    }
 
 
 def _contains_forbidden_key(value: Any) -> bool:
@@ -471,12 +626,18 @@ def run_official_stability(
         raise RuntimeError("Experiment 019 artifact config differs from checked config")
     if not all(stability_metrics["contract_checks"].values()):
         raise RuntimeError("Experiment 019 artifact has a failed scientific contract")
-    datasets = _datasets(stability)
-    data_protocol = _data_protocol(stability, datasets)
-    if data_protocol != stability_metrics["data_protocol"]:
+    training_datasets = _datasets(stability)
+    training_protocol = _data_protocol(stability, training_datasets)
+    if training_protocol != stability_metrics["data_protocol"]:
         raise RuntimeError(
             "Experiment 019 data identity changed before official metric"
         )
+    datasets, data_protocol = _evaluation_datasets(
+        stability,
+        config,
+        training_datasets,
+        training_protocol,
+    )
 
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -484,13 +645,15 @@ def run_official_stability(
     scratch_root.mkdir(exist_ok=True)
     manifest_path = output_dir / "run_manifest.json"
     run_manifest = {
-        "experiment": "020_official_stability",
+        "experiment": config.experiment_name,
         "config": _json_ready(asdict(config)),
         "stability_config_sha256": file_sha256(stability_path),
         "stability_metrics_sha256": file_sha256(stability_metrics_path),
         "pc_error_sha256": file_sha256(executable),
         "data_protocol": data_protocol,
     }
+    if config.evaluation_manifest is not None:
+        run_manifest["experiment_019_data_protocol"] = training_protocol
     if manifest_path.exists():
         if json.loads(manifest_path.read_text()) != run_manifest:
             raise RuntimeError("existing Experiment 020 run manifest does not match")
@@ -624,7 +787,7 @@ def run_official_stability(
 
     summary = summarize_official_rows(rows, config)
     result = {
-        "experiment": "020_official_stability",
+        "experiment": config.experiment_name,
         "config": _json_ready(asdict(config)),
         "device": str(device),
         "resumed_rows": resumed_rows,

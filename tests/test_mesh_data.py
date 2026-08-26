@@ -8,6 +8,7 @@ import pytest
 
 from pointconstellation.data.mesh import (
     MeshSurfaceDataset,
+    file_sha256,
     load_mesh,
     load_mesh_manifest,
     load_obj,
@@ -15,6 +16,7 @@ from pointconstellation.data.mesh import (
     normalize_mesh,
 )
 from pointconstellation.mesh_manifest import (
+    build_final_slice_manifest,
     create_modelnet40_manifest,
     create_pilot_manifest,
     discover_modelnet40_meshes,
@@ -219,3 +221,79 @@ def test_modelnet_category_split_is_deterministic_and_disjoint() -> None:
     assert len(heldout) == 3
     assert set(train).isdisjoint(heldout)
     assert set(train) | set(heldout) == set(categories)
+
+
+def test_final_slice_manifest_excludes_prior_meshes_and_stratifies(
+    tmp_path: Path,
+) -> None:
+    categories = ("alpha", "beta", "gamma", "delta")
+    for category in categories:
+        _write_off(
+            tmp_path / "meshes" / category / "train" / f"{category}_train.off",
+            1.0,
+        )
+        for index in range(3):
+            _write_off(
+                tmp_path / "meshes" / category / "test" / f"{category}_{index:04d}.off",
+                float(index + 1),
+            )
+
+    discovered = discover_modelnet40_meshes(tmp_path / "meshes")
+    category_partition = {
+        "train": ["alpha", "beta"],
+        "heldout": ["delta", "gamma"],
+    }
+    input_paths = []
+    for manifest_index, selected_categories in enumerate(
+        (("alpha", "gamma"), ("beta", "delta"))
+    ):
+        records = [discovered["test"][category][0] for category in selected_categories]
+        path = tmp_path / f"input_{manifest_index}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "dataset": "ModelNet40",
+                    "categories": category_partition,
+                    "splits": {"used": records},
+                }
+            )
+        )
+        input_paths.append(path)
+
+    manifest = build_final_slice_manifest(
+        tmp_path / "meshes",
+        input_manifests=input_paths,
+        validation_cap_per_category=1,
+        minimum_ood_clouds=4,
+        seed=43,
+    )
+
+    excluded = {
+        (record["category"], record["model_id"])
+        for record in manifest["excluded_meshes"]
+    }
+    selected = {
+        (record["category"], record["model_id"])
+        for records in manifest["splits"].values()
+        for record in records
+    }
+    assert excluded == {
+        ("alpha", "alpha_0000"),
+        ("beta", "beta_0000"),
+        ("gamma", "gamma_0000"),
+        ("delta", "delta_0000"),
+    }
+    assert excluded.isdisjoint(selected)
+    assert [
+        record["category"] for record in manifest["splits"]["final_validation"]
+    ] == ["alpha", "beta"]
+    assert {
+        category: sum(
+            record["category"] == category for record in manifest["splits"]["final_ood"]
+        )
+        for category in ("delta", "gamma")
+    } == {"delta": 2, "gamma": 2}
+    assert manifest["input_manifests"] == [
+        {"path": path.as_posix(), "sha256": file_sha256(path)} for path in input_paths
+    ]
