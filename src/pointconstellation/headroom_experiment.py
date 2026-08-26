@@ -1042,8 +1042,12 @@ def run_headroom_experiment(
     timing_devices = {name: select_device(name) for name in config.timing_devices}
     stability_path = Path(config.stability_config)
     stability = StabilityExperimentConfig.from_json(stability_path)
-    if tuple(config.decoder_seeds) != tuple(stability.decoder_seeds):
-        raise ValueError("headroom decoder seeds must match Experiment 019 exactly")
+    if not config.decoder_seeds or any(
+        seed not in stability.decoder_seeds for seed in config.decoder_seeds
+    ):
+        raise ValueError(
+            "headroom decoder seeds must be a subset of the Experiment 019 seeds"
+        )
     if tuple(config.refiner_seeds) != tuple(stability.refiner_seeds):
         raise ValueError("headroom refiner seeds must match Experiment 019 exactly")
     if config.position_bits != stability.coordinate_bits:
