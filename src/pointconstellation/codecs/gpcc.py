@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import struct
 import subprocess
 import time
 from dataclasses import dataclass
@@ -22,6 +23,10 @@ RESERVED_OPTIONS = (
     "--disableAttributeCoding",
     "--mergeDuplicatedPoints",
 )
+TLV_HEADER = struct.Struct(">BI")
+SPS_PAYLOAD_TYPE = 0
+GPS_PAYLOAD_TYPE = 1
+GEOMETRY_BRICK_PAYLOAD_TYPE = 2
 
 
 @dataclass(frozen=True)
@@ -39,6 +44,101 @@ class Tmc3RatePoint:
                 raise ValueError(
                     f"rate point cannot override managed option: {argument}"
                 )
+
+
+@dataclass(frozen=True)
+class GpccStreamBreakdown:
+    """Byte-exact outer components of a geometry-only TMC13 stream."""
+
+    sps_bytes: int
+    gps_bytes: int
+    slice_header_bytes: int
+    payload_bytes: int
+    total_bytes: int
+
+    def __post_init__(self) -> None:
+        components = (
+            self.sps_bytes,
+            self.gps_bytes,
+            self.slice_header_bytes,
+            self.payload_bytes,
+        )
+        if any(value < 0 for value in components):
+            raise ValueError("G-PCC stream byte counts cannot be negative")
+        if sum(components) != self.total_bytes:
+            raise ValueError("G-PCC stream components do not sum to total_bytes")
+
+    @property
+    def header_bytes(self) -> int:
+        """Return all bytes outside the geometry-brick values."""
+
+        return self.sps_bytes + self.gps_bytes + self.slice_header_bytes
+
+
+def parse_gpcc_stream(
+    stream: bytes | bytearray | memoryview | Path,
+) -> GpccStreamBreakdown:
+    """Parse the high-level TMC13 v23 TLV framing without estimating syntax."""
+
+    data = stream.read_bytes() if isinstance(stream, Path) else bytes(stream)
+    if not data:
+        raise ValueError("TMC13 stream is empty")
+    offset = 0
+    sps_bytes = 0
+    gps_bytes = 0
+    slice_header_bytes = 0
+    payload_bytes = 0
+    payload_counts = {
+        SPS_PAYLOAD_TYPE: 0,
+        GPS_PAYLOAD_TYPE: 0,
+        GEOMETRY_BRICK_PAYLOAD_TYPE: 0,
+    }
+    while offset < len(data):
+        if len(data) - offset < TLV_HEADER.size:
+            raise ValueError(f"truncated TMC13 TLV header at byte {offset}")
+        payload_type, value_bytes = TLV_HEADER.unpack_from(data, offset)
+        value_start = offset + TLV_HEADER.size
+        value_end = value_start + value_bytes
+        if value_end > len(data):
+            raise ValueError(
+                f"truncated TMC13 TLV value at byte {offset}: "
+                f"declares {value_bytes} bytes"
+            )
+        unit_bytes = TLV_HEADER.size + value_bytes
+        if payload_type == SPS_PAYLOAD_TYPE:
+            sps_bytes += unit_bytes
+        elif payload_type == GPS_PAYLOAD_TYPE:
+            gps_bytes += unit_bytes
+        elif payload_type == GEOMETRY_BRICK_PAYLOAD_TYPE:
+            slice_header_bytes += TLV_HEADER.size
+            payload_bytes += value_bytes
+        else:
+            raise ValueError(
+                "unsupported payload type in geometry-only TMC13 stream at "
+                f"byte {offset}: {payload_type}"
+            )
+        payload_counts[payload_type] += 1
+        offset = value_end
+    missing = [
+        name
+        for payload_type, name in (
+            (SPS_PAYLOAD_TYPE, "SPS"),
+            (GPS_PAYLOAD_TYPE, "GPS"),
+            (GEOMETRY_BRICK_PAYLOAD_TYPE, "geometry brick"),
+        )
+        if not payload_counts[payload_type]
+    ]
+    if missing:
+        raise ValueError(
+            f"TMC13 stream is missing required units: {', '.join(missing)}"
+        )
+    return GpccStreamBreakdown(
+        sps_bytes=sps_bytes,
+        gps_bytes=gps_bytes,
+        slice_header_bytes=slice_header_bytes,
+        payload_bytes=payload_bytes,
+        total_bytes=len(data),
+    )
 
 
 @dataclass(frozen=True)

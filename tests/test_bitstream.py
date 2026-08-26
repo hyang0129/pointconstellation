@@ -7,6 +7,7 @@ from pointconstellation.bitstream import (
     HEADER,
     decode_constellation,
     encode_constellation,
+    expected_payload_bytes,
     expected_stream_bytes,
 )
 
@@ -29,6 +30,9 @@ def test_fixed_width_stream_round_trips_lattice(bits: int) -> None:
     assert packet.bits == bits
     assert packet.output_points == 32
     assert packet.payload_bits == 9 * bits
+    assert packet.header_bytes == HEADER.size
+    assert packet.payload_bytes == expected_payload_bytes(3, bits)
+    assert packet.header_bytes + packet.payload_bytes == packet.stream_bytes
     assert len(stream) == expected_stream_bytes(3, bits)
     assert sorted(map(tuple, actual.tolist())) == sorted(map(tuple, expected.tolist()))
 
