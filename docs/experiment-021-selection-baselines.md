@@ -1,6 +1,6 @@
 # Experiment 021: non-learned selection baselines at identical bytes
 
-Status: complete; the predeclared gate fails. implemented; full ModelNet40 evaluation pending.
+Status: complete; the predeclared gate fails.
 
 ## Question and hypothesis
 
