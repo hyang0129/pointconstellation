@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 from pathlib import Path
 
 import numpy as np
@@ -11,9 +12,21 @@ from pointconstellation.data import file_sha256
 from pointconstellation.retrained_codec_benchmark import (
     RetrainedCodecBenchmarkConfig,
     _checked_array,
+    _gzip_stream_breakdown,
     _rmse_or_none,
     _valid_only_rmse,
 )
+
+
+def test_external_gzip_header_and_payload_sum_to_stream_size(tmp_path: Path) -> None:
+    path = tmp_path / "stream.bin"
+    path.write_bytes(gzip.compress(b"learned geometry payload", mtime=0))
+
+    breakdown = _gzip_stream_breakdown(path)
+
+    assert breakdown.header_bytes + breakdown.payload_bytes == path.stat().st_size
+    assert breakdown.header_bytes == 18
+    assert breakdown.payload_bytes > 0
 
 
 def test_retrained_rate_config_requires_sealed_evaluation_manifest() -> None:

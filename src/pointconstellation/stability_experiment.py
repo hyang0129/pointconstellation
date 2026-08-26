@@ -26,6 +26,7 @@ from torch import Tensor, nn
 from torch.utils.data import DataLoader, Dataset, Subset
 
 from pointconstellation.bitstream import (
+    ConstellationPacket,
     decode_constellation,
     encode_constellation,
     expected_stream_bytes,
@@ -762,9 +763,9 @@ def _serialized_coordinates(
     *,
     config: StabilityExperimentConfig,
     mode: str,
-) -> tuple[Tensor, list[int], bool, bool]:
+) -> tuple[Tensor, list[ConstellationPacket], bool, bool]:
     decoded = []
-    byte_counts = []
+    packets = []
     exact = True
     lattice_exact = True
     for row in coordinates.detach().cpu().numpy():
@@ -791,10 +792,10 @@ def _serialized_coordinates(
             == stream
         )
         decoded.append(torch.from_numpy(packet.coordinates).float())
-        byte_counts.append(packet.stream_bytes)
+        packets.append(packet)
     return (
         torch.stack(decoded).to(coordinates.device),
-        byte_counts,
+        packets,
         exact,
         lattice_exact,
     )
@@ -864,7 +865,7 @@ def _evaluate_pair(
 
             for method, (coordinates, source_only_probe) in methods.items():
                 mode = "fps" if method == "fps" else "free"
-                decoded, stream_bytes, exact, lattice_exact = _serialized_coordinates(
+                decoded, packets, exact, lattice_exact = _serialized_coordinates(
                     coordinates, config=config, mode=mode
                 )
                 with torch.no_grad():
@@ -883,6 +884,7 @@ def _evaluate_pair(
                     )
                 for index in range(len(decoded)):
                     metadata = _batch_metadata(batch, index)
+                    packet = packets[index]
                     rows.append(
                         {
                             "arm": arm,
@@ -896,9 +898,14 @@ def _evaluate_pair(
                             "method": method,
                             "constellation_size": config.constellation_size,
                             "coordinate_bits": config.coordinate_bits,
-                            "stream_bytes": stream_bytes[index],
+                            "header_bytes": packet.header_bytes,
+                            "payload_bytes": packet.payload_bytes,
+                            "payload_bpp": 8.0
+                            * packet.payload_bytes
+                            / config.num_points,
+                            "stream_bytes": packet.stream_bytes,
                             "actual_stream_bpp": 8.0
-                            * stream_bytes[index]
+                            * packet.stream_bytes
                             / config.num_points,
                             "chamfer_mse": float(source_losses[index].item()),
                             "fresh_chamfer_mse": float(fresh_losses[index].item()),
@@ -1823,6 +1830,10 @@ def run_stability_experiment(
                 == expected_stream_bytes(
                     config.constellation_size, config.coordinate_bits
                 )
+                for row in all_rows
+            ),
+            "all_header_payload_splits_exact": all(
+                row["header_bytes"] + row["payload_bytes"] == row["stream_bytes"]
                 for row in all_rows
             ),
         },

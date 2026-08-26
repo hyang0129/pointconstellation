@@ -1,9 +1,21 @@
-"""Auditable subprocess adapter for MPEG G-PCC TMC13 geometry streams."""
+"""Auditable subprocess adapter for MPEG G-PCC TMC13 geometry streams.
+
+TMC13 v23 frames each high-level syntax unit as a type-length-value record:
+one unsigned type byte, a four-byte big-endian unsigned value length, and
+exactly that many value bytes. Geometry-only streams produced by this module
+contain type 0 (sequence parameter set), type 1 (geometry parameter set), and
+type 2 (geometry brick). Rate accounting assigns each parameter set's five
+framing bytes to that parameter set, the geometry brick's five framing bytes
+to ``slice_header_bytes``, and the geometry brick value to ``payload_bytes``.
+The latter is the complete TMC13 positions payload and therefore retains any
+syntax carried inside the geometry brick value.
+"""
 
 from __future__ import annotations
 
 import os
 import re
+import struct
 import subprocess
 import time
 from dataclasses import dataclass
@@ -22,6 +34,10 @@ RESERVED_OPTIONS = (
     "--disableAttributeCoding",
     "--mergeDuplicatedPoints",
 )
+TLV_HEADER = struct.Struct(">BI")
+SPS_PAYLOAD_TYPE = 0
+GPS_PAYLOAD_TYPE = 1
+GEOMETRY_BRICK_PAYLOAD_TYPE = 2
 
 
 @dataclass(frozen=True)
@@ -42,15 +58,129 @@ class Tmc3RatePoint:
 
 
 @dataclass(frozen=True)
+class GpccStreamBreakdown:
+    """Byte-exact components of a geometry-only TMC13 stream."""
+
+    sps_bytes: int
+    gps_bytes: int
+    slice_header_bytes: int
+    payload_bytes: int
+    total_bytes: int
+
+    def __post_init__(self) -> None:
+        components = (
+            self.sps_bytes,
+            self.gps_bytes,
+            self.slice_header_bytes,
+            self.payload_bytes,
+        )
+        if any(value < 0 for value in components):
+            raise ValueError("G-PCC stream byte counts cannot be negative")
+        if sum(components) != self.total_bytes:
+            raise ValueError("G-PCC stream components do not sum to total_bytes")
+
+    @property
+    def header_bytes(self) -> int:
+        """Return all bytes outside geometry-brick values."""
+
+        return self.sps_bytes + self.gps_bytes + self.slice_header_bytes
+
+    def amortized_stream_bytes(self, parameter_set_period: int) -> float:
+        """Account for SPS/GPS once per sequence; this is not a decodable stream."""
+
+        if (
+            not isinstance(parameter_set_period, int)
+            or isinstance(parameter_set_period, bool)
+            or parameter_set_period < 1
+        ):
+            raise ValueError("parameter_set_period must be a positive integer")
+        parameter_sets = self.sps_bytes + self.gps_bytes
+        return self.total_bytes - parameter_sets + parameter_sets / parameter_set_period
+
+
+@dataclass(frozen=True)
 class GpccResult:
     reconstruction: NDArray[np.float32]
     stream_bytes: int
+    stream_breakdown: GpccStreamBreakdown
     encode_seconds: float
     decode_seconds: float
     encoder_command: tuple[str, ...]
     decoder_command: tuple[str, ...]
     encoder_stdout: str
     decoder_stdout: str
+
+    def __post_init__(self) -> None:
+        if self.stream_bytes != self.stream_breakdown.total_bytes:
+            raise ValueError("G-PCC result size differs from its stream breakdown")
+
+
+def parse_gpcc_stream(
+    stream: bytes | bytearray | memoryview | Path,
+) -> GpccStreamBreakdown:
+    """Parse a geometry-only TMC13 v23 TLV stream without estimating syntax."""
+
+    data = stream.read_bytes() if isinstance(stream, Path) else bytes(stream)
+    if not data:
+        raise ValueError("TMC13 stream is empty")
+    offset = 0
+    sps_bytes = 0
+    gps_bytes = 0
+    slice_header_bytes = 0
+    payload_bytes = 0
+    payload_counts = {
+        SPS_PAYLOAD_TYPE: 0,
+        GPS_PAYLOAD_TYPE: 0,
+        GEOMETRY_BRICK_PAYLOAD_TYPE: 0,
+    }
+    while offset < len(data):
+        if len(data) - offset < TLV_HEADER.size:
+            raise ValueError(f"truncated TMC13 TLV header at byte {offset}")
+        payload_type, value_bytes = TLV_HEADER.unpack_from(data, offset)
+        value_start = offset + TLV_HEADER.size
+        value_end = value_start + value_bytes
+        if value_end > len(data):
+            raise ValueError(
+                f"truncated TMC13 TLV value at byte {offset}: "
+                f"declares {value_bytes} bytes"
+            )
+        unit_bytes = TLV_HEADER.size + value_bytes
+        if payload_type == SPS_PAYLOAD_TYPE:
+            sps_bytes += unit_bytes
+        elif payload_type == GPS_PAYLOAD_TYPE:
+            gps_bytes += unit_bytes
+        elif payload_type == GEOMETRY_BRICK_PAYLOAD_TYPE:
+            slice_header_bytes += TLV_HEADER.size
+            payload_bytes += value_bytes
+        else:
+            raise ValueError(
+                "unsupported payload type in geometry-only TMC13 stream at "
+                f"byte {offset}: {payload_type}"
+            )
+        payload_counts[payload_type] += 1
+        offset = value_end
+    if offset != len(data):
+        raise ValueError("TMC13 TLV records do not consume the complete stream")
+    missing = [
+        name
+        for payload_type, name in (
+            (SPS_PAYLOAD_TYPE, "SPS"),
+            (GPS_PAYLOAD_TYPE, "GPS"),
+            (GEOMETRY_BRICK_PAYLOAD_TYPE, "geometry brick"),
+        )
+        if not payload_counts[payload_type]
+    ]
+    if missing:
+        raise ValueError(
+            f"TMC13 stream is missing required units: {', '.join(missing)}"
+        )
+    return GpccStreamBreakdown(
+        sps_bytes=sps_bytes,
+        gps_bytes=gps_bytes,
+        slice_header_bytes=slice_header_bytes,
+        payload_bytes=payload_bytes,
+        total_bytes=len(data),
+    )
 
 
 @dataclass(frozen=True)
@@ -225,6 +355,9 @@ def run_tmc3(
     )
     if not stream_path.is_file() or not stream_path.stat().st_size:
         raise RuntimeError("TMC13 produced no compressed stream")
+    stream_breakdown = parse_gpcc_stream(stream_path)
+    if stream_breakdown.total_bytes != stream_path.stat().st_size:
+        raise RuntimeError("parsed TMC13 byte total differs from stream file size")
 
     decoder_command = (
         executable_string,
@@ -240,7 +373,8 @@ def run_tmc3(
     reconstruction = (decoded_integer * (2.0 / levels) - 1.0).astype(np.float32)
     return GpccResult(
         reconstruction=reconstruction,
-        stream_bytes=stream_path.stat().st_size,
+        stream_bytes=stream_breakdown.total_bytes,
+        stream_breakdown=stream_breakdown,
         encode_seconds=encode_seconds,
         decode_seconds=decode_seconds,
         encoder_command=encoder_command,
