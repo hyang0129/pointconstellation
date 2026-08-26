@@ -36,6 +36,9 @@ dev = [
   "pytest>=8",
   "ruff>=0.6",
 ]
+figures = [
+  "matplotlib>=3.8",
+]
 train = [
   "torch>=2.2",
 ]

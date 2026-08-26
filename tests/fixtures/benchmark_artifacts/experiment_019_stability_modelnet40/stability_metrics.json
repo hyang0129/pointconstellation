@@ -1,0 +1,9 @@
+{
+  "config": {
+    "num_points": 2048
+  },
+  "data_protocol": {
+    "dataset": "FixtureNet"
+  },
+  "per_cloud": []
+}
