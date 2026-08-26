@@ -134,6 +134,15 @@ in the first local run and was lower for all seven procedural families. See the
 [matched FPS report](docs/experiment-001-fps-comparison.md) for the result and
 its important limitations.
 
+### Regenerate figures
+
+Rebuild the machine-readable registry, then regenerate Figure 1 and Table 1:
+
+```bash
+.venv-train/bin/python -m pointconstellation.benchmark_registry --rebuild
+.venv-train/bin/python scripts/figures/fig1_selection_baselines.py && .venv-train/bin/python scripts/figures/table1_headline.py
+```
+
 The next fixed-rate control sweeps constellation size and precision:
 
 ```bash

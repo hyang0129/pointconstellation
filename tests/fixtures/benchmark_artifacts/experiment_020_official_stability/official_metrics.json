@@ -1,0 +1,9 @@
+{
+  "experiment": "020_official_stability",
+  "dataset": "FixtureNet",
+  "config": {
+    "position_bits": 12
+  },
+  "expected_stream_bytes": 50,
+  "per_cloud_rows": 8
+}
