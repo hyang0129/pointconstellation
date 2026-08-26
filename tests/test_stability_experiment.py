@@ -28,6 +28,21 @@ def test_config_rejects_test_calibration_and_incomplete_rate_curriculum() -> Non
         StabilityExperimentConfig(bootstrap_samples=99)
 
 
+def test_external_stability_configs_keep_six_decoder_protocol() -> None:
+    thingi10k = StabilityExperimentConfig.from_json(
+        Path("configs/experiment_028_thingi10k_stability.json")
+    )
+    scanobjectnn = StabilityExperimentConfig.from_json(
+        Path("configs/experiment_029_scanobjectnn_stability.json")
+    )
+
+    assert thingi10k.dataset_kind == "mesh_manifest"
+    assert scanobjectnn.dataset_kind == "pointcloud_manifest"
+    assert len(thingi10k.decoder_seeds) == len(scanobjectnn.decoder_seeds) == 6
+    assert thingi10k.mesh_ood_split == scanobjectnn.mesh_ood_split == "ood"
+    assert thingi10k.ood_samples == scanobjectnn.ood_samples == 200
+
+
 def test_procedural_partitions_are_disjoint_and_deterministic() -> None:
     config = StabilityExperimentConfig(
         num_points=16,
@@ -51,6 +66,68 @@ def test_procedural_partitions_are_disjoint_and_deterministic() -> None:
     assert first["all_partitions_pairwise_disjoint"]
     assert first["partitions"]["train"]["count"] == 4
     assert first["partitions"]["calibration"]["count"] == 2
+
+
+def test_pointcloud_manifest_protocol_checks_roles_without_loading_labels(
+    tmp_path: Path,
+) -> None:
+    def record(index: int, *, category: str, official_split: str) -> dict[str, object]:
+        return {
+            "category": category,
+            "category_label": 0 if category == "id" else 1,
+            "model_id": f"{official_split}:{index}",
+            "pointcloud": f"{official_split}.npz",
+            "pointcloud_sha256": "0" * 64,
+            "record_index": index,
+            "official_split": official_split,
+            "normals_estimated": True,
+        }
+
+    manifest = {
+        "version": 1,
+        "dataset": "ScanObjectNN",
+        "sampling": {"normals_estimated": True},
+        "splits": {
+            "train": [
+                record(0, category="id", official_split="train"),
+                record(1, category="id", official_split="train"),
+            ],
+            "calibration": [record(2, category="id", official_split="train")],
+            "validation": [record(0, category="id", official_split="test")],
+            "ood": [
+                record(1, category="heldout", official_split="test"),
+                record(2, category="heldout", official_split="test"),
+            ],
+        },
+    }
+    manifest_path = tmp_path / "pointcloud.json"
+    manifest_path.write_text(json.dumps(manifest))
+    config = StabilityExperimentConfig(
+        dataset_kind="pointcloud_manifest",
+        dataset_root=str(tmp_path),
+        dataset_manifest=str(manifest_path),
+        calibration_split="calibration",
+        mesh_ood_split="ood",
+        num_points=16,
+        constellation_size=2,
+        training_constellation_sizes=(2, 4),
+        train_samples=2,
+        calibration_samples=1,
+        validation_samples=1,
+        ood_samples=2,
+        batch_size=1,
+        decoder_seeds=(1, 2),
+        refiner_seeds=(3, 4),
+        baseline_decoder_epochs=1,
+        stabilized_decoder_epochs=2,
+    )
+
+    protocol = _data_protocol(config, _datasets(config))
+
+    assert protocol["dataset_kind"] == "pointcloud_manifest"
+    assert protocol["all_partitions_pairwise_disjoint"]
+    assert protocol["normals_estimated"] is True
+    assert protocol["official_split_checks"]["applicable"] is True
 
 
 def test_two_way_components_identify_decoder_dominance() -> None:

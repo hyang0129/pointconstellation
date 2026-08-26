@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import struct
 from pathlib import Path
 
 import numpy as np
@@ -8,15 +9,19 @@ import pytest
 
 from pointconstellation.data.mesh import (
     MeshSurfaceDataset,
+    TriangleMesh,
+    filter_degenerate_faces,
     load_mesh,
     load_mesh_manifest,
     load_obj,
     load_off,
+    load_stl,
     normalize_mesh,
 )
 from pointconstellation.mesh_manifest import (
     create_modelnet40_manifest,
     create_pilot_manifest,
+    create_thingi10k_manifest,
     discover_modelnet40_meshes,
     split_modelnet40_categories,
 )
@@ -81,6 +86,50 @@ def test_off_loader_rejects_out_of_range_indices(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="out of range"):
         load_off(path)
+
+
+def test_ascii_and_binary_stl_loading_filters_degenerate_faces(
+    tmp_path: Path,
+) -> None:
+    ascii_mesh = load_stl(FIXTURE_ROOT / "ascii_with_degenerate.stl")
+    binary_path = tmp_path / "triangle.stl"
+    binary_path.write_bytes(
+        b"binary fixture".ljust(80, b"\0")
+        + struct.pack("<I", 1)
+        + struct.pack(
+            "<12fH",
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0,
+        )
+    )
+    binary_mesh = load_mesh(binary_path)
+
+    assert ascii_mesh.faces.shape == (1, 3)
+    assert binary_mesh.faces.shape == (1, 3)
+    assert np.array_equal(ascii_mesh.vertices[:3], binary_mesh.vertices)
+
+
+def test_degenerate_face_filter_preserves_valid_face_indices() -> None:
+    mesh = TriangleMesh(
+        np.asarray([[0, 0, 0], [1, 0, 0], [0, 1, 0], [2, 0, 0]], dtype=np.float32),
+        np.asarray([[0, 1, 2], [0, 1, 3]], dtype=np.int64),
+    )
+
+    filtered = filter_degenerate_faces(mesh)
+
+    assert filtered.faces.tolist() == [[0, 1, 2]]
+    assert np.array_equal(filtered.vertices, mesh.vertices)
 
 
 def test_training_target_defaults_to_encoder_visible_source() -> None:
@@ -219,3 +268,70 @@ def test_modelnet_category_split_is_deterministic_and_disjoint() -> None:
     assert len(heldout) == 3
     assert set(train).isdisjoint(heldout)
     assert set(train) | set(heldout) == set(categories)
+
+
+def _write_ascii_stl(path: Path, triangles: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    facets = []
+    for index in range(triangles):
+        offset = 2 * index
+        facets.append(
+            "facet normal 0 0 1\n"
+            "outer loop\n"
+            f"vertex {offset} 0 0\n"
+            f"vertex {offset + 1} 0 0\n"
+            f"vertex {offset} 1 0\n"
+            "endloop\n"
+            "endfacet\n"
+        )
+    path.write_text("solid test\n" + "".join(facets) + "endsolid test\n")
+
+
+def test_thingi10k_manifest_is_stratified_licensed_and_disjoint(
+    tmp_path: Path,
+) -> None:
+    metadata = []
+    categories = ("alpha", "alpha", "beta", "beta", "beta", "omega", "omega")
+    for index, category in enumerate(categories):
+        file_id = str(10_000 + index)
+        _write_ascii_stl(tmp_path / "raw" / f"{file_id}.stl", 1 + index % 2)
+        metadata.append(
+            {
+                "file_id": file_id,
+                "category": category,
+                "license": f"license-{index}",
+                "closed": index % 2 == 0,
+                "num_components": 1,
+                "euler_characteristic": 2 if index % 3 else 0,
+            }
+        )
+    metadata_path = tmp_path / "metadata.json"
+    metadata_path.write_text(json.dumps(metadata))
+    options = {
+        "train_count": 2,
+        "calibration_count": 1,
+        "validation_count": 1,
+        "ood_count": 1,
+        "final_count": 1,
+        "minimum_faces": 1,
+        "heldout_categories": ("omega",),
+        "seed": 47,
+    }
+
+    first = create_thingi10k_manifest(tmp_path / "raw", metadata_path, **options)
+    repeated = create_thingi10k_manifest(tmp_path / "raw", metadata_path, **options)
+    records = [record for split in first["splits"].values() for record in split]
+
+    assert first == repeated
+    assert tuple(first["splits"]) == (
+        "train",
+        "calibration",
+        "validation",
+        "ood",
+        "final",
+    )
+    assert len({record["model_id"] for record in records}) == 6
+    assert all(record["license"].startswith("license-") for record in records)
+    assert all(record["manifest_role"] in first["splits"] for record in records)
+    assert first["splits"]["ood"][0]["category"] == "omega"
+    assert first["selection"]["stratification"] == ["size_proxy", "genus_proxy"]
