@@ -1,0 +1,21 @@
+{
+  "stability_config": "configs/experiment_019_stability_modelnet40.json",
+  "expected_stability_manifest_sha256": "d44014dd2313b8815562cde9df2ba1927e1110fcfbc218428a7db39ef6b829ac",
+  "workspace_root": "artifacts/external/pcgcv2",
+  "upstream_subpath": "upstream",
+  "environment_python_subpath": "env/bin/python",
+  "environment_manifest_subpath": "environment.json",
+  "training_adapter_script": "scripts/external/pcgcv2_train.py",
+  "dataset_root_subpath": "exact-retrain/dataset",
+  "checkpoint_root_subpath": "exact-retrain/checkpoints",
+  "upstream_url": "https://github.com/NJUVISION/PCGCv2.git",
+  "upstream_commit": "88ff2a18b1b3cac89eef66997cc4e8bcf4fb0420",
+  "checkout_diff_sha256": null,
+  "seed": 20260826,
+  "timeout_seconds": 172800.0,
+  "arms": [
+    {"name": "q6_beta4", "position_bits": 6, "alpha": 1.0, "beta": 4.0, "epochs": 50, "batch_size": 8, "learning_rate": 0.0008},
+    {"name": "q7_beta4", "position_bits": 7, "alpha": 1.0, "beta": 4.0, "epochs": 50, "batch_size": 8, "learning_rate": 0.0008},
+    {"name": "q8_beta4", "position_bits": 8, "alpha": 1.0, "beta": 4.0, "epochs": 50, "batch_size": 8, "learning_rate": 0.0008}
+  ]
+}
