@@ -15,10 +15,11 @@ from typing import Any
 import numpy as np
 import torch
 
-from pointconstellation.bitstream import expected_stream_bytes
+from pointconstellation.bitstream import encode_constellation, expected_stream_bytes
 from pointconstellation.codecs import run_pc_error
-from pointconstellation.data import file_sha256
+from pointconstellation.data import MeshSurfaceDataset, TriangleMesh, file_sha256
 from pointconstellation.losses import chamfer_squared_chunked
+from pointconstellation.metrics import point_set_error_metrics
 from pointconstellation.refiner_experiment import _state_hash
 from pointconstellation.selection_baselines import (
     SELECTION_METHODS,
@@ -32,7 +33,9 @@ from pointconstellation.stability_experiment import (
     _decoder,
     _refiner,
     _serialized_coordinates,
+    stability_config_matches_artifact,
 )
+from pointconstellation.surface_metrics import mesh_surface_metrics
 from pointconstellation.train import select_device
 
 METRICS = ("d1_mse", "d2_mse")
@@ -55,6 +58,10 @@ class OfficialStabilityConfig:
     selection_seed: int = 20_260_821
     splits: tuple[str, ...] = SPLITS
     max_clouds_per_split: int | None = None
+    compute_mesh_metrics: bool = False
+    mesh_metric_point_chunk_size: int = 256
+    mesh_metric_triangle_chunk_size: int = 256
+    mesh_normal_neighbors: int = 12
     bootstrap_samples: int = 10_000
     bootstrap_seed: int = 20_260_817
     confidence_level: float = 0.95
@@ -88,6 +95,17 @@ class OfficialStabilityConfig:
             raise ValueError("official stability splits must be validation and/or ood")
         if self.max_clouds_per_split is not None and self.max_clouds_per_split < 2:
             raise ValueError("max_clouds_per_split must be at least two")
+        if (
+            min(
+                self.mesh_metric_point_chunk_size,
+                self.mesh_metric_triangle_chunk_size,
+                self.mesh_normal_neighbors,
+            )
+            < 1
+        ):
+            raise ValueError("mesh metric chunk and neighbor counts must be positive")
+        if self.mesh_normal_neighbors < 3:
+            raise ValueError("mesh_normal_neighbors must be at least three")
         if self.bootstrap_samples < 100:
             raise ValueError("bootstrap_samples must be at least 100")
         if not 0.5 < self.confidence_level < 1.0:
@@ -395,6 +413,33 @@ def summarize_official_rows(
     validation_fps = [
         row for row in validation_refiner if row["baseline_method"] == "fps"
     ]
+    diagnostic_fields = (
+        "p90_euclidean",
+        "p99_euclidean",
+        "hausdorff",
+        "surface_rmse",
+        "normal_consistency",
+    )
+    diagnostic_summary = []
+    for split in config.splits:
+        for method in config.methods:
+            selected = [
+                row for row in rows if row["split"] == split and row["method"] == method
+            ]
+            values = {
+                field: float(np.mean([row[field] for row in selected]))
+                for field in diagnostic_fields
+                if selected and all(field in row for row in selected)
+            }
+            if values:
+                diagnostic_summary.append(
+                    {
+                        "split": split,
+                        "method": method,
+                        "rows": len(selected),
+                        **values,
+                    }
+                )
     return {
         "comparison_definition": (
             "paired hierarchical category/cloud bootstrap with paired decoder and "
@@ -403,6 +448,7 @@ def summarize_official_rows(
             "symmetric MSE"
         ),
         "comparisons": comparisons,
+        "tail_and_surface_summary": diagnostic_summary,
         "official_metric_gate_passes": bool(
             len(validation_fps) == len(METRICS)
             and all(
@@ -527,6 +573,7 @@ def _evaluate_method(
     device: torch.device,
     scratch_root: Path,
     method: str | None = None,
+    mesh: TriangleMesh | None = None,
 ) -> dict[str, Any]:
     source = sample["source_points"].unsqueeze(0).to(device)
     normals = sample["source_normals"].cpu().numpy()
@@ -616,6 +663,30 @@ def _evaluate_method(
         raise RuntimeError("official evaluation message failed exact stream checks")
     if len(stream_bytes) != 1:
         raise RuntimeError("official evaluation expected a single encoded cloud")
+    reconstruction_points = reconstruction[0].detach().cpu().numpy()
+    source_points = source[0].detach().cpu().numpy()
+    tails = point_set_error_metrics(
+        reconstruction_points,
+        source_points,
+        chunk_size=stability.distance_chunk_size,
+    )
+    surface: dict[str, float] = {}
+    if official.compute_mesh_metrics:
+        if mesh is None:
+            raise ValueError("compute_mesh_metrics requires the source triangle mesh")
+        surface = mesh_surface_metrics(
+            reconstruction_points,
+            mesh,
+            point_chunk_size=official.mesh_metric_point_chunk_size,
+            triangle_chunk_size=official.mesh_metric_triangle_chunk_size,
+            normal_neighbors=official.mesh_normal_neighbors,
+        )
+    canonical_stream = encode_constellation(
+        decoded[0].detach().cpu().numpy(),
+        bits=stability.coordinate_bits,
+        mode=bitstream_mode,
+        output_points=stability.num_points,
+    )
     return {
         "split": split,
         "method": method,
@@ -631,6 +702,8 @@ def _evaluate_method(
         "selection_seed": selection_seed,
         "selection_trials": selection_trials,
         "stream_bytes": stream_bytes[0],
+        "stream_hex": canonical_stream.hex(),
+        "stream_sha256": hashlib.sha256(canonical_stream).hexdigest(),
         "actual_stream_bpp": 8.0 * stream_bytes[0] / stability.num_points,
         "serialized_round_trip_exact": exact,
         "coordinates_on_exact_lattice": lattice_exact,
@@ -639,6 +712,10 @@ def _evaluate_method(
         "encode_seconds": encode_seconds,
         "decode_seconds": decode_seconds,
         "official_metric_seconds": metric.elapsed_seconds,
+        "p90_euclidean": tails["p90_euclidean"],
+        "p99_euclidean": tails["p99_euclidean"],
+        "hausdorff": tails["hausdorff"],
+        **surface,
         **metric.metrics,
     }
 
@@ -668,7 +745,7 @@ def run_official_stability(
     artifact_dir = Path(config.stability_artifact_dir)
     stability_metrics_path = artifact_dir / "stability_metrics.json"
     stability_metrics = json.loads(stability_metrics_path.read_text())
-    if stability_metrics["config"] != _json_ready(asdict(stability)):
+    if not stability_config_matches_artifact(stability_metrics["config"], stability):
         raise RuntimeError("Experiment 019 artifact config differs from checked config")
     if not all(stability_metrics["contract_checks"].values()):
         raise RuntimeError("Experiment 019 artifact has a failed scientific contract")
@@ -693,7 +770,18 @@ def run_official_stability(
         "data_protocol": data_protocol,
     }
     if manifest_path.exists():
-        if json.loads(manifest_path.read_text()) != run_manifest:
+        existing_manifest = json.loads(manifest_path.read_text())
+        existing_config = dict(existing_manifest.get("config", {}))
+        expected_config = run_manifest["config"]
+        for field in (
+            "compute_mesh_metrics",
+            "mesh_metric_point_chunk_size",
+            "mesh_metric_triangle_chunk_size",
+            "mesh_normal_neighbors",
+        ):
+            existing_config.setdefault(field, expected_config[field])
+        existing_manifest["config"] = existing_config
+        if existing_manifest != run_manifest:
             raise RuntimeError(f"existing Experiment {experiment[:3]} manifest differs")
     else:
         manifest_path.write_text(json.dumps(run_manifest, indent=2) + "\n")
@@ -757,6 +845,12 @@ def run_official_stability(
                         device=device,
                         scratch_root=scratch_root,
                         method=method,
+                        mesh=(
+                            dataset.mesh(sample_index)
+                            if config.compute_mesh_metrics
+                            and isinstance(dataset, MeshSurfaceDataset)
+                            else None
+                        ),
                     )
                     if row["stream_bytes"] != expected_bytes:
                         raise RuntimeError(
@@ -810,6 +904,12 @@ def run_official_stability(
                         device=device,
                         scratch_root=scratch_root,
                         method="refiner",
+                        mesh=(
+                            dataset.mesh(sample_index)
+                            if config.compute_mesh_metrics
+                            and isinstance(dataset, MeshSurfaceDataset)
+                            else None
+                        ),
                     )
                     if row["stream_bytes"] != expected_bytes:
                         raise RuntimeError(
