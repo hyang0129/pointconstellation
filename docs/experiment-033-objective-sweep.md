@@ -1,6 +1,6 @@
 # Experiment 033: encoder objective sweep
 
-Status: implemented; the fixture smoke passes. The full factorial is blocked on
+Status: `k8_n2048` regime complete; Gate G-B2 fails under its predeclared rules (single regime, classifier below 0.70, D1 regressions above 2%), while the measured trade-offs show the objectives are Pareto-distinct.
 the stabilized decoder cells assigned to Experiment 038.
 
 ## Question and hypothesis
@@ -153,3 +153,54 @@ Run the full factorial after all Experiment 038 stabilized dependencies exist:
 
 Generated classifiers, streams, metric scratch files, and results stay under
 `artifacts/local/` and are not committed.
+
+## Results
+
+Executed on an EmpireAI H200 for the one regime with sealed stabilized decoders (`k8_n2048`, six decoders,
+Adam-STE search, 3840 rows). The other eleven `K x N` regimes require the Experiment 038 decoders,
+which do not exist yet, so the factorial is incomplete by construction. The frozen PointNet feature extractor
+was trained on training-split clouds only and reaches 0.547 top-1 on validation *source* clouds.
+
+**Gate G-B2 fails** under its predeclared rules (it requires at least two regimes spanning two `K` and two `N`,
+a source-cloud classifier accuracy of at least 0.70, and a D1/D2 regression of at most 2%); none of the three
+conditions is met. The measured trade-offs are nonetheless decisive about the hypothesis:
+
+| Candidate vs Chamfer | Accuracy delta (95% CI) | D1 regression | D2 regression | Passes |
+|---|---|---|---|---|
+| `point_to_plane` | +0.020 [0.003, 0.036] | +12.5% [10.8, 14.3] | -1.9% [-3.9, 0.4] | False |
+| `feature_matching` | +0.202 [0.172, 0.232] | +68.2% [63.7, 72.7] | +122.5% [106.2, 138.5] | False |
+| `mixed` | +0.198 [0.169, 0.229] | +58.1% [54.6, 61.6] | +99.8% [86.9, 112.1] | False |
+
+| Split | Objective | D1 RMSE | D2 RMSE | Chamfer RMSE | Recon. classifier acc. | Encode s |
+|---|---|---:|---:|---:|---:|---:|
+| validation | `chamfer` | 239.2 | 128.2 | 0.0950 | 0.066 | 0.247 |
+| validation | `point_to_plane` | 269.0 | 125.7 | 0.1050 | 0.086 | 0.217 |
+| validation | `feature_matching` | 402.3 | 285.2 | 0.1625 | 0.268 | 0.112 |
+| validation | `mixed` | 378.2 | 256.0 | 0.1534 | 0.264 | 0.262 |
+| ood | `chamfer` | 248.2 | 139.2 | 0.1011 | n/a (OOD labels unseen) | 0.250 |
+| ood | `point_to_plane` | 290.6 | 133.1 | 0.1136 | n/a (OOD labels unseen) | 0.220 |
+| ood | `feature_matching` | 430.6 | 328.5 | 0.1739 | n/a (OOD labels unseen) | 0.115 |
+| ood | `mixed` | 396.4 | 285.2 | 0.1623 | n/a (OOD labels unseen) | 0.265 |
+
+### Reading
+
+1. **The objectives are Pareto-distinct, so PSNR and task utility genuinely trade off at this rate.** Optimizing
+   the eight coordinates to match the frozen classifier's features of the reconstruction makes the decoded cloud
+   four times more recognizable (6.6% -> 26.8% top-1; +20 points, CI [17, 23]) while raising D1 by 68% and D2
+   by 122%. The mixed objective sits between the two (26.4%, +58% D1).
+2. **Point-to-plane is the interesting cheap alternative**: +2.0 points accuracy (CI [0.3, 3.6]) and slightly
+   *better* D2 (-1.9%, CI [-3.9, 0.4]) for 12.5% worse D1. With D2 as the primary metric, point-to-plane would be
+   the better encoder objective at no utility cost.
+3. **Reconstructions from eight Chamfer-optimized points are nearly unrecognizable** to a classifier trained on
+   real clouds (6.6% top-1 against 54.7% on the source). This is the decoder-side counterpart of Experiment 030's
+   finding that raw constellations outclass decoded clouds as task inputs: geometric fidelity as measured by
+   Chamfer/D1 and recognizability are different targets, and the shared decoder is trained only for the first.
+4. Encode cost is objective-dependent (feature matching is the cheapest, 0.11 s; Chamfer 0.25 s per cloud on H200
+   at 64 evaluations), which matters for the amortization story of Experiment 022.
+5. To pass G-B2 as written, the missing regimes (Experiment 038 decoders for `K in {4, 16, 32}`,
+   `N in {1024, 4096}`) and a stronger frozen classifier (>= 0.70 source accuracy, i.e. more training meshes
+   or a larger backbone) are required; both are decoder/data investments, not encoder changes.
+
+Artifacts: `artifacts/local/experiment_033_objective_sweep_k8/objective_sweep_metrics.json`,
+`objective_sweep_per_cloud.jsonl`, `pointnet_classifier.pt` (cluster: `~/LLM_research/pointconstellation-tracks-a`).
+
