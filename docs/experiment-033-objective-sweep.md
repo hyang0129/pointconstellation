@@ -1,7 +1,6 @@
 # Experiment 033: encoder objective sweep
 
 Status: `k8_n2048` regime complete; Gate G-B2 fails under its predeclared rules (single regime, classifier below 0.70, D1 regressions above 2%), while the measured trade-offs show the objectives are Pareto-distinct.
-the stabilized decoder cells assigned to Experiment 038.
 
 ## Question and hypothesis
 
