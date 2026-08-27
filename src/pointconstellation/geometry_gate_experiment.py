@@ -162,7 +162,9 @@ def perturb_quantized_coordinates(
         raise ValueError("bins must be smaller than the number of lattice intervals")
     lattice = (values + 1.0) * 0.5 * levels
     rounded = np.rint(lattice)
-    if not np.all(np.abs(lattice - rounded) <= 2e-4):
+    # float32 coordinates carry ~1e-7 relative error, i.e. up to ~3e-4 lattice
+    # units at 12 bits; any offset far below half a bin is an exact lattice point.
+    if not np.all(np.abs(lattice - rounded) <= 1e-2):
         raise ValueError("coordinates must lie on the declared quantization lattice")
     integers = rounded.astype(np.int64)
     rng = np.random.default_rng(seed)
