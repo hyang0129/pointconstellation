@@ -1,6 +1,6 @@
 # Experiment 030: downstream classification at matched bytes
 
-Status: implemented; the full ModelNet40 run is pending.
+Status: complete; Gate G-B1 fails (Adam-64 constellation does not beat the raw FPS subset on task utility; coordinates beat the feature latent on top-1).
 
 ## Question
 
@@ -134,6 +134,66 @@ checked cache identity; a mismatched run manifest is rejected.
 
 ## Results
 
-Pending. Populate this section only from the complete full-configuration
-artifact. The CPU smoke completed locally in under two minutes and its failed
-gate is not a scientific result.
+Executed on an EmpireAI H200 in 425 s without the optional G-PCC control (`--skip-gpcc`).
+Three classifier seeds per representation; small PointNet for point sets, MLP for feature latents; the encoder
+never sees labels.
+
+**Gate G-B1 fails.** The raw Adam-64 constellation does not beat the byte-matched raw FPS subset on either
+seen-category top-1 or category-OOD retrieval (both intervals include zero); it does beat the feature latent on
+top-1 (+13.8 points, CI excludes zero) but not on OOD retrieval.
+
+| Candidate | Baseline | Metric | Difference | 95% CI | Positive |
+|---|---|---|---:|---|---|
+| `adam64_raw_k0008` | `fps_raw_k0008` | validation_top1 | -0.021 | [-0.099, 0.057] | False |
+| `adam64_raw_k0008` | `fps_raw_k0008` | ood_retrieval_map | -0.041 | [-0.143, 0.062] | False |
+| `adam64_raw_k0008` | `feature_latent_k0008` | validation_top1 | +0.138 | [0.036, 0.242] | True |
+| `adam64_raw_k0008` | `feature_latent_k0008` | ood_retrieval_map | +0.015 | [-0.069, 0.097] | False |
+
+### Rate--accuracy curve (validation top-1, retrieval mAP@k)
+
+| Representation | Bytes | Val top-1 (95% CI) | Val mAP@k | OOD mAP@k |
+|---|---:|---|---:|---:|
+| `adam64_decoded_k0004` | 32 | 0.328 [0.255, 0.406] | 0.216 | 0.318 |
+| `adam64_raw_k0004` | 32 | 0.354 [0.279, 0.438] | 0.202 | 0.521 |
+| `feature_latent_k0004` | 32 | 0.237 [0.169, 0.310] | 0.170 | 0.652 |
+| `fps_decoded_k0004` | 32 | 0.201 [0.141, 0.263] | 0.146 | 0.495 |
+| `fps_raw_k0004` | 32 | 0.349 [0.273, 0.430] | 0.203 | 0.570 |
+| `adam64_decoded_k0008` | 50 | 0.281 [0.211, 0.354] | 0.190 | 0.523 |
+| `adam64_raw_k0008` | 50 | 0.388 [0.307, 0.469] | 0.219 | 0.662 |
+| `feature_latent_k0008` | 50 | 0.250 [0.177, 0.328] | 0.178 | 0.648 |
+| `fps_decoded_k0008` | 50 | 0.284 [0.211, 0.362] | 0.148 | 0.451 |
+| `fps_raw_k0008` | 50 | 0.409 [0.331, 0.490] | 0.232 | 0.703 |
+| `refiner_decoded_k0008` | 50 | 0.258 [0.188, 0.331] | 0.143 | 0.390 |
+| `refiner_raw_k0008` | 50 | 0.424 [0.346, 0.505] | 0.205 | 0.635 |
+| `adam64_decoded_k0016` | 86 | 0.349 [0.268, 0.432] | 0.209 | 0.565 |
+| `adam64_raw_k0016` | 86 | 0.443 [0.362, 0.524] | 0.249 | 0.699 |
+| `feature_latent_k0016` | 86 | 0.247 [0.180, 0.320] | 0.181 | 0.648 |
+| `fps_decoded_k0016` | 86 | 0.320 [0.242, 0.401] | 0.212 | 0.562 |
+| `fps_raw_k0016` | 86 | 0.474 [0.385, 0.562] | 0.258 | 0.721 |
+| `adam64_decoded_k0032` | 158 | 0.401 [0.315, 0.492] | 0.240 | 0.568 |
+| `adam64_raw_k0032` | 158 | 0.451 [0.359, 0.539] | 0.266 | 0.663 |
+| `feature_latent_k0032` | 158 | 0.260 [0.188, 0.336] | 0.194 | 0.659 |
+| `fps_decoded_k0032` | 158 | 0.401 [0.318, 0.484] | 0.242 | 0.695 |
+| `fps_raw_k0032` | 158 | 0.477 [0.388, 0.565] | 0.266 | 0.729 |
+| `source_full` | full | 0.474 [0.388, 0.560] | 0.278 | 0.732 |
+
+### Reading
+
+1. **Raw `K x 3` coordinates are a strong task input at tens of bytes.** At 50 bytes the raw FPS subset reaches
+   40.9% top-1 and the raw refiner constellation 42.4%, against 47.4% for the full 2,048-point cloud through the
+   same classifier; the byte-matched feature latent reaches only 25.0%. Coordinates remain the better code for
+   classification as well as for reconstruction (Experiment 023).
+2. **Decoder-aware selection buys reconstruction, not task utility.** Adam-64 and FPS subsets are statistically
+   indistinguishable as classifier inputs at every rate (50 B: 38.8% vs 40.9%; 86 B: 44.3% vs 47.4%), and FPS is
+   marginally better on OOD retrieval. Optimizing the constellation for the frozen decoder moves points to where
+   the decoder needs them, which is not where a classifier needs them.
+3. **Decoded clouds are worse inputs than the raw constellation** (50 B: 28.1% decoded vs 38.8% raw for Adam;
+   28.4% vs 40.9% for FPS). The shared decoder reconstructs geometry that scores well on D1/D2 but discards the
+   detail a classifier uses; the K points themselves carry more discriminative information than their expansion.
+4. The absolute numbers are bounded by the classifier and the 512-mesh training set (full-cloud ceiling 47.4%);
+   the comparisons are paired and the conclusions are about ordering, not absolute ModelNet40 accuracy.
+5. Consequence for Track B: hypothesis H-B1 holds only in its weak form (coordinates > feature latent); the
+   objective-mismatch hypothesis H-B2 (Experiment 033) is now the central question, since a task-aware objective
+   is what could make decoder-aware selection matter for utility.
+
+Numbers: `artifacts/local/experiment_030_downstream/downstream_metrics.json`.
