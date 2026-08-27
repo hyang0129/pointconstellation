@@ -1,6 +1,6 @@
 # Experiment 022: multi-start Adam/STE inference headroom
 
-Status: implemented; the full ModelNet40 run is pending.
+Status: complete; Gate E passes (refiner on the encode-time/D1 Pareto front), but plain Adam-STE with 16 evaluations beats the refiner on D1 and D2.
 
 ## Question and hypothesis
 
@@ -128,3 +128,68 @@ Both commands require the ignored Experiment 019 checkpoints, ModelNet40
 manifest and meshes, and executable MPEG `pc_error` build. Generated streams,
 metric scratch files, and results remain under `artifacts/local/` and are not
 committed.
+
+## Results
+
+Complete six-decoder factorial: decoder seeds 7/17/29/41 on the MacBook (MPS) and 53/67 on homen-linux
+(RTX 5070 Ti, CUDA), merged and aggregated once (18240 rows; timing column: CPU, the one device
+common to both halves; MPS/CUDA encode times are retained per row). Paired hierarchical bootstrap, 10,000 draws.
+
+**Gate E (primary gate) passes**: the aggregate refiner is non-dominated in encode seconds versus official D1
+RMSE among FPS and every Adam start/budget arm — it is the only decoder-aware point below 30 ms per cloud.
+
+### Headroom recovered by the refiner
+
+| Split | Metric | FPS | Refiner | Best Adam (256) | Headroom recovered |
+|---|---|---:|---:|---:|---:|
+| validation | source_chamfer_mse | 0.1314 | 0.1092 | 0.0936 | 58.8% |
+| validation | d1_mse | 316.7 | 264.4 | 235.6 | 64.4% |
+| validation | d2_mse | 260.9 | 170.5 | 126.7 | 67.4% |
+| ood | source_chamfer_mse | 0.148 | 0.1219 | 0.09928 | 53.5% |
+| ood | d1_mse | 359.9 | 292.3 | 243.9 | 58.3% |
+| ood | d2_mse | 315.9 | 209.2 | 136.2 | 59.4% |
+
+### Refiner relative to each Adam arm (negative = refiner worse; 95% CI)
+
+| Adam arm | Val D1 | Val D2 | OOD D1 | OOD D2 |
+|---|---|---|---|---|
+| `adam_ste:fps:budget_16` | -3.84% [-5.66, -2.34] | -25.13% [-33.75, -17.45] | -8.39% [-15.33, -3.54] | -32.29% [-47.31, -17.04] |
+| `adam_ste:fps:budget_64` | -9.34% [-11.88, -7.39] | -30.20% [-39.08, -21.59] | -14.70% [-23.61, -8.16] | -40.59% [-57.94, -20.82] |
+| `adam_ste:fps:budget_256` | -10.46% [-13.08, -8.45] | -31.28% [-40.80, -22.67] | -16.35% [-26.09, -9.13] | -42.51% [-59.77, -21.15] |
+| `adam_multistart:budget_64` | -11.12% [-13.77, -9.07] | -33.74% [-44.30, -24.18] | -18.26% [-28.99, -10.54] | -51.21% [-84.92, -22.60] |
+| `adam_multistart:budget_256` | -12.25% [-14.93, -10.07] | -34.56% [-45.31, -25.04] | -19.85% [-30.99, -11.48] | -53.53% [-87.61, -24.05] |
+
+### Encode-time versus quality (validation, CPU timing)
+
+| Arm (validation) | Encode s/cloud (CPU) | D1 RMSE | Pareto |
+|---|---:|---:|---|
+| `fps` | 0.001 | 316.7 | yes |
+| `refiner` | 0.030 | 264.4 | yes |
+| `adam_ste:random_seed_211:budget_16` | 0.280 | 266.9 |  |
+| `adam_ste:random_seed_101:budget_16` | 0.287 | 268.6 |  |
+| `adam_ste:fps:budget_16` | 0.301 | 254.6 | yes |
+| `adam_ste:kmeans:budget_16` | 0.335 | 255.6 |  |
+| `adam_ste:fps:budget_64` | 1.148 | 241.8 | yes |
+| `adam_multistart:budget_16` | 1.203 | 249.1 |  |
+| `adam_multistart:budget_64` | 4.623 | 237.9 | yes |
+| `adam_multistart:budget_256` | 20.392 | 235.6 | yes |
+
+### Reading
+
+1. **The learned refiner is an amortization, not a quality mechanism.** With 16 decoder evaluations from the FPS
+   start, plain Adam-STE already beats the refiner by 3.8% D1 [2.3, 5.7] and 25% D2 [17, 34] on validation, and
+   by 8.4% / 32% on category OOD; 256-evaluation multi-start Adam beats it by 12% D1 and 35% D2. The refiner
+   recovers 58--67% of the available headroom (D1/D2, validation) and 54--59% on OOD.
+2. **It is on the Pareto front only as the cheap end**: ~30 ms per cloud on CPU versus ~300 ms for Adam-16 and
+   ~1.15 s for Adam-64. Together with Experiment 021 (random best-of-16 through the decoder matches it on D1 and
+   beats it on D2), the honest presentation is a time--quality curve in which the refiner is a 10x-cheaper
+   approximation of decoder-aware search, and the paper's mechanism claim is *decoder-aware selection*.
+3. **Multi-start adds little over a single FPS start** (Adam-256 single-start vs multi-start 256: ~2% D1), and
+   random starts are slightly worse than FPS or k-means starts at equal budget; the search is not start-limited.
+4. **D2 gains are much larger than D1 gains** for every Adam arm (e.g. Adam-64 vs FPS: +24% D1, +50% D2), which
+   is consistent with the frozen decoder rewarding surface-aligned constellations that D1 under-weights.
+
+Artifacts: `artifacts/local/experiment_022_headroom_merged/headroom_metrics.json` and `headroom_per_cloud.jsonl`
+(merged); per-machine raw outputs under `experiment_022_headroom_modelnet40` (MacBook) and
+`experiment_022_headroom_modelnet40_homen` (homen-linux). Comparison roles present: adam_vs_fps, refiner_vs_adam.
+
