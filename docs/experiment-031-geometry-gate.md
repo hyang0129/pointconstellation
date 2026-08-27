@@ -1,8 +1,6 @@
 # Experiment 031: surface-level geometry gate
 
 Status: complete at the configured (light) budget; Gate B fails formally on the validation surface-RMSE interval, while fresh-resample and analytic gains are consistently positive and match target-sample gains.
-the full ModelNet40 resummary have not been executed in this change, so Gate B
-does not yet have an empirical pass/fail result.
 
 ## Question and hypothesis
 
