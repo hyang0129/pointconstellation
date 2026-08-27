@@ -1,7 +1,6 @@
 # Experiment 034: semantic placement analysis
 
 Status: complete for decoder seed 7 / refiner seed 101; Gate H-B4 passes narrowly (Adam-64 free coordinates are more category-consistent than strict subsets; the refiner is not).
-numbers in this document are measured results.
 
 ## Question and hypothesis
 
