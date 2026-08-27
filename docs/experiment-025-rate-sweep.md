@@ -1,6 +1,6 @@
 # Experiment 025: stabilized Adam-STE rate sweep
 
-Status: implemented; the full ModelNet40 curve is pending.
+Status: complete; Gate G-A1 passes (14/14 eligible points non-dominated by G-PCC below 80 bytes).
 
 ## Question and hypothesis
 
@@ -155,3 +155,60 @@ The full run requires the ignored Experiment 019 checkpoints, ModelNet40 data
 and manifest, executable MPEG `pc_error`, and either rate-accounted G-PCC rows
 or the preserved G-PCC streams. Generated results remain under
 `artifacts/local/` and are not committed.
+
+## Results
+
+All 15 `(K, q)` cells completed on EmpireAI H200s (51840 per-cloud rows; six sealed Experiment 019
+decoders, 128 validation + 32 category-OOD clouds, official `pc_error` on the 12-bit grid). Validation, Adam-64
+encoder unless stated (RMSE in grid units):
+
+| K | q | Stream B | Payload B | FPS D1 | Adam-64 D1 | Adam-64 D2 | Multi-start D1 | Non-dominated |
+|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 4 | 8 | 26 | 12 | 341.8 | 255.8 | 136.5 | 250.3 | yes |
+| 4 | 10 | 29 | 15 | 341.8 | 255.9 | 136.3 | 250.3 | yes |
+| 4 | 12 | 32 | 18 | 341.8 | 255.9 | 136.3 | 250.2 | yes |
+| 6 | 8 | 32 | 18 | 320.8 | 247.7 | 133.2 | 243.1 | yes |
+| 6 | 10 | 37 | 23 | 320.8 | 247.5 | 132.9 | 243.0 | yes |
+| 8 | 8 | 38 | 24 | 316.7 | 241.8 | 131.1 | 237.9 | yes |
+| 6 | 12 | 41 | 27 | 320.8 | 247.7 | 133.2 | 243.0 | yes |
+| 8 | 10 | 44 | 30 | 316.8 | 241.8 | 130.9 | 237.9 | yes |
+| 8 | 12 | 50 | 36 | 316.7 | 241.8 | 131.0 | 237.8 | yes |
+| 12 | 8 | 50 | 36 | 306.4 | 233.9 | 127.2 | 230.5 | yes |
+| 12 | 10 | 59 | 45 | 306.4 | 234.0 | 127.2 | 230.6 | yes |
+| 16 | 8 | 62 | 48 | 308.0 | 229.1 | 123.6 | 225.7 | yes |
+| 12 | 12 | 68 | 54 | 306.4 | 234.0 | 127.2 | 230.7 | yes |
+| 16 | 10 | 74 | 60 | 308.1 | 229.1 | 123.7 | 225.7 | yes |
+| 16 | 12 | 86 | 72 | 308.0 | 229.1 | 123.7 | 225.7 | n/a (>=80 B) |
+
+Measured G-PCC (Experiment 017 seed-7 validation, TMC13 v23, byte-exact payload from TLV parsing):
+
+| G-PCC point | Stream B | Payload B | D1 RMSE | D2 RMSE |
+|---|---:|---:|---:|---:|
+| `octree_s1_768` | 55 | 18 | 384.2 | 226.6 |
+| `octree_s1_640` | 61 | 24 | 317.8 | 186.6 |
+| `octree_s1_512` | 70 | 33 | 251.4 | 144.7 |
+| `octree_s1_256` | 114 | 77 | 126.4 | 72.2 |
+
+**Gate G-A1 passes** (`continue_track_a`): 14 of 14 eligible stabilized points
+below 80 bytes are not jointly dominated in payload bytes, D1, and D2 by any measured G-PCC point (required: 4).
+
+### Reading
+
+1. **Below ~65 bytes the constellation dominates G-PCC on both full-stream and payload accounting.** A 26-byte
+   `K=4, q=8` constellation (12 payload bytes) reaches D1 255.8, essentially G-PCC's 70-byte `octree_s1_512`
+   point (251.4, 33 payload bytes); `K=8, q=8` at 38 bytes beats it outright (241.8).
+2. **Precision beyond 8 bits is wasted.** At every `K`, `q=8`, `q=10`, and `q=12` are indistinguishable
+   (differences < 0.2 RMSE), so the declared 12-bit stream can shrink by 24--33% at no cost. At a fixed
+   50-byte budget, `K=12, q=8` (D1 235.6 val / 243.9 OOD) beats `K=8, q=12` (241.8 / 254.8): bytes are
+   better spent on points than on precision.
+3. **Quality saturates with `K`.** D1 improves only from 255.8 (`K=4`) to 229.1 (`K=16`) while bytes rise from
+   26 to 62--86; G-PCC reaches 126.4 at 114 bytes. The crossover is therefore ~70--110 bytes, and the ceiling
+   is set by the frozen decoder, not by the message. Raising the ceiling (decoder capacity, training data,
+   or objective; Track B) is what would extend the winning regime.
+4. Multi-start Adam (4 starts x 64 evaluations) adds only 1.5--2% over single-start Adam-64; the refiner
+   (K=8 only) trails Adam-64 by ~9% D1 and ~24% D2 on validation.
+5. Category-OOD reproduces the ordering at every cell (see `rate_sweep_table.md`).
+
+Artifacts: `artifacts/local/experiment_025_rate_sweep_modelnet40/rate_sweep_{metrics,curve}.json`, `rate_sweep_table.md`,
+per-cell `cells/k_*_q_*/cell_metrics.json` and `rate_sweep_per_cloud.jsonl` (cluster: `~/LLM_research/pointconstellation-tracks-a`).
+
