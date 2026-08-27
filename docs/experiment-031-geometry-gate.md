@@ -1,6 +1,6 @@
 # Experiment 031: surface-level geometry gate
 
-Status: implemented; the CPU smoke is tested. The predeclared multi-seed run and
+Status: complete at the configured (light) budget; Gate B fails formally on the validation surface-RMSE interval, while fresh-resample and analytic gains are consistently positive and match target-sample gains.
 the full ModelNet40 resummary have not been executed in this change, so Gate B
 does not yet have an empirical pass/fail result.
 
@@ -149,3 +149,48 @@ Run a bounded ModelNet40 resummary smoke against existing ignored artifacts:
 The full resummary omits `--max-clouds-per-split`. It requires the ignored
 ModelNet40 manifest and meshes, Experiment 019 checkpoints, and completed or
 partially completed Experiment 021/022 JSONL files at the configured paths.
+
+## Results
+
+Executed on the MacBook (MPS) with the configured budget: model seeds [7, 17, 29], decoder epochs
+2, refiner epochs 2, 2520 per-cloud rows over the
+procedural families, both training protocols (exact-sample and independent-resampling), and 0/1/2-bin lattice
+perturbations. One code fix was required first: the perturbation lattice check used a 2e-4 tolerance that
+float32 coordinates cannot satisfy at 12 bits; it now accepts offsets far below half a bin.
+
+**Gate B fails under its predeclared rule** (every comparison must pass): the refiner beats FPS on fresh
+`X_c` Chamfer on every split and protocol (about +3--4%, all seeds, CIs excluding zero), and on analytic
+reconstruction-to-surface RMSE on parameter OOD, but the surface-RMSE interval on validation includes zero
+(+2.4% [-0.07, 7.43] exact-sample; +2.1% [-0.05, 5.33] independent-resampling).
+
+| Training protocol | Split | Metric | Refiner vs FPS | 95% CI | All seeds better | Passes |
+|---|---|---|---:|---|---|---|
+| exact_sample | validation | `x_c_chamfer_mse` | +3.76% | [1.71, 7.36] | True | True |
+| exact_sample | validation | `surface_mse` | +2.44% | [-0.07, 7.43] | True | False |
+| exact_sample | parameter_ood | `x_c_chamfer_mse` | +3.06% | [1.25, 6.17] | True | True |
+| exact_sample | parameter_ood | `surface_mse` | +2.98% | [0.28, 7.11] | True | True |
+| independent_resampling | validation | `x_c_chamfer_mse` | +3.63% | [1.88, 6.64] | True | True |
+| independent_resampling | validation | `surface_mse` | +2.13% | [-0.05, 5.33] | True | False |
+| independent_resampling | parameter_ood | `x_c_chamfer_mse` | +2.93% | [1.12, 5.52] | True | True |
+| independent_resampling | parameter_ood | `surface_mse` | +2.35% | [0.10, 5.69] | True | True |
+
+### Reading
+
+1. **The effect is geometric, not sample fitting, but small at this budget.** Fresh-sample (`X_c`) and
+   analytic surface gains track the target-sample (`X_b`) gains almost exactly (validation: 0.2753 -> 0.2657
+   `X_b`, 0.2752 -> 0.2648 `X_c`, 0.2831 -> 0.2762 surface RMSE), and training with independent resampling
+   changes nothing. There is no evidence of the encoder exploiting the finite target sample.
+2. **The budget is far below Experiment 013's.** Absolute Chamfer RMSE is 0.26--0.28 here versus 0.145--0.19
+   in Experiment 013, and the refiner gain is 3--4% versus 23%. With two decoder and two refiner epochs the
+   decoder is undertrained, so this run bounds the *kind* of effect (surface-level, resampling-robust) but not
+   its size. A rerun at the Experiment 013 budget is required before Gate B can be called either way.
+3. **One-- and two-bin perturbations are invisible** at 12 bits (identical metrics to three decimals): a bin is
+   2.4e-4 of the unit cube, so the test as configured cannot detect steganographic sensitivity. Perturbations
+   of 8--64 bins, or perturbing at 8-bit precision, are the informative variants.
+4. **Boundary recall drops sharply for the refiner** (0.22 -> 0.09 on validation) while thin-structure recall is
+   unchanged (~0.28): decoder-aware constellations trade boundary coverage for interior fidelity. This is a
+   concrete failure mode for the paper's limitations section and a candidate objective term for Track B.
+
+Artifacts: `artifacts/local/experiment_031_geometry_gate/geometry_gate_metrics.json`, `geometry_per_cloud.jsonl`,
+per-protocol subdirectories `exact_sample/` and `independent_resampling/`.
+
