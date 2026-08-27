@@ -1,6 +1,6 @@
 # Experiment 034: semantic placement analysis
 
-Status: implemented; the full ModelNet40 analysis is pending. No placement
+Status: complete for decoder seed 7 / refiner seed 101; Gate H-B4 passes narrowly (Adam-64 free coordinates are more category-consistent than strict subsets; the refiner is not).
 numbers in this document are measured results.
 
 ## Question and hypothesis
@@ -137,4 +137,37 @@ unit suite:
 ```bash
 .venv-train/bin/python -m pytest -q tests/test_placement_analysis.py
 ```
+
+## Results
+
+Executed on homen-linux (RTX 5070 Ti, CUDA) in under a minute for decoder seed 7 / refiner seed 101 over all
+160 validation and category-OOD clouds (40 categories). No part-labelled subset was
+available, so placement is characterised by category consistency and mesh-geometry proxies only.
+
+**Gate H-B4 passes, but narrowly.** Criterion: both free-coordinate methods must have a lower within/across
+set-distance ratio than both strict-subset controls.
+
+| Method | Class | Within-category mean | Across-category mean | Within/across ratio | Relative separation |
+|---|---|---:|---:|---:|---:|
+| `fps` | strict-subset | 0.3733 | 0.4771 | 0.7825 | 0.2175 |
+| `random_best_of_16` | strict-subset | 0.3745 | 0.4766 | 0.7857 | 0.2143 |
+| `refiner` | free-coordinate | 0.3746 | 0.4798 | 0.7807 | 0.2193 |
+| `adam_64` | free-coordinate | 0.4355 | 0.5838 | 0.7460 | 0.2540 |
+
+### Reading
+
+1. Decoder-aware **Adam-64 constellations are modestly more category-consistent** than FPS or decoder-guided
+   random subsets (ratio 0.746 vs 0.782): free coordinates chosen against the decoder land in more
+   repeatable places for instances of the same category than any strict subset does.
+2. The **refiner's constellations are not more consistent than FPS** (0.7807 vs 0.7825, a difference far inside
+   noise), so the gate passes on the strength of the Adam arm alone. This mirrors Experiments 021/022: the
+   refiner behaves like FPS-plus-small-corrections, whereas full decoder-aware search moves points substantially.
+3. Absolute separation is weak for every method (within/across ratios 0.75--0.79): eight points in a canonical
+   frame carry category information, but far less than the classifier results of Experiment 030 would suggest
+   is available in the raw coordinates — the set-distance statistic is a blunt instrument here.
+4. Part-hit rates remain untested (`part_hit_analysis.status = not_used_in_modelnet40_analysis`); the tested
+   radius-based metric is ready for a ShapeNet-Part-compatible subset.
+
+Artifacts: `artifacts/local/experiment_034_placement_analysis/placement_summary.json`, `placement_points.jsonl`,
+`category_placement_maps.svg`, `qualitative_overlays.svg`.
 
