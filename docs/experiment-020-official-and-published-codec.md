@@ -1,6 +1,6 @@
 # Experiment 020: official metrics and published learned codec
 
-Status: official-metric slice, published-codec pipeline/rate smoke, and the
+Status: complete; the published-codec sub-gate closes negatively — every lambda of the exact-split pcc_geo_cnn_v2 low-rate arm converges to empty reconstructions (see below).
 5,000-step feasibility pilot and staged 20,000-step recovery test are complete;
 the five-lambda 100,000-step sweep and full curves remain open under
 [issue #15](https://github.com/hyang0129/pointconstellation/issues/15).
@@ -256,6 +256,31 @@ diversity is therefore 6.25%, far below the contract's 90% minimum. Despite its
 small serialized size and finite distortion, this is a near-constant-output
 collapse, not a functioning codec, and the rate point is excluded from every
 overlapping-rate comparison. The all-empty `1e-6` point is also invalid.
+
+### Converged five-lambda sweep: every arm collapses
+
+Resuming all five lambdas toward the predeclared 100,000-step budget, the upstream trainer's own early-stopping
+rule (validation-loss plateau, patience of four validation intervals) sealed every arm between 20,500 and
+25,000 steps. Evaluating the sealed checkpoints on the 32 sealed clouds with the diversity contract:
+
+| Lambda | Sealed step | Stream bytes | Valid clouds | Unique streams | Unique reconstructions |
+|---:|---:|---:|---:|---:|---:|
+| 1.00e-05 | 24,500 | 48 on 32/32 | 0/32 | 11 | 1 (empty) |
+| 3.00e-06 | 20,500 | 48 on 32/32 | 0/32 | 10 | 1 (empty) |
+| 1.00e-06 | 24,500 | 48 on 32/32 | 0/32 | 10 | 1 (empty) |
+| 3.00e-07 | 22,000 | 48 on 32/32 | 0/32 | 11 | 1 (empty) |
+| 1.00e-07 | 25,000 | 48 on 32/32 | 0/32 | 9 | 1 (empty) |
+
+Under its own training criterion, the `pcc_geo_cnn_v2` low-rate q6/global arm converges, at every lambda in
+the declared sweep, to a codec that transmits 48 bytes and decodes nothing. The 20,000-step near-constant
+point above was a transient on the way to this collapse. Gate B of issue #15 therefore closes negatively:
+there is no valid overlapping rate point for this codec, and the paper reports it as such rather than as a
+comparison. The constellation curve of Experiment 025 (26--86 bytes, all clouds decoded) is the only learned
+system with valid streams in this regime; the nearest valid external points remain G-PCC's.
+
+Artifacts: `artifacts/local/experiment_020_external_retrain/results-earlystop/lambda_*/metrics.json` (per-cloud
+rows, stream and reconstruction hashes); checkpoints and streams remain on EmpireAI under
+`pcc_geo_cnn_v2/exact-retrain/checkpoints/low_rate_q6_global/` and `exact-evaluation/results-earlystop/`.
 
 Gate B of [issue #15](https://github.com/hyang0129/pointconstellation/issues/15)
 still requires at least three valid overlapping actual-rate points and remains
