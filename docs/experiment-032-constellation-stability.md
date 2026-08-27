@@ -1,6 +1,6 @@
 # Experiment 032: constellation stability
 
-Status: implemented; full ModelNet40 evaluation pending.
+Status: complete; Gate G-B3 fails — constellations are not repeatable point sets (resample repeatability < 3% at 16 bins), while decoded surfaces are stable and cross-decoder degradation stays at 15--27%.
 
 ## Question and hypothesis
 
@@ -156,7 +156,66 @@ does not treat partial files as resumable evidence.
 
 ## Results
 
-Pending. Do not populate this section from the smoke configuration.
+Executed on an EmpireAI H200 (CPU-bound matching; 7.8 h): 23040 comparison rows and
+34560 cross-decoder rows over the six sealed decoders, three refiner seeds, 128 validation and 32
+category-OOD clouds; every message serialized as an actual 50-byte stream. Repeatability is the fraction of
+constellation points re-found within `r` lattice bins (12-bit lattice) in the second encoding.
+
+**Gate G-B3 fails** (thresholds at r=16: repeatability >= 0.5, translation repeatability >=
+0.75, cross-decoder degradation <= 50.0%).
+
+### Repeatability (validation; mean fraction of points re-found, 95% CI)
+
+| Method | Resample r=16 | Resample r=64 | Translation r=16 | Translation r=64 | Rotation r=64 | Rotation+PCA r=64 |
+|---|---|---|---|---|---|---|
+| `fps` | 0.028 [0.011, 0.050] | 0.190 [0.136, 0.251] | 1.000 [1.000, 1.000] | 1.000 [1.000, 1.000] | 1.000 [1.000, 1.000] | 1.000 [1.000, 1.000] |
+| `random_best_of_16` | 0.001 [0.000, 0.002] | 0.015 [0.009, 0.024] | 0.005 [0.003, 0.008] | 0.015 [0.010, 0.023] | 0.016 [0.010, 0.024] | 0.018 [0.011, 0.029] |
+| `refiner` | 0.005 [0.002, 0.009] | 0.096 [0.063, 0.133] | 0.056 [0.040, 0.076] | 0.365 [0.317, 0.412] | 0.026 [0.021, 0.032] | 1.000 [1.000, 1.000] |
+| `adam_64` | 0.008 [0.004, 0.012] | 0.122 [0.089, 0.159] | 0.027 [0.018, 0.036] | 0.212 [0.181, 0.244] | 0.051 [0.039, 0.065] | 1.000 [1.000, 1.000] |
+
+### Decoded-cloud consistency (validation; Chamfer RMSE between the two decodings)
+
+| Method | Decoded consistency, resample | Decoded consistency, translation | Decoded consistency, rotation |
+|---|---:|---:|---:|
+| `fps` | 0.0302 | 0.0266 | 0.0972 |
+| `random_best_of_16` | 0.0498 | 0.0539 | 0.0914 |
+| `refiner` | 0.0387 | 0.0383 | 0.0980 |
+| `adam_64` | 0.0348 | 0.0366 | 0.0963 |
+
+### Cross-decoder transfer (fresh-resample RMSE degradation when decoded by a different decoder seed)
+
+| Method | Val cross-decoder degradation | OOD cross-decoder degradation |
+|---|---|---|
+| `fps` | 2.6% [2.0, 3.2] | 3.6% [1.9, 5.6] |
+| `random_best_of_16` | 16.6% [13.6, 19.7] | 15.2% [11.9, 18.5] |
+| `refiner` | 15.1% [12.5, 17.9] | 15.5% [11.2, 19.6] |
+| `adam_64` | 26.8% [23.2, 30.6] | 26.7% [20.2, 33.1] |
+
+### Reading
+
+1. **Decoder-aware constellations are not repeatable keypoints.** Re-encoding an independent sample of the same
+   mesh re-finds essentially none of the same points within 16 bins for any method (FPS 2.8%, refiner 0.5%,
+   Adam 0.8%), and only 10--19% within 64 bins. Even under a pure translation, which FPS handles exactly (100%),
+   the refiner re-finds only 37% of its points within 64 bins and Adam 21%: the search lands in a different
+   member of a large family of equivalent constellations each time.
+2. **But the decoded surfaces are stable.** The two decodings of independent samples agree to Chamfer RMSE
+   0.035--0.039 for the refiner and Adam (FPS 0.030, random best-of-16 0.050), i.e. within the reconstruction
+   error itself. The constellation is a stable code *for the surface* without being a stable *point set*, which
+   is consistent with Experiment 031 (surface-level gains) and Experiment 034 (only weak category-consistent
+   placement).
+3. **The code is decoder-tuned but not decoder-private.** Decoding a constellation with a different decoder seed
+   degrades fresh-resample RMSE by 15% (refiner) and 27% (Adam-64) against 2.6% for FPS: free coordinates
+   exploit decoder-specific structure but still transfer, so the message is geometry plus a moderate
+   decoder-specific component, not an arbitrary private code.
+4. **Rotation** without canonicalization destroys repeatability for every free-coordinate method (the decoder
+   is not equivariant); PCA pose normalization restores it fully for FPS, the refiner, and Adam, and is therefore
+   part of the deployable protocol. Random best-of-16 is the least stable arm under every condition.
+5. For the paper: the constellation should be described as a compact surface code with many equivalent
+   realizations, not as learned keypoints; H-B3 as stated ("repeatable like keypoints") is rejected, while the
+   weaker property that matters for compression -- decoding stability -- holds.
+
+Artifacts: `artifacts/local/experiment_032_constellation_stability/constellation_stability_metrics.json`; per-pair
+and cross-decoder rows on EmpireAI under `pointconstellation-tracks-b/artifacts/local/experiment_032_constellation_stability/`.
 
 ## Reproduction
 
