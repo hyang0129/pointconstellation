@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import struct
 from pathlib import Path
 
 import numpy as np
@@ -8,6 +9,7 @@ import pytest
 
 from pointconstellation.codecs.gpcc import (
     Tmc3RatePoint,
+    parse_gpcc_stream,
     read_ascii_ply,
     run_pc_error,
     run_tmc3,
@@ -35,6 +37,21 @@ def test_rate_point_rejects_managed_arguments() -> None:
         Tmc3RatePoint("bad", ("--mode=0",))
     with pytest.raises(ValueError, match="option=value"):
         Tmc3RatePoint("bad", ("--codingScale",))
+
+
+def test_tmc3_payload_accounting_parses_complete_tlv_stream() -> None:
+    def unit(kind: int, value: bytes) -> bytes:
+        return struct.pack(">BI", kind, len(value)) + value
+
+    stream = unit(0, b"sps") + unit(1, b"gpsx") + unit(2, b"payload")
+
+    breakdown = parse_gpcc_stream(stream)
+
+    assert breakdown.sps_bytes == 8
+    assert breakdown.gps_bytes == 9
+    assert breakdown.slice_header_bytes == 5
+    assert breakdown.payload_bytes == 7
+    assert breakdown.header_bytes + breakdown.payload_bytes == len(stream)
 
 
 def test_tmc3_adapter_counts_the_real_stream_and_round_trips(tmp_path: Path) -> None:
