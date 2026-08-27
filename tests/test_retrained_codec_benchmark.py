@@ -8,6 +8,9 @@ import pytest
 pytest.importorskip("torch")
 
 from pointconstellation.data import file_sha256
+from pointconstellation.published_codec_benchmark import (
+    _diversity_contract_summary,
+)
 from pointconstellation.retrained_codec_benchmark import (
     RetrainedCodecBenchmarkConfig,
     _checked_array,
@@ -24,6 +27,25 @@ def test_retrained_rate_config_requires_sealed_evaluation_manifest() -> None:
             expected_evaluation_manifest_sha256="short",
             pc_error_executable="pc_error",
             output_dir="output",
+        )
+
+
+def test_retrained_rate_config_validates_diversity_fraction() -> None:
+    values = {
+        "codec_manifest": "codec.json",
+        "evaluation_root": "evaluation",
+        "expected_evaluation_manifest_sha256": "0" * 64,
+        "pc_error_executable": "pc_error",
+        "output_dir": "output",
+    }
+
+    assert (
+        RetrainedCodecBenchmarkConfig(**values).minimum_unique_reconstruction_fraction
+        == 0.9
+    )
+    with pytest.raises(ValueError, match="minimum_unique_reconstruction_fraction"):
+        RetrainedCodecBenchmarkConfig(
+            **values, minimum_unique_reconstruction_fraction=1.1
         )
 
 
@@ -49,3 +71,24 @@ def test_rmse_helpers_handle_fully_valid_and_fully_failed_rows() -> None:
     assert _rmse_or_none([1.0, 9.0]) == pytest.approx(np.sqrt(5.0))
     assert _rmse_or_none([]) is None
     assert _valid_only_rmse([None, None]) is None
+
+
+def test_retrained_diversity_contract_detects_near_constant_output() -> None:
+    rows = [
+        {
+            "stream_sha256": f"{index % 13:064x}",
+            "reconstruction_sha256": f"{int(index == 31):064x}",
+        }
+        for index in range(32)
+    ]
+
+    summary = _diversity_contract_summary(
+        rows, minimum_unique_reconstruction_fraction=0.9
+    )
+
+    assert summary == {
+        "unique_streams": 13,
+        "unique_reconstructions": 2,
+        "constant_output": True,
+        "rate_point_valid": False,
+    }

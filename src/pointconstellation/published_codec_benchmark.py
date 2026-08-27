@@ -108,12 +108,15 @@ class PublishedCodecBenchmarkConfig:
     max_clouds_per_split: int | None = None
     workspace_root: str | None = None
     output_dir: str = "artifacts/local/experiment_020_pcc_geo_cnn_v2"
+    minimum_unique_reconstruction_fraction: float = 0.9
 
     def __post_init__(self) -> None:
         if not self.splits or set(self.splits) - {"validation", "ood"}:
             raise ValueError("splits must contain validation and/or ood")
         if self.max_clouds_per_split is not None and self.max_clouds_per_split < 1:
             raise ValueError("max_clouds_per_split must be positive")
+        if not 0.0 < self.minimum_unique_reconstruction_fraction <= 1.0:
+            raise ValueError("minimum_unique_reconstruction_fraction must be in (0, 1]")
 
     @classmethod
     def from_json(cls, path: Path) -> PublishedCodecBenchmarkConfig:
@@ -172,17 +175,57 @@ def _append_row(path: Path, row: dict[str, Any]) -> None:
         handle.flush()
 
 
-def _rate_summaries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _diversity_contract_summary(
+    rows: list[dict[str, Any]],
+    *,
+    minimum_unique_reconstruction_fraction: float,
+) -> dict[str, Any]:
+    """Summarize whether independently decoded outputs retain cloud diversity.
+
+    ``constant_output`` includes near-constant collapse below the configured
+    reconstruction-diversity threshold, not only a single literal output hash.
+    """
+
+    if not rows:
+        raise ValueError("diversity contract requires at least one row")
+    if not 0.0 < minimum_unique_reconstruction_fraction <= 1.0:
+        raise ValueError("minimum_unique_reconstruction_fraction must be in (0, 1]")
+    unique_streams = len({row["stream_sha256"] for row in rows})
+    unique_reconstructions = len({row["reconstruction_sha256"] for row in rows})
+    unique_reconstruction_fraction = unique_reconstructions / len(rows)
+    constant_output = (
+        unique_reconstruction_fraction < minimum_unique_reconstruction_fraction
+    )
+    return {
+        "unique_streams": unique_streams,
+        "unique_reconstructions": unique_reconstructions,
+        "constant_output": constant_output,
+        "rate_point_valid": not constant_output and unique_streams > 1,
+    }
+
+
+def _rate_summaries(
+    rows: list[dict[str, Any]],
+    *,
+    minimum_unique_reconstruction_fraction: float = 0.9,
+) -> list[dict[str, Any]]:
     groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for row in rows:
         groups.setdefault((row["lambda"], row["split"]), []).append(row)
     summaries = []
     for (rate_lambda, split), group in sorted(groups.items()):
+        diversity = _diversity_contract_summary(
+            group,
+            minimum_unique_reconstruction_fraction=(
+                minimum_unique_reconstruction_fraction
+            ),
+        )
         summaries.append(
             {
                 "lambda": rate_lambda,
                 "split": split,
                 "clouds": len(group),
+                **diversity,
                 "mean_stream_bytes": float(
                     np.mean([row["stream_bytes"] for row in group])
                 ),
@@ -494,7 +537,12 @@ def run_published_codec_benchmark(
         "resumed_rows": resumed_rows,
         "per_cloud_rows": len(rows),
         "model_records": model_records,
-        "rate_summaries": _rate_summaries(rows),
+        "rate_summaries": _rate_summaries(
+            rows,
+            minimum_unique_reconstruction_fraction=(
+                config.minimum_unique_reconstruction_fraction
+            ),
+        ),
         "contract_checks": {
             "actual_streams_nonempty": bool(
                 rows and all(row["stream_bytes"] > 0 for row in rows)
