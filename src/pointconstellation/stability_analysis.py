@@ -1351,7 +1351,7 @@ def main() -> None:
         type=Path,
         default=Path("configs/experiment_032_constellation_stability_smoke.json"),
     )
-    parser.add_argument("--device", choices=("cpu", "mps"))
+    parser.add_argument("--device", choices=("cpu", "mps", "cuda"))
     parser.add_argument("--stability-artifact-dir", type=Path)
     parser.add_argument("--max-clouds-per-split", type=int)
     parser.add_argument("--output-dir", type=Path)
