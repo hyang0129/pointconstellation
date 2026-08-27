@@ -1,8 +1,9 @@
 # Experiment 020: official metrics and published learned codec
 
 Status: complete; the published-codec sub-gate closes negatively — every lambda of the exact-split pcc_geo_cnn_v2 low-rate arm converges to empty reconstructions (see below).
-5,000-step feasibility pilot and staged 20,000-step recovery test are complete;
-the five-lambda 100,000-step sweep and full curves remain open under
+The official-metric slice, the published-codec pipeline/rate smoke, the 5,000-step
+feasibility pilot, the staged 20,000-step recovery test, and the converged
+five-lambda sweep are all complete; see
 [issue #15](https://github.com/hyang0129/pointconstellation/issues/15).
 
 ## Decision summary
