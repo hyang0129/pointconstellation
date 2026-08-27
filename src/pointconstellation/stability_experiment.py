@@ -37,11 +37,13 @@ from pointconstellation.data import (
     load_mesh_manifest,
 )
 from pointconstellation.losses import pairwise_squared
+from pointconstellation.metrics import point_set_error_metrics
 from pointconstellation.models.bottleneck import VariableConstellationDecoder
 from pointconstellation.models.gradient_free import adam_ste_search
 from pointconstellation.models.refiner import CompetitiveConstellationRefiner
 from pointconstellation.quantization import quantize_ste
 from pointconstellation.refiner_experiment import _fps, _state_hash
+from pointconstellation.surface_metrics import mesh_surface_metrics
 from pointconstellation.train import select_device, set_seed
 
 ARMS = ("baseline", "stabilized")
@@ -84,6 +86,10 @@ class StabilityExperimentConfig:
     maximum_update: float = 0.1
     use_decoder_gradient: bool = True
     distance_chunk_size: int = 256
+    compute_mesh_metrics: bool = False
+    mesh_metric_point_chunk_size: int = 256
+    mesh_metric_triangle_chunk_size: int = 256
+    mesh_normal_neighbors: int = 12
     adam_probe_evaluations: int = 16
     adam_probe_learning_rate: float = 0.03
     adam_probe_clouds_per_split: int = 16
@@ -133,9 +139,14 @@ class StabilityExperimentConfig:
             self.stabilized_decoder_epochs,
             self.refiner_epochs,
             self.distance_chunk_size,
+            self.mesh_metric_point_chunk_size,
+            self.mesh_metric_triangle_chunk_size,
+            self.mesh_normal_neighbors,
         )
         if min(counts) < 1:
             raise ValueError("sample, batch, epoch, and chunk counts must be positive")
+        if self.mesh_normal_neighbors < 3:
+            raise ValueError("mesh_normal_neighbors must be at least three")
         if self.stabilized_decoder_epochs <= self.baseline_decoder_epochs:
             raise ValueError("stabilized decoder training must be longer than baseline")
         if len(self.decoder_seeds) < 2 or len(set(self.decoder_seeds)) != len(
@@ -179,6 +190,23 @@ class StabilityExperimentConfig:
 
 
 DatasetMap = dict[str, Dataset[dict[str, Any]]]
+
+
+def stability_config_matches_artifact(
+    artifact_config: Mapping[str, Any], config: StabilityExperimentConfig
+) -> bool:
+    """Compare configs while accepting absent default Experiment 031 fields."""
+
+    actual = dict(artifact_config)
+    expected = json.loads(json.dumps(asdict(config)))
+    for field in (
+        "compute_mesh_metrics",
+        "mesh_metric_point_chunk_size",
+        "mesh_metric_triangle_chunk_size",
+        "mesh_normal_neighbors",
+    ):
+        actual.setdefault(field, expected[field])
+    return actual == expected
 
 
 def _mesh_dataset(config: StabilityExperimentConfig, split: str) -> MeshSurfaceDataset:
@@ -883,6 +911,35 @@ def _evaluate_pair(
                     )
                 for index in range(len(decoded)):
                     metadata = _batch_metadata(batch, index)
+                    reconstruction_points = reconstruction[index].detach().cpu().numpy()
+                    source_points = source[index].detach().cpu().numpy()
+                    fresh_points = fresh[index].detach().cpu().numpy()
+                    source_tail = point_set_error_metrics(
+                        reconstruction_points,
+                        source_points,
+                        chunk_size=config.distance_chunk_size,
+                    )
+                    fresh_tail = point_set_error_metrics(
+                        reconstruction_points,
+                        fresh_points,
+                        chunk_size=config.distance_chunk_size,
+                    )
+                    continuous_surface: dict[str, float] = {}
+                    if config.compute_mesh_metrics:
+                        dataset = datasets[split]
+                        if not isinstance(dataset, MeshSurfaceDataset):
+                            raise ValueError(
+                                "compute_mesh_metrics requires a mesh manifest dataset"
+                            )
+                        continuous_surface = mesh_surface_metrics(
+                            reconstruction_points,
+                            dataset.mesh(metadata["sample_id"]),
+                            point_chunk_size=config.mesh_metric_point_chunk_size,
+                            triangle_chunk_size=(
+                                config.mesh_metric_triangle_chunk_size
+                            ),
+                            normal_neighbors=config.mesh_normal_neighbors,
+                        )
                     rows.append(
                         {
                             "arm": arm,
@@ -902,6 +959,13 @@ def _evaluate_pair(
                             / config.num_points,
                             "chamfer_mse": float(source_losses[index].item()),
                             "fresh_chamfer_mse": float(fresh_losses[index].item()),
+                            "p90_euclidean": source_tail["p90_euclidean"],
+                            "p99_euclidean": source_tail["p99_euclidean"],
+                            "hausdorff": source_tail["hausdorff"],
+                            "fresh_p90_euclidean": fresh_tail["p90_euclidean"],
+                            "fresh_p99_euclidean": fresh_tail["p99_euclidean"],
+                            "fresh_hausdorff": fresh_tail["hausdorff"],
+                            **continuous_surface,
                             "source_only_optimization": source_only_probe,
                             "serialized_round_trip_exact": exact,
                             "coordinates_on_exact_lattice": lattice_exact,
@@ -944,6 +1008,20 @@ def _summaries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "chamfer_rmse": math.sqrt(mse),
                 "fresh_chamfer_mse": fresh_mse,
                 "fresh_chamfer_rmse": math.sqrt(fresh_mse),
+                **{
+                    field: float(np.mean([item[field] for item in group]))
+                    for field in (
+                        "p90_euclidean",
+                        "p99_euclidean",
+                        "hausdorff",
+                        "fresh_p90_euclidean",
+                        "fresh_p99_euclidean",
+                        "fresh_hausdorff",
+                        "surface_rmse",
+                        "normal_consistency",
+                    )
+                    if all(field in item for item in group)
+                },
             }
         )
     fps = {
