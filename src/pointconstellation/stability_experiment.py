@@ -15,7 +15,7 @@ import hashlib
 import json
 import math
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -452,6 +452,41 @@ def _update_ema(ema: dict[str, Tensor], module: nn.Module, decay: float) -> None
                 ema[name].copy_(current)
 
 
+def _ema_calibration_candidate(
+    module: nn.Module,
+    ema: dict[str, Tensor],
+    *,
+    epoch: int,
+    calibration_score: Callable[[nn.Module], float],
+) -> tuple[dict[str, Tensor], dict[str, Any]]:
+    """Score an EMA state without changing the continuing raw training state."""
+
+    raw_state = _clone_state(module)
+    try:
+        module.load_state_dict(ema)
+        score = calibration_score(module)
+        candidate_state = _clone_state(module)
+        candidate_hash = _state_hash(module)
+    finally:
+        module.load_state_dict(raw_state)
+    return candidate_state, {
+        "epoch": epoch,
+        "kind": "ema",
+        "calibration_chamfer_rmse": score,
+        "state_hash": candidate_hash,
+    }
+
+
+def _calibration_candidate_is_better(
+    candidate: Mapping[str, Any], selected: Mapping[str, Any] | None
+) -> bool:
+    """Use the predeclared calibration objective with stable earliest-epoch ties."""
+
+    return selected is None or (
+        candidate["calibration_chamfer_rmse"] < selected["calibration_chamfer_rmse"]
+    )
+
+
 def _calibration_rmse(
     decoder: nn.Module,
     dataset: Dataset[dict[str, Any]],
@@ -549,29 +584,22 @@ def _train_decoders(
             )
             record["baseline_calibration_chamfer_rmse"] = baseline_calibration_rmse
         if epoch > config.baseline_decoder_epochs:
-            raw_state = _clone_state(decoder)
-            decoder.load_state_dict(ema)
-            calibration_rmse = _calibration_rmse(
+            candidate_state, candidate = _ema_calibration_candidate(
                 decoder,
-                datasets["calibration"],
-                config=config,
-                device=device,
+                ema,
+                epoch=epoch,
+                calibration_score=lambda candidate_decoder: _calibration_rmse(
+                    candidate_decoder,
+                    datasets["calibration"],
+                    config=config,
+                    device=device,
+                ),
             )
-            candidate_state = _clone_state(decoder)
-            candidate_hash = _state_hash(decoder)
-            decoder.load_state_dict(raw_state)
-            candidate = {
-                "epoch": epoch,
-                "kind": "ema",
-                "calibration_chamfer_rmse": calibration_rmse,
-                "state_hash": candidate_hash,
-            }
             candidates.append(candidate)
-            record["ema_calibration_chamfer_rmse"] = calibration_rmse
-            if (
-                stabilized_choice is None
-                or calibration_rmse < stabilized_choice["calibration_chamfer_rmse"]
-            ):
+            record["ema_calibration_chamfer_rmse"] = candidate[
+                "calibration_chamfer_rmse"
+            ]
+            if _calibration_candidate_is_better(candidate, stabilized_choice):
                 stabilized_choice = candidate
                 stabilized_state = candidate_state
         history.append(record)

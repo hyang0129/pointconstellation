@@ -13,7 +13,8 @@ from typing import Any
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch import Tensor, nn
+from torch.utils.data import DataLoader, Dataset, Subset
 
 from pointconstellation.bitstream import expected_stream_bytes
 from pointconstellation.codecs import run_pc_error
@@ -27,6 +28,14 @@ from pointconstellation.losses import chamfer_squared_chunked
 from pointconstellation.models.feature_codec import VariableFeatureCodec
 from pointconstellation.refiner_benchmark import paired_hierarchical_bootstrap
 from pointconstellation.refiner_experiment import _state_hash
+from pointconstellation.stability_experiment import (
+    _calibration_candidate_is_better,
+    _clone_state,
+    _ema_calibration_candidate,
+    _independent_feature_bootstrap,
+    _membership,
+    _update_ema,
+)
 from pointconstellation.standardized_benchmark import (
     _average_rows,
     _monotonicity,
@@ -49,11 +58,16 @@ class FeatureCodecBenchmarkConfig:
     data_seed: int = 1517
     num_points: int = 2048
     train_samples: int = 512
+    calibration_split: str | None = None
+    calibration_samples: int = 0
     validation_samples: int = 128
     category_ood_samples: int = 32
+    verify_mesh_hashes: bool = True
     batch_size: int = 4
     epochs: int = 2
     learning_rate: float = 1e-3
+    ema_decay: float | None = None
+    calibration_selection_start_epoch: int = 2
     feature_bits: int = 8
     coordinate_bits: int = 12
     feature_width: int = 64
@@ -64,6 +78,8 @@ class FeatureCodecBenchmarkConfig:
     official_metric_position_bits: int = 12
     official_metric_timeout_seconds: float = 120.0
     reference_multiseed_dir: str | None = None
+    reference_stability_dir: str | None = None
+    expected_manifest_sha256: str | None = None
     bootstrap_samples: int = 10_000
     bootstrap_seed: int = 20_260_814
     confidence_level: float = 0.95
@@ -83,6 +99,8 @@ class FeatureCodecBenchmarkConfig:
             raise ValueError("latent and constellation rate points must align uniquely")
         if self.primary_constellation_size not in self.matched_constellation_sizes:
             raise ValueError("primary constellation size is absent from rate points")
+        if self.calibration_split not in {None, "train", "calibration"}:
+            raise ValueError("calibration_split must be train, calibration, or null")
         if (
             min(
                 self.num_points,
@@ -96,6 +114,20 @@ class FeatureCodecBenchmarkConfig:
             < 1
         ):
             raise ValueError("sample, batch, epoch, and point counts must be positive")
+        if self.calibration_samples < 0:
+            raise ValueError("calibration_samples cannot be negative")
+        if self.ema_decay is None:
+            if self.calibration_split is not None or self.calibration_samples:
+                raise ValueError("calibration selection requires ema_decay")
+        else:
+            if not 0.0 < self.ema_decay < 1.0:
+                raise ValueError("ema_decay must be in (0, 1)")
+            if self.calibration_split is None or self.calibration_samples < 1:
+                raise ValueError("EMA selection requires a nonempty calibration split")
+            if not 1 <= self.calibration_selection_start_epoch <= self.epochs:
+                raise ValueError(
+                    "calibration_selection_start_epoch must be within training"
+                )
         if self.learning_rate <= 0 or self.peak_distance <= 0:
             raise ValueError("learning rate and peak distance must be positive")
         if self.bootstrap_samples < 100:
@@ -127,40 +159,150 @@ class FeatureCodecBenchmarkConfig:
         return cls(**values)
 
 
-def _datasets(config: FeatureCodecBenchmarkConfig) -> dict[str, MeshSurfaceDataset]:
-    datasets = {
-        split: MeshSurfaceDataset(
-            Path(config.dataset_root),
-            Path(config.dataset_manifest),
-            split=split,
-            num_points=config.num_points,
-            seed=config.data_seed,
-            verify_hashes=True,
-            training_target="source",
-        )
-        for split in ("train", "validation", "category_ood")
-    }
-    expected = {
-        "train": config.train_samples,
-        "validation": config.validation_samples,
-        "category_ood": config.category_ood_samples,
-    }
-    for split, count in expected.items():
-        if len(datasets[split]) != count:
+FeatureDatasetMap = dict[str, Dataset[dict[str, Any]]]
+
+
+def _mesh_dataset(
+    config: FeatureCodecBenchmarkConfig, split: str
+) -> MeshSurfaceDataset:
+    return MeshSurfaceDataset(
+        Path(config.dataset_root),
+        Path(config.dataset_manifest),
+        split=split,
+        num_points=config.num_points,
+        seed=config.data_seed,
+        verify_hashes=config.verify_mesh_hashes,
+        training_target="source",
+    )
+
+
+def _datasets(config: FeatureCodecBenchmarkConfig) -> FeatureDatasetMap:
+    train = _mesh_dataset(config, "train")
+    datasets: FeatureDatasetMap
+    if config.calibration_split == "train":
+        expected_train = config.train_samples + config.calibration_samples
+        if len(train) != expected_train:
             raise ValueError(
-                f"manifest split {split} has {len(datasets[split])} records; "
+                f"manifest train has {len(train)} records; expected {expected_train} "
+                "for the declared train/calibration holdout"
+            )
+        datasets = {
+            "train": Subset(train, range(config.train_samples)),
+            "calibration": Subset(train, range(config.train_samples, expected_train)),
+        }
+    else:
+        if len(train) != config.train_samples:
+            raise ValueError(
+                f"manifest train has {len(train)} records; config expects "
+                f"{config.train_samples}"
+            )
+        datasets = {"train": train}
+        if config.calibration_split == "calibration":
+            calibration = _mesh_dataset(config, "calibration")
+            if len(calibration) != config.calibration_samples:
+                raise ValueError(
+                    f"manifest calibration has {len(calibration)} records; config "
+                    f"expects {config.calibration_samples}"
+                )
+            datasets["calibration"] = calibration
+
+    for split, count in (
+        ("validation", config.validation_samples),
+        ("category_ood", config.category_ood_samples),
+    ):
+        dataset = _mesh_dataset(config, split)
+        if len(dataset) != count:
+            raise ValueError(
+                f"manifest split {split} has {len(dataset)} records; "
                 f"config expects {count}"
             )
+        datasets[split] = dataset
     return datasets
+
+
+def _data_protocol(
+    config: FeatureCodecBenchmarkConfig, datasets: FeatureDatasetMap
+) -> dict[str, Any]:
+    partitions = {name: _membership(dataset) for name, dataset in datasets.items()}
+    record_sets = {
+        name: set(partition["records"]) for name, partition in partitions.items()
+    }
+    pairwise_disjoint = {
+        f"{left}_vs_{right}": not bool(record_sets[left] & record_sets[right])
+        for index, left in enumerate(partitions)
+        for right in tuple(partitions)[index + 1 :]
+    }
+    manifest_path = Path(config.dataset_manifest)
+    manifest_sha256 = file_sha256(manifest_path)
+    if (
+        config.expected_manifest_sha256 is not None
+        and manifest_sha256 != config.expected_manifest_sha256
+    ):
+        raise ValueError("dataset manifest hash differs from expected_manifest_sha256")
+    return {
+        "dataset": load_mesh_manifest(manifest_path)["dataset"],
+        "manifest_sha256": manifest_sha256,
+        "data_seed": config.data_seed,
+        "calibration_source": (
+            None
+            if config.calibration_split is None
+            else (
+                "held_out_train_records"
+                if config.calibration_split == "train"
+                else "explicit_calibration_manifest_split"
+            )
+        ),
+        "calibration_forbidden_splits": ["validation", "category_ood"],
+        "partitions": partitions,
+        "pairwise_disjoint": pairwise_disjoint,
+        "all_partitions_pairwise_disjoint": all(pairwise_disjoint.values()),
+    }
 
 
 def _parameter_count(codec: VariableFeatureCodec) -> int:
     return sum(parameter.numel() for parameter in codec.parameters())
 
 
+def _calibration_rmse(
+    codec: nn.Module,
+    dataset: Dataset[dict[str, Any]],
+    *,
+    config: FeatureCodecBenchmarkConfig,
+    device: torch.device,
+) -> float:
+    """Measure source-visible calibration Chamfer at the primary byte rate."""
+
+    latent_dim = dict(
+        zip(config.matched_constellation_sizes, config.latent_dims, strict=True)
+    )[config.primary_constellation_size]
+    codec.eval()
+    total = 0.0
+    count = 0
+    loader = DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=0,
+    )
+    with torch.no_grad():
+        for batch in loader:
+            source = batch["source_points"].to(device)
+            reconstruction, _ = codec(source, latent_dim)
+            loss = chamfer_squared_chunked(
+                reconstruction,
+                source,
+                chunk_size=config.distance_chunk_size,
+            )
+            total += float(loss.item()) * len(source)
+            count += len(source)
+    return math.sqrt(total / count)
+
+
 def _train_seed(
     config: FeatureCodecBenchmarkConfig,
     *,
+    training_dataset: Dataset[dict[str, Any]],
+    calibration_dataset: Dataset[dict[str, Any]] | None,
     model_seed: int,
     device: torch.device,
     output_dir: Path,
@@ -173,24 +315,27 @@ def _train_seed(
         feature_width=config.feature_width,
     ).to(device)
     optimizer = torch.optim.AdamW(codec.parameters(), lr=config.learning_rate)
-    datasets = _datasets(config)
     loader = DataLoader(
-        datasets["train"],
+        training_dataset,
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=0,
         generator=torch.Generator().manual_seed(model_seed),
     )
     started = time.perf_counter()
-    history = []
+    history: list[dict[str, Any]] = []
+    ema = _clone_state(codec) if config.ema_decay is not None else None
+    candidates: list[dict[str, Any]] = []
+    selected_state: dict[str, Tensor] | None = None
+    selected_candidate: dict[str, Any] | None = None
     update_count = 0
-    for epoch in range(config.epochs):
+    for epoch in range(1, config.epochs + 1):
         total = 0.0
         examples = 0
         codec.train()
         for batch_index, batch in enumerate(loader):
             latent_dim = config.latent_dims[
-                (epoch * len(loader) + batch_index) % len(config.latent_dims)
+                ((epoch - 1) * len(loader) + batch_index) % len(config.latent_dims)
             ]
             points = batch["source_points"].to(device)
             optimizer.zero_grad(set_to_none=True)
@@ -202,34 +347,104 @@ def _train_seed(
             )
             loss.backward()
             optimizer.step()
+            if ema is not None:
+                assert config.ema_decay is not None
+                _update_ema(ema, codec, config.ema_decay)
             total += float(loss.item()) * len(points)
             examples += len(points)
             update_count += 1
-        history.append(
-            {
-                "epoch": epoch + 1,
-                "training_chamfer_rmse": math.sqrt(total / examples),
-            }
-        )
+        record: dict[str, Any] = {
+            "epoch": epoch,
+            "training_chamfer_rmse": math.sqrt(total / examples),
+        }
+        if ema is not None and epoch >= config.calibration_selection_start_epoch:
+            if calibration_dataset is None:
+                raise RuntimeError("EMA selection has no calibration dataset")
+            candidate_state, candidate = _ema_calibration_candidate(
+                codec,
+                ema,
+                epoch=epoch,
+                calibration_score=lambda candidate_codec: _calibration_rmse(
+                    candidate_codec,
+                    calibration_dataset,
+                    config=config,
+                    device=device,
+                ),
+            )
+            candidates.append(candidate)
+            record["ema_calibration_chamfer_rmse"] = candidate[
+                "calibration_chamfer_rmse"
+            ]
+            if _calibration_candidate_is_better(candidate, selected_candidate):
+                selected_candidate = candidate
+                selected_state = candidate_state
+        history.append(record)
         print(
             json.dumps(
                 {
                     "stage": "feature_codec",
                     "model_seed": model_seed,
-                    **history[-1],
+                    **record,
                 }
             ),
             flush=True,
         )
+
+    if ema is None:
+        selected_state = _clone_state(codec)
+        selected_candidate = {
+            "epoch": config.epochs,
+            "kind": "raw_final_epoch",
+            "calibration_chamfer_rmse": None,
+            "state_hash": _state_hash(codec),
+        }
+    elif selected_state is None or selected_candidate is None:
+        raise RuntimeError("no EMA calibration candidate was eligible")
+    codec.load_state_dict(selected_state)
+    selected_hash = _state_hash(codec)
+    selection = {**selected_candidate, "selected_state_hash": selected_hash}
     output_dir.mkdir(parents=True, exist_ok=True)
     torch.save(codec.encoder.state_dict(), output_dir / "encoder.pt")
     torch.save(codec.decoder.state_dict(), output_dir / "decoder.pt")
+    selection_record = {
+        "model_seed": model_seed,
+        "selection_metric": (
+            "source-visible aggregate Chamfer RMSE at the primary matched byte rate"
+            if ema is not None
+            else None
+        ),
+        "primary_constellation_size": config.primary_constellation_size,
+        "primary_latent_dim": dict(
+            zip(config.matched_constellation_sizes, config.latent_dims, strict=True)
+        )[config.primary_constellation_size],
+        "expected_stream_bytes": expected_stream_bytes(
+            config.primary_constellation_size, config.coordinate_bits
+        ),
+        "ema_decay": config.ema_decay,
+        "calibration_selection_start_epoch": (
+            config.calibration_selection_start_epoch if ema is not None else None
+        ),
+        "calibration_partition_sha256": (
+            _membership(calibration_dataset)["sha256"]
+            if calibration_dataset is not None
+            else None
+        ),
+        "candidates": candidates,
+        "selection": selection,
+    }
+    (output_dir / "selection.json").write_text(
+        json.dumps(selection_record, indent=2) + "\n"
+    )
     return codec.eval(), {
         "history": history,
         "optimizer_updates": update_count,
         "training_elapsed_seconds": time.perf_counter() - started,
         "parameters": _parameter_count(codec),
-        "state_hash": _state_hash(codec),
+        "state_hash": selected_hash,
+        "ema_decay": config.ema_decay,
+        "calibration_candidates": candidates,
+        "selection": selection,
+        "selection_record": str(output_dir / "selection.json"),
         "encoder_checkpoint_bytes": (output_dir / "encoder.pt").stat().st_size,
         "decoder_checkpoint_bytes": (output_dir / "decoder.pt").stat().st_size,
     }
@@ -238,11 +453,11 @@ def _train_seed(
 def _evaluate_seed(
     config: FeatureCodecBenchmarkConfig,
     *,
+    datasets: FeatureDatasetMap,
     codec: VariableFeatureCodec,
     device: torch.device,
     output_dir: Path,
 ) -> tuple[list[dict[str, Any]], float]:
-    datasets = _datasets(config)
     rows: list[dict[str, Any]] = []
     started = time.perf_counter()
     with torch.no_grad():
@@ -510,6 +725,217 @@ def _reference_comparisons(
     return comparisons
 
 
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in path.read_text().splitlines() if line]
+
+
+def _stability_reference_comparison(
+    config: FeatureCodecBenchmarkConfig,
+    seed_results: list[dict[str, Any]],
+    data_protocol: dict[str, Any],
+) -> dict[str, Any]:
+    """Compare feature seeds with all stabilized Experiment 019 factorial cells."""
+
+    if config.reference_stability_dir is None:
+        return {"status": "not_configured", "representation_gate_passes": None}
+    root = Path(config.reference_stability_dir)
+    metrics_path = root / "stability_metrics.json"
+    rows_path = root / "per_cloud.jsonl"
+    if not metrics_path.is_file() or not rows_path.is_file():
+        return {
+            "status": "configured_reference_missing",
+            "reference_dir": str(root),
+            "representation_gate_passes": None,
+        }
+
+    reference = json.loads(metrics_path.read_text())
+    reference_config = reference["config"]
+    reference_protocol = reference["data_protocol"]
+    protocol_checks = {
+        "data_seed_matches": reference_config["data_seed"] == config.data_seed,
+        "manifest_matches": (
+            reference_protocol["manifest_sha256"] == data_protocol["manifest_sha256"]
+        ),
+        "num_points_matches": reference_config["num_points"] == config.num_points,
+        "training_samples_match": (
+            reference_config["train_samples"] == config.train_samples
+        ),
+        "calibration_samples_match": (
+            reference_config["calibration_samples"] == config.calibration_samples
+        ),
+        "validation_samples_match": (
+            reference_config["validation_samples"] == config.validation_samples
+        ),
+        "ood_samples_match": (
+            reference_config["ood_samples"] == config.category_ood_samples
+        ),
+        "batch_size_matches": reference_config["batch_size"] == config.batch_size,
+        "rate_curriculum_matches": (
+            tuple(reference_config["training_constellation_sizes"])
+            == config.matched_constellation_sizes
+        ),
+        "primary_constellation_size_matches": (
+            reference_config["constellation_size"] == config.primary_constellation_size
+        ),
+        "coordinate_bits_match": (
+            reference_config["coordinate_bits"] == config.coordinate_bits
+        ),
+        "stabilized_epochs_match": (
+            reference_config["stabilized_decoder_epochs"] == config.epochs
+        ),
+        "ema_decay_matches": reference_config["ema_decay"] == config.ema_decay,
+        "selection_start_matches": (
+            reference_config["baseline_decoder_epochs"] + 1
+            == config.calibration_selection_start_epoch
+        ),
+        "train_partition_matches": (
+            reference_protocol["partitions"]["train"]["sha256"]
+            == data_protocol["partitions"]["train"]["sha256"]
+        ),
+        "calibration_partition_matches": (
+            reference_protocol["partitions"]["calibration"]["sha256"]
+            == data_protocol["partitions"]["calibration"]["sha256"]
+        ),
+        "validation_partition_matches": (
+            reference_protocol["partitions"]["validation"]["sha256"]
+            == data_protocol["partitions"]["validation"]["sha256"]
+        ),
+        "ood_partition_matches": (
+            reference_protocol["partitions"]["ood"]["sha256"]
+            == data_protocol["partitions"]["category_ood"]["sha256"]
+        ),
+        "stability_factorial_complete": reference["factorial"]["complete"],
+    }
+    if not all(protocol_checks.values()):
+        failed = sorted(name for name, passes in protocol_checks.items() if not passes)
+        raise ValueError(
+            "stability reference differs from the equal protocol: " + ", ".join(failed)
+        )
+
+    coordinate_rows = _read_jsonl(rows_path)
+    decoder_seeds = tuple(reference_config["decoder_seeds"])
+    refiner_seeds = tuple(reference_config["refiner_seeds"])
+    expected_bytes = expected_stream_bytes(
+        config.primary_constellation_size, config.coordinate_bits
+    )
+    comparisons = []
+    split_names = {"validation": "validation", "ood": "category_ood"}
+    for split_index, (coordinate_split, feature_split) in enumerate(
+        split_names.items()
+    ):
+        selected_coordinates = [
+            row
+            for row in coordinate_rows
+            if row["arm"] == "stabilized"
+            and row["split"] == coordinate_split
+            and row["method"] == "refiner"
+        ]
+        if any(row["stream_bytes"] != expected_bytes for row in selected_coordinates):
+            raise ValueError("stability reference stream size is not rate matched")
+        first_cell = [
+            row
+            for row in selected_coordinates
+            if row["decoder_seed"] == decoder_seeds[0]
+            and row["refiner_seed"] == refiner_seeds[0]
+        ]
+        cloud_keys = [(row["family"], row["model_id"]) for row in first_cell]
+        if not cloud_keys or len(cloud_keys) != len(set(cloud_keys)):
+            raise RuntimeError("stability reference has invalid cloud identities")
+        families = np.asarray([key[0] for key in cloud_keys], dtype=object)
+        coordinate_index = {
+            (
+                row["decoder_seed"],
+                row["refiner_seed"],
+                row["family"],
+                row["model_id"],
+            ): row
+            for row in selected_coordinates
+        }
+        expected_coordinate_rows = (
+            len(decoder_seeds) * len(refiner_seeds) * len(cloud_keys)
+        )
+        if len(coordinate_index) != expected_coordinate_rows:
+            raise RuntimeError("stability reference has incomplete factorial cells")
+
+        feature_indices = []
+        for result in seed_results:
+            selected_features = [
+                row
+                for row in result["per_cloud"]
+                if row["split"] == feature_split
+                and row["method"] == "feature_latent"
+                and row["constellation_size"] == config.primary_constellation_size
+            ]
+            if any(row["stream_bytes"] != expected_bytes for row in selected_features):
+                raise ValueError("feature stream size is not rate matched")
+            indexed = {
+                (row["family"], row["model_id"]): row for row in selected_features
+            }
+            if set(indexed) != set(cloud_keys):
+                raise ValueError("feature and stability cloud identities do not align")
+            feature_indices.append(indexed)
+
+        for metric_index, metric in enumerate(("chamfer_mse", "fresh_chamfer_mse")):
+            coordinate = np.asarray(
+                [
+                    [
+                        [
+                            coordinate_index[(decoder_seed, refiner_seed, *key)][metric]
+                            for key in cloud_keys
+                        ]
+                        for refiner_seed in refiner_seeds
+                    ]
+                    for decoder_seed in decoder_seeds
+                ],
+                dtype=np.float64,
+            )
+            feature = np.asarray(
+                [
+                    [feature_index[key][metric] for key in cloud_keys]
+                    for feature_index in feature_indices
+                ],
+                dtype=np.float64,
+            )
+            comparisons.append(
+                {
+                    "split": coordinate_split,
+                    "metric": metric,
+                    "stream_bytes": expected_bytes,
+                    "constellation_size": config.primary_constellation_size,
+                    **_independent_feature_bootstrap(
+                        coordinate,
+                        feature,
+                        families,
+                        config=config,
+                        seed_offset=1000 * split_index + metric_index,
+                    ),
+                }
+            )
+
+    primary = next(
+        row
+        for row in comparisons
+        if row["split"] == "validation" and row["metric"] == "chamfer_mse"
+    )
+    gate_passes = primary["confidence_interval_lower_percent"] > 0.0
+    return {
+        "status": "complete",
+        "reference_dir": str(root),
+        "feature_seeds": list(config.model_seeds),
+        "coordinate_decoder_seeds": list(decoder_seeds),
+        "coordinate_refiner_seeds": list(refiner_seeds),
+        "protocol_checks": protocol_checks,
+        "resampling": (
+            "independent coordinate-decoder, coordinate-refiner, and feature-seed "
+            "factors with paired hierarchical category/cloud draws"
+        ),
+        "comparisons": comparisons,
+        "primary": primary,
+        "representation_gate_passes": gate_passes,
+        "claim_if_gate_fails": "competitive with a byte-matched feature codec",
+    }
+
+
 def run_feature_codec_benchmark(
     config: FeatureCodecBenchmarkConfig,
     *,
@@ -521,20 +947,23 @@ def run_feature_codec_benchmark(
     device = select_device(device_name)
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    metrics_path = output_dir / "multiseed_metrics.json"
+    multiseed_metrics_path = output_dir / "multiseed_metrics.json"
     previous_elapsed_seconds = None
-    if resume and metrics_path.exists():
-        previous_elapsed_seconds = json.loads(metrics_path.read_text()).get(
+    if resume and multiseed_metrics_path.exists():
+        previous_elapsed_seconds = json.loads(multiseed_metrics_path.read_text()).get(
             "elapsed_seconds"
         )
-    manifest = load_mesh_manifest(Path(config.dataset_manifest))
+    datasets = _datasets(config)
+    data_protocol = _data_protocol(config, datasets)
+    if not data_protocol["all_partitions_pairwise_disjoint"]:
+        raise RuntimeError("training/calibration/evaluation memberships overlap")
     started = time.perf_counter()
     seed_results = []
     for model_seed in config.model_seeds:
         seed_dir = output_dir / f"seed_{model_seed}"
-        metrics_path = seed_dir / "benchmark_metrics.json"
-        if resume and metrics_path.exists():
-            seed_result = json.loads(metrics_path.read_text())
+        seed_metrics_path = seed_dir / "benchmark_metrics.json"
+        if resume and seed_metrics_path.exists():
+            seed_result = json.loads(seed_metrics_path.read_text())
             if (
                 seed_result.get("model_seed") != model_seed
                 or seed_result.get("data_seed") != config.data_seed
@@ -543,12 +972,15 @@ def run_feature_codec_benchmark(
         else:
             codec, model = _train_seed(
                 config,
+                training_dataset=datasets["train"],
+                calibration_dataset=datasets.get("calibration"),
                 model_seed=model_seed,
                 device=device,
                 output_dir=seed_dir / "model",
             )
             rows, evaluation_seconds = _evaluate_seed(
                 config,
+                datasets=datasets,
                 codec=codec,
                 device=device,
                 output_dir=seed_dir,
@@ -562,7 +994,7 @@ def run_feature_codec_benchmark(
                 "per_cloud": rows,
                 "evaluation_elapsed_seconds": evaluation_seconds,
             }
-            metrics_path.write_text(json.dumps(seed_result, indent=2) + "\n")
+            seed_metrics_path.write_text(json.dumps(seed_result, indent=2) + "\n")
             with (seed_dir / "per_cloud.jsonl").open("w") as handle:
                 for row in rows:
                     handle.write(json.dumps(row) + "\n")
@@ -571,6 +1003,9 @@ def run_feature_codec_benchmark(
     if len(set(hashes)) != len(hashes):
         raise RuntimeError("independent feature-codec seeds produced duplicate hashes")
     comparisons = _reference_comparisons(config, seed_results)
+    stability_comparison = _stability_reference_comparison(
+        config, seed_results, data_protocol
+    )
     measured_component_seconds = sum(
         result["model"]["training_elapsed_seconds"]
         + result["evaluation_elapsed_seconds"]
@@ -590,19 +1025,68 @@ def run_feature_codec_benchmark(
         )
         for row in primary
     )
+    if stability_comparison["status"] == "complete":
+        primary_gate = {
+            "constellation_size": config.primary_constellation_size,
+            "stream_bytes": expected_stream_bytes(
+                config.primary_constellation_size, config.coordinate_bits
+            ),
+            "metric": "validation source-cloud Chamfer RMSE",
+            "criterion": (
+                "stabilized constellation relative improvement confidence interval "
+                "excludes zero on the positive side"
+            ),
+            "passes": stability_comparison["representation_gate_passes"],
+            "claim_if_gate_fails": "competitive with a byte-matched feature codec",
+        }
+    else:
+        primary_gate = {
+            "constellation_size": config.primary_constellation_size,
+            "requires_every_seed_positive_and_ci_lower_above_zero": True,
+            "passes": primary_passes,
+            "status": stability_comparison["status"],
+        }
+    rate_points = [
+        {
+            "constellation_size": constellation_size,
+            "coordinate_bits": config.coordinate_bits,
+            "latent_dim": latent_dim,
+            "feature_bits": config.feature_bits,
+            "stream_bytes": expected_stream_bytes(
+                constellation_size, config.coordinate_bits
+            ),
+        }
+        for latent_dim, constellation_size in zip(
+            config.latent_dims, config.matched_constellation_sizes, strict=True
+        )
+    ]
     result = {
+        "experiment": (
+            "023_feature_codec_equal_protocol"
+            if config.ema_decay is not None
+            else "018_feature_codec_multiseed"
+        ),
         "config": asdict(config),
         "protocol": {
-            "name": "pointconstellation-modelnet40-matched-feature-codec-v1",
-            "dataset": manifest["dataset"],
-            "manifest_sha256": file_sha256(Path(config.dataset_manifest)),
+            "name": (
+                "pointconstellation-modelnet40-equal-protocol-feature-codec-v1"
+                if config.ema_decay is not None
+                else "pointconstellation-modelnet40-matched-feature-codec-v1"
+            ),
+            "dataset": data_protocol["dataset"],
+            "manifest_sha256": data_protocol["manifest_sha256"],
             "data_seed": config.data_seed,
             "input_points": config.num_points,
             "rate_definition": "total serialized stream bits / input points",
             "rate_match": "exact bytes including each format's complete header",
+            "rate_points": rate_points,
             "feature_latent_is_not_coordinate_only": True,
             "shared_model_cost_excluded_from_per_cloud_rate": True,
+            "ema_checkpoint_selection_uses_calibration_source_only": (
+                config.ema_decay is not None
+            ),
         },
+        "data_protocol": data_protocol,
         "device": str(device),
         "environment": {
             "python": platform.python_version(),
@@ -612,10 +1096,30 @@ def run_feature_codec_benchmark(
         "per_seed": seed_results,
         "model_independence": {"state_hashes": hashes, "all_unique": True},
         "matched_rate_comparisons": comparisons,
-        "primary_gate": {
-            "constellation_size": config.primary_constellation_size,
-            "requires_every_seed_positive_and_ci_lower_above_zero": True,
-            "passes": primary_passes,
+        "stability_reference": stability_comparison,
+        "primary_gate": primary_gate,
+        "contract_checks": {
+            "all_stream_sizes_match_declared_rates": all(
+                row["stream_bytes"]
+                == expected_stream_bytes(
+                    row["constellation_size"], config.coordinate_bits
+                )
+                for seed_result in seed_results
+                for row in seed_result["per_cloud"]
+            ),
+            "all_selected_state_hashes_match_models": all(
+                seed_result["model"]["selection"]["selected_state_hash"]
+                == seed_result["model"]["state_hash"]
+                for seed_result in seed_results
+            ),
+            "all_ema_paths_selected_by_calibration": (
+                config.ema_decay is None
+                or all(
+                    seed_result["model"]["selection"]["kind"] == "ema"
+                    and seed_result["model"]["calibration_candidates"]
+                    for seed_result in seed_results
+                )
+            ),
         },
         "peak_process_rss_bytes": _peak_rss_bytes(),
         "elapsed_seconds": max(
@@ -625,7 +1129,7 @@ def run_feature_codec_benchmark(
         ),
         "aggregation_elapsed_seconds": time.perf_counter() - started,
     }
-    metrics_path.write_text(json.dumps(result, indent=2) + "\n")
+    multiseed_metrics_path.write_text(json.dumps(result, indent=2) + "\n")
     return result
 
 
