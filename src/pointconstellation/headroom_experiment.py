@@ -38,6 +38,7 @@ from pointconstellation.stability_experiment import (
     _data_protocol,
     _datasets,
     _per_cloud_chamfer,
+    stability_config_matches_artifact,
 )
 from pointconstellation.train import select_device
 
@@ -1059,7 +1060,7 @@ def run_headroom_experiment(
     artifact_dir = Path(config.stability_artifact_dir)
     stability_metrics_path = artifact_dir / "stability_metrics.json"
     stability_metrics = json.loads(stability_metrics_path.read_text())
-    if stability_metrics["config"] != _json_ready(asdict(stability)):
+    if not stability_config_matches_artifact(stability_metrics["config"], stability):
         raise RuntimeError("Experiment 019 artifact config differs from checked config")
     if not all(stability_metrics["contract_checks"].values()):
         raise RuntimeError("Experiment 019 artifact has a failed scientific contract")

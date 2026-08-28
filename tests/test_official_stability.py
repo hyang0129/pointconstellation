@@ -11,6 +11,7 @@ torch = pytest.importorskip("torch")
 
 from pointconstellation.bitstream import expected_stream_bytes
 from pointconstellation.codecs import OfficialMetricResult
+from pointconstellation.data import TriangleMesh
 from pointconstellation.official_stability import (
     OfficialStabilityConfig,
     _bootstrap_comparison,
@@ -246,3 +247,88 @@ def test_two_selection_methods_run_through_official_evaluator(
     }
     assert all(row["stream_bytes"] == expected_stream_bytes(4, 8) for row in rows)
     assert all(row["encode_seconds"] >= 0.0 for row in rows)
+
+
+def test_official_evaluator_exposes_optional_mesh_metrics(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stability = StabilityExperimentConfig(
+        num_points=16,
+        constellation_size=4,
+        training_constellation_sizes=(4, 8),
+        coordinate_bits=8,
+        train_samples=4,
+        calibration_samples=2,
+        validation_samples=2,
+        ood_samples=2,
+        batch_size=2,
+        decoder_seeds=(1, 2),
+        refiner_seeds=(3, 4),
+        baseline_decoder_epochs=1,
+        stabilized_decoder_epochs=2,
+        distance_chunk_size=8,
+    )
+    official = OfficialStabilityConfig(
+        pc_error_executable="unused",
+        position_bits=8,
+        decoder_seeds=(1, 2),
+        refiner_seeds=(3, 4),
+        splits=("validation",),
+        compute_mesh_metrics=True,
+        mesh_metric_point_chunk_size=8,
+        mesh_metric_triangle_chunk_size=1,
+        mesh_normal_neighbors=6,
+        bootstrap_samples=100,
+    )
+    axis = torch.linspace(-0.8, 0.8, 4)
+    x, y = torch.meshgrid(axis, axis, indexing="ij")
+    source = torch.stack((x.ravel(), y.ravel(), torch.zeros(16)), dim=1)
+    sample = {
+        "source_points": source,
+        "source_normals": torch.tensor([[0.0, 0.0, 1.0]]).repeat(16, 1),
+        "family": "plane",
+        "model_id": "plane",
+        "sample_id": 0,
+    }
+    mesh = TriangleMesh(
+        vertices=np.asarray(
+            [
+                [-1.0, -1.0, 0.0],
+                [1.0, -1.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [-1.0, 1.0, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        faces=np.asarray([[0, 1, 2], [0, 2, 3]], dtype=np.int64),
+    )
+
+    monkeypatch.setattr(
+        "pointconstellation.official_stability.run_pc_error",
+        lambda *args, **kwargs: OfficialMetricResult(
+            metrics={"d1_mse": 1.0, "d2_mse": 0.5},
+            elapsed_seconds=0.01,
+            command=("fixture",),
+            stdout="",
+        ),
+    )
+    row = _evaluate_method(
+        stability,
+        official,
+        decoder=_TinyDecoder().eval(),
+        refiner=None,
+        decoder_seed=1,
+        refiner_seed=None,
+        split="validation",
+        sample=sample,
+        device=torch.device("cpu"),
+        scratch_root=tmp_path,
+        method="fps",
+        mesh=mesh,
+    )
+
+    # An even-sized signed fixed-width lattice has no exact zero level.
+    assert row["surface_rmse"] == pytest.approx(1.0 / 255.0, abs=1e-9)
+    assert 0.0 <= row["normal_consistency"] <= 1.0
+    assert row["p90_euclidean"] >= 0.0
+    assert len(bytes.fromhex(row["stream_hex"])) == row["stream_bytes"]

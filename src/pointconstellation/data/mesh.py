@@ -470,6 +470,11 @@ class MeshSurfaceDataset:
             normalization.restore(target),
         )
 
+    def mesh(self, index: int) -> TriangleMesh:
+        """Return the normalized source mesh for an indexed manifest record."""
+
+        return self._load_mesh(self.records[index])
+
     def __getitem__(self, index: int) -> dict[str, object]:
         import torch
 

@@ -84,6 +84,12 @@ remain geometrically meaningful under exact quantization.
 surface metrics. If it exists only for Chamfer against `X_b`, reframe the method
 as learned sample completion/private coding rather than surface compression.
 
+Status: [Experiment 031](experiment-031-geometry-gate.md) implements the
+independent three-role sampler, analytic and feature-recall metrics, exact
+lattice perturbations, and the predeclared paired gate. Its smoke validates the
+execution contract. The full three-seed run remains pending, so Gate B has not
+yet been declared passed or failed.
+
 ## Work package C: external surface pilot
 
 Build a small, reproducible ShapeNetCore pilot from mesh surfaces rather than

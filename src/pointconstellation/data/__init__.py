@@ -29,6 +29,16 @@ from pointconstellation.data.procedural import (
     ProceduralPointCloudDataset,
     generate_sample,
 )
+from pointconstellation.data.procedural_surfaces import (
+    ProceduralSurface,
+    ProceduralSurfaceDataset,
+    ProceduralSurfaceTriplet,
+    SurfacePointSample,
+    analytic_surface_distances,
+    generate_procedural_surface,
+    generate_surface_triplet,
+    sample_procedural_surface,
+)
 
 __all__ = [
     "FAMILIES",
@@ -36,14 +46,21 @@ __all__ = [
     "MeshSurfaceDataset",
     "MeshSurfaceSample",
     "ProceduralPointCloudDataset",
+    "ProceduralSurface",
+    "ProceduralSurfaceDataset",
+    "ProceduralSurfaceTriplet",
     "RawPointCloudDataset",
     "RawPointCloudSample",
+    "SurfacePointSample",
     "TriangleMesh",
     "estimate_pca_knn_normals",
     "file_sha256",
     "filter_degenerate_faces",
+    "analytic_surface_distances",
+    "generate_procedural_surface",
     "load_mesh",
     "generate_sample",
+    "generate_surface_triplet",
     "load_mesh_manifest",
     "load_obj",
     "load_off",
@@ -54,4 +71,5 @@ __all__ = [
     "normalize_mesh",
     "normalize_point_cloud",
     "sample_mesh_surface",
+    "sample_procedural_surface",
 ]
