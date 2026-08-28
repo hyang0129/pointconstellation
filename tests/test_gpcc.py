@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import struct
 from pathlib import Path
 
 import numpy as np
@@ -69,6 +70,21 @@ def test_tmc13_tlv_parser_rejects_truncation_and_unknown_payloads() -> None:
         parse_gpcc_stream(bytes([9]) + stream[1:])
     with pytest.raises(ValueError, match="positive integer"):
         parse_gpcc_stream(stream).amortized_stream_bytes(0)
+
+
+def test_tmc3_payload_accounting_parses_complete_tlv_stream() -> None:
+    def unit(kind: int, value: bytes) -> bytes:
+        return struct.pack(">BI", kind, len(value)) + value
+
+    stream = unit(0, b"sps") + unit(1, b"gpsx") + unit(2, b"payload")
+
+    breakdown = parse_gpcc_stream(stream)
+
+    assert breakdown.sps_bytes == 8
+    assert breakdown.gps_bytes == 9
+    assert breakdown.slice_header_bytes == 5
+    assert breakdown.payload_bytes == 7
+    assert breakdown.header_bytes + breakdown.payload_bytes == len(stream)
 
 
 def test_tmc3_adapter_counts_the_real_stream_and_round_trips(tmp_path: Path) -> None:
