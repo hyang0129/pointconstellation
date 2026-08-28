@@ -103,6 +103,8 @@ def test_rate_summary_uses_actual_streams_and_aggregate_mse() -> None:
     assert summary["unique_reconstructions"] == 2
     assert summary["constant_output"] is False
     assert summary["rate_point_valid"] is True
+    assert summary["model_bytes"] == 1000
+    assert summary["amortized_bpp"]["128"] > summary["mean_actual_bpp"]
 
 
 def test_rate_summary_rejects_constant_stream_and_reconstruction_hashes() -> None:

@@ -99,7 +99,20 @@ def test_official_row_summary_requires_d1_and_d2_positive() -> None:
         "d1_mse",
         "d2_mse",
     }
-
+    original_rows = [
+        {
+            **row,
+            "original_frame_d1_mse": row["d1_mse"] * 1.001,
+            "original_frame_d2_mse": row["d2_mse"] * 1.001,
+        }
+        for row in rows
+    ]
+    original_summary = summarize_official_rows(original_rows, config)
+    assert {row["coordinate_frame"] for row in original_summary["comparisons"]} == {
+        "shared_normalized",
+        "original_mesh",
+    }
+    assert original_summary["official_metric_gate_passes"]
 
 def test_selection_summary_compares_arm_with_fps_and_refiner() -> None:
     config = replace(

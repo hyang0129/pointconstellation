@@ -22,7 +22,9 @@ from torch.utils.data import DataLoader
 from pointconstellation.bitstream import (
     MODE_FIXED,
     decode_constellation,
+    decode_normalization,
     encode_constellation,
+    encode_normalization,
     expected_stream_bytes,
 )
 from pointconstellation.codecs import Tmc3RatePoint, run_pc_error, run_tmc3
@@ -34,6 +36,11 @@ from pointconstellation.data import (
 )
 from pointconstellation.models.bottleneck import VariableConstellationDecoder
 from pointconstellation.models.refiner import CompetitiveConstellationRefiner
+from pointconstellation.rate_accounting import (
+    model_amortization,
+    no_model_amortization,
+    parameter_set_amortized_bpp_table,
+)
 from pointconstellation.refiner_experiment import (
     RefinerExperimentConfig,
     _fps,
@@ -213,17 +220,52 @@ def _load_models(
     return decoder.eval().requires_grad_(False), refiner.eval().requires_grad_(False)
 
 
+def _save_deployment_state_dicts(
+    model: torch.nn.Module, output_dir: Path
+) -> dict[str, dict[str, Any]]:
+    """Write exact fp32/fp16 decoder state dicts and report their identities."""
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    source = model.state_dict()
+    records = {}
+    for precision, dtype in (("fp32", torch.float32), ("fp16", torch.float16)):
+        state = {
+            name: (
+                value.detach().cpu().to(dtype)
+                if value.is_floating_point()
+                else value.detach().cpu()
+            )
+            for name, value in source.items()
+        }
+        path = output_dir / f"decoder_state_dict_{precision}.pt"
+        torch.save(state, path)
+        records[precision] = {
+            "path": str(path),
+            "bytes": path.stat().st_size,
+            "sha256": file_sha256(path),
+        }
+    return records
+
+
 def _decode_and_reconstruct(
     stream: bytes,
     *,
     device: torch.device,
     dtype: torch.dtype,
     decoder: VariableConstellationDecoder,
-) -> tuple[Any, Tensor]:
+) -> tuple[Any, Tensor, Tensor]:
     packet = decode_constellation(stream)
-    decoded = torch.from_numpy(packet.coordinates).to(device=device, dtype=dtype)[None]
+    decoded = torch.from_numpy(packet.normalized_coordinates).to(
+        device=device, dtype=dtype
+    )[None]
     reconstruction = decoder(decoded, num_output_points=packet.output_points)
-    return packet, reconstruction
+    original_reconstruction = reconstruction
+    if packet.normalization_center is not None:
+        center = torch.from_numpy(packet.normalization_center).to(
+            device=device, dtype=dtype
+        )
+        original_reconstruction = reconstruction * packet.normalization_scale + center
+    return packet, reconstruction, original_reconstruction
 
 
 def _manifest_hash(*, split: str, samples: int, num_points: int, seed: int) -> str:
@@ -368,6 +410,7 @@ def _average_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         "actual_stream_bpp",
         "header_bytes",
         "payload_bytes",
+        "normalization_bytes",
         "stream_bytes",
         "encoder_inference_seconds",
         "bitstream_encode_seconds",
@@ -403,6 +446,21 @@ def _average_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if rows and "official_d1_mse" in rows[0]:
         scalar_fields += tuple(
             f"official_{field}"
+            for field in (
+                "d1_mse",
+                "d1_psnr_db",
+                "d2_mse",
+                "d2_psnr_db",
+                "d1_hausdorff",
+                "d1_hausdorff_psnr_db",
+                "d2_hausdorff",
+                "d2_hausdorff_psnr_db",
+                "elapsed_seconds",
+            )
+        )
+    if rows and "original_frame_official_d1_mse" in rows[0]:
+        scalar_fields += tuple(
+            f"original_frame_official_{field}"
             for field in (
                 "d1_mse",
                 "d1_psnr_db",
@@ -655,6 +713,10 @@ def run_standardized_benchmark(
             data_identity=data_identity,
         )
     decoder, refiner = _load_models(experiment, device)
+    decoder_files = _save_deployment_state_dicts(decoder, output_dir / "model")
+    decoder_bytes = {
+        precision: record["bytes"] for precision, record in decoder_files.items()
+    }
     data_seed = (
         experiment.seed if experiment.data_seed is None else experiment.data_seed
     )
@@ -691,6 +753,9 @@ def run_standardized_benchmark(
                     normals_cpu = torch.from_numpy(sample.normals)
                     family = sample.family
                     model_id = str(sample.sample_id)
+                    normalization_center = None
+                    normalization_scale = None
+                    original_source_cpu = None
                 else:
                     mesh_sample = evaluation_meshes[split].sample(sample_id)
                     source_cpu = torch.from_numpy(mesh_sample.source_points)
@@ -700,6 +765,11 @@ def run_standardized_benchmark(
                     fresh_normals_cpu = torch.from_numpy(mesh_sample.target_normals)
                     family = mesh_sample.category
                     model_id = mesh_sample.model_id
+                    normalization_center = mesh_sample.normalization_center
+                    normalization_scale = mesh_sample.normalization_scale
+                    original_source_cpu = torch.from_numpy(
+                        mesh_sample.original_source_points
+                    )
                 source = source_cpu.to(device)[None]
                 for size in experiment.constellation_sizes:
                     for method in config.evaluation_methods:
@@ -723,11 +793,20 @@ def run_standardized_benchmark(
                             bits=experiment.bits,
                             mode=MODE_FIXED,
                             output_points=experiment.num_points,
+                            normalization_center=normalization_center,
+                            normalization_scale=normalization_scale,
                         )
                         bitstream_encode_seconds = (
                             time.perf_counter() - serialization_started
                         )
-                        (packet, reconstruction), decode_seconds = _timed(
+                        (
+                            (
+                                packet,
+                                reconstruction,
+                                original_reconstruction,
+                            ),
+                            decode_seconds,
+                        ) = _timed(
                             device,
                             lambda stream=stream, dtype=source.dtype: (
                                 _decode_and_reconstruct(
@@ -787,6 +866,40 @@ def run_standardized_benchmark(
                             metrics["official_elapsed_seconds"] = (
                                 official.elapsed_seconds
                             )
+                            if original_source_cpu is not None:
+                                original_official = run_pc_error(
+                                    Path(config.official_metric_executable),
+                                    original_source_cpu.numpy(),
+                                    original_reconstruction[0].cpu().numpy(),
+                                    normals_cpu.numpy(),
+                                    work_dir=(
+                                        output_dir
+                                        / "official_metric_original_frame_work"
+                                        / split
+                                        / f"sample_{sample_id:05d}"
+                                        / method
+                                        / f"k_{size:04d}"
+                                    ),
+                                    position_bits=(
+                                        config.official_metric_position_bits
+                                    ),
+                                    timeout_seconds=(
+                                        config.official_metric_timeout_seconds
+                                    ),
+                                    normalization_center=normalization_center,
+                                    normalization_scale=normalization_scale,
+                                )
+                                metrics.update(
+                                    {
+                                        f"original_frame_official_{name}": value
+                                        for name, value in (
+                                            original_official.metrics.items()
+                                        )
+                                    }
+                                )
+                                metrics["original_frame_official_elapsed_seconds"] = (
+                                    original_official.elapsed_seconds
+                                )
                         rows.append(
                             {
                                 "split": split,
@@ -801,6 +914,7 @@ def run_standardized_benchmark(
                                 / experiment.num_points,
                                 "header_bytes": packet.header_bytes,
                                 "payload_bytes": packet.payload_bytes,
+                                "normalization_bytes": packet.normalization_bytes,
                                 "payload_bpp": packet.payload_bytes
                                 * 8
                                 / experiment.num_points,
@@ -822,20 +936,37 @@ def run_standardized_benchmark(
                             rate_point.name,
                             (*config.gpcc.encoder_args, *rate_point.encoder_args),
                         )
+                        gpcc_work_dir = (
+                            output_dir
+                            / "gpcc_work"
+                            / split
+                            / f"sample_{sample_id:05d}"
+                            / rate_point.name
+                        )
                         gpcc_result = run_tmc3(
                             Path(config.gpcc.executable),
                             source_cpu.numpy(),
                             rate_point=effective_rate_point,
-                            work_dir=(
-                                output_dir
-                                / "gpcc_work"
-                                / split
-                                / f"sample_{sample_id:05d}"
-                                / rate_point.name
-                            ),
+                            work_dir=gpcc_work_dir,
                             position_bits=config.gpcc.position_bits,
                             timeout_seconds=config.gpcc.timeout_seconds,
                         )
+                        normalization_payload = b""
+                        gpcc_original_reconstruction = gpcc_result.reconstruction
+                        if normalization_center is not None:
+                            normalization_payload = encode_normalization(
+                                normalization_center, normalization_scale
+                            )
+                            (gpcc_work_dir / "normalization.bin").write_bytes(
+                                normalization_payload
+                            )
+                            decoded_center, decoded_scale = decode_normalization(
+                                normalization_payload
+                            )
+                            gpcc_original_reconstruction = (
+                                gpcc_result.reconstruction * decoded_scale
+                                + decoded_center
+                            ).astype(np.float32)
                         gpcc_reconstruction = torch.from_numpy(
                             gpcc_result.reconstruction
                         )
@@ -888,7 +1019,44 @@ def run_standardized_benchmark(
                             gpcc_metrics["official_elapsed_seconds"] = (
                                 official.elapsed_seconds
                             )
+                            if original_source_cpu is not None:
+                                original_official = run_pc_error(
+                                    Path(config.official_metric_executable),
+                                    original_source_cpu.numpy(),
+                                    gpcc_original_reconstruction,
+                                    normals_cpu.numpy(),
+                                    work_dir=(
+                                        output_dir
+                                        / "official_metric_original_frame_work"
+                                        / split
+                                        / f"sample_{sample_id:05d}"
+                                        / "gpcc_octree"
+                                        / rate_point.name
+                                    ),
+                                    position_bits=(
+                                        config.official_metric_position_bits
+                                    ),
+                                    timeout_seconds=(
+                                        config.official_metric_timeout_seconds
+                                    ),
+                                    normalization_center=normalization_center,
+                                    normalization_scale=normalization_scale,
+                                )
+                                gpcc_metrics.update(
+                                    {
+                                        f"original_frame_official_{name}": value
+                                        for name, value in (
+                                            original_official.metrics.items()
+                                        )
+                                    }
+                                )
+                                gpcc_metrics[
+                                    "original_frame_official_elapsed_seconds"
+                                ] = original_official.elapsed_seconds
                         breakdown = gpcc_result.stream_breakdown
+                        total_stream_bytes = gpcc_result.stream_bytes + len(
+                            normalization_payload
+                        )
                         gpcc_row = {
                             "split": split,
                             "sample_id": sample_id,
@@ -902,11 +1070,18 @@ def run_standardized_benchmark(
                             "slice_header_bytes": breakdown.slice_header_bytes,
                             "header_bytes": breakdown.header_bytes,
                             "payload_bytes": breakdown.payload_bytes,
+                            "normalization_bytes": len(normalization_payload),
+                            "normalization_sha256": (
+                                file_sha256(gpcc_work_dir / "normalization.bin")
+                                if normalization_payload
+                                else None
+                            ),
                             "payload_bpp": breakdown.payload_bytes
                             * 8
                             / experiment.num_points,
-                            "stream_bytes": gpcc_result.stream_bytes,
-                            "actual_stream_bpp": gpcc_result.stream_bytes
+                            "codec_stream_bytes": gpcc_result.stream_bytes,
+                            "stream_bytes": total_stream_bytes,
+                            "actual_stream_bpp": total_stream_bytes
                             * 8
                             / experiment.num_points,
                             "reconstruction_points": len(gpcc_result.reconstruction),
@@ -916,7 +1091,9 @@ def run_standardized_benchmark(
                         }
                         if config.gpcc.amortize_parameter_sets_over is not None:
                             period = config.gpcc.amortize_parameter_sets_over
-                            amortized_bytes = breakdown.amortized_stream_bytes(period)
+                            amortized_bytes = breakdown.amortized_stream_bytes(
+                                period
+                            ) + len(normalization_payload)
                             gpcc_row.update(
                                 {
                                     "amortize_parameter_sets_over": period,
@@ -931,7 +1108,15 @@ def run_standardized_benchmark(
                             )
                         gpcc_rows.append(gpcc_row)
 
-    summary = _average_rows(rows)
+    summary = [
+        {
+            **row,
+            **model_amortization(
+                row["stream_bytes"], experiment.num_points, decoder_bytes
+            ),
+        }
+        for row in _average_rows(rows)
+    ]
     model_dir = Path(experiment.output_dir)
     if evaluation_meshes is None:
         manifests = {
@@ -960,7 +1145,19 @@ def run_standardized_benchmark(
                 split: {"samples": samples} for split, samples in split_sizes.items()
             },
         }
-    gpcc_summary = _average_gpcc_rows(gpcc_rows)
+    gpcc_summary = [
+        {
+            **row,
+            **no_model_amortization(row["stream_bytes"], experiment.num_points),
+            "sequence_amortized_bpp": parameter_set_amortized_bpp_table(
+                row["stream_bytes"] - row.get("normalization_bytes", 0.0),
+                row["sps_bytes"] + row["gps_bytes"],
+                experiment.num_points,
+                per_object_side_information_bytes=row.get("normalization_bytes", 0.0),
+            ),
+        }
+        for row in _average_gpcc_rows(gpcc_rows)
+    ]
     gpcc_frontier = _pareto_frontier(gpcc_summary)
     gpcc_metadata = None
     if config.gpcc is not None:
@@ -1005,6 +1202,15 @@ def run_standardized_benchmark(
             "constellation_sizes": list(experiment.constellation_sizes),
             "fixed_header_bytes": expected_stream_bytes(1, experiment.bits)
             - ((3 * experiment.bits + 7) // 8),
+            "normalization_payload": (
+                {
+                    "bytes_per_object": 8,
+                    "center": "3 x IEEE-754 binary16",
+                    "scale": "positive IEEE-754 binary16",
+                }
+                if config.dataset_kind == "mesh_manifest"
+                else None
+            ),
             "rate_definition": "total serialized stream bits / input points",
             "payload_rate_definition": (
                 "byte-aligned payload bits / input points; outer format headers "
@@ -1013,7 +1219,8 @@ def run_standardized_benchmark(
             "metric_note": (
                 "Unprefixed D1/D2 proxy fields use the declared normalized peak; "
                 "sliced Wasserstein is an EMD proxy. official_* fields are emitted "
-                "only when MPEG pc_error is configured."
+                "only when MPEG pc_error is configured. original_frame_official_* "
+                "fields include serialized-normalization loss."
             ),
             "comparability_claims": {
                 "shapenet": False,
@@ -1040,6 +1247,7 @@ def run_standardized_benchmark(
             "decoder_parameters": model_result["decoder_parameter_count"],
             "refiner_parameters": model_result["refiner_parameter_count"],
             "decoder_checkpoint_bytes": (model_dir / "decoder.pt").stat().st_size,
+            "decoder_state_dicts": decoder_files,
             "refiner_checkpoint_bytes": (model_dir / "refiner.pt").stat().st_size,
             "decoder_unchanged": model_result["decoder_unchanged"],
             "decoder_state_hash": model_result["decoder_hash_after_refiner"],

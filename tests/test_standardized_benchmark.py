@@ -217,3 +217,12 @@ def test_mesh_benchmark_uses_source_primary_and_independent_fresh_target(
     assert len(result["per_cloud"]) == 4
     assert all("fresh_chamfer_rmse" in row for row in result["per_cloud"])
     assert all(row["model_id"] for row in result["per_cloud"])
+    assert all(row["normalization_bytes"] == 8 for row in result["per_cloud"])
+    assert all(
+        row["header_bytes"] + row["payload_bytes"] + row["normalization_bytes"]
+        == row["stream_bytes"]
+        for row in result["per_cloud"]
+    )
+    assert all(
+        set(row["amortized_bpp"]) == {"fp32", "fp16"} for row in result["summary"]
+    )

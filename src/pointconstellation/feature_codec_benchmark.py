@@ -16,7 +16,7 @@ import torch
 from torch import Tensor, nn
 from torch.utils.data import DataLoader, Dataset, Subset
 
-from pointconstellation.bitstream import expected_stream_bytes
+from pointconstellation.bitstream import NORMALIZATION, expected_stream_bytes
 from pointconstellation.codecs import run_pc_error
 from pointconstellation.data import MeshSurfaceDataset, file_sha256, load_mesh_manifest
 from pointconstellation.feature_bitstream import (
@@ -27,6 +27,7 @@ from pointconstellation.feature_bitstream import (
 )
 from pointconstellation.losses import chamfer_squared_chunked
 from pointconstellation.models.feature_codec import VariableFeatureCodec
+from pointconstellation.rate_accounting import model_amortization
 from pointconstellation.refiner_benchmark import paired_hierarchical_bootstrap
 from pointconstellation.refiner_experiment import _state_hash
 from pointconstellation.stability_experiment import (
@@ -406,7 +407,27 @@ def _train_seed(
     selection = {**selected_candidate, "selected_state_hash": selected_hash}
     output_dir.mkdir(parents=True, exist_ok=True)
     torch.save(codec.encoder.state_dict(), output_dir / "encoder.pt")
-    torch.save(codec.decoder.state_dict(), output_dir / "decoder.pt")
+    decoder_files = {}
+    decoder_state = codec.decoder.state_dict()
+    torch.save(decoder_state, output_dir / "decoder.pt")
+    for precision, dtype in (("fp32", torch.float32), ("fp16", torch.float16)):
+        path = output_dir / f"decoder_state_dict_{precision}.pt"
+        torch.save(
+            {
+                name: (
+                    value.detach().cpu().to(dtype)
+                    if value.is_floating_point()
+                    else value.detach().cpu()
+                )
+                for name, value in decoder_state.items()
+            },
+            path,
+        )
+        decoder_files[precision] = {
+            "path": str(path),
+            "bytes": path.stat().st_size,
+            "sha256": file_sha256(path),
+        }
     selection_record = {
         "model_seed": model_seed,
         "selection_metric": (
@@ -419,7 +440,9 @@ def _train_seed(
             zip(config.matched_constellation_sizes, config.latent_dims, strict=True)
         )[config.primary_constellation_size],
         "expected_stream_bytes": expected_stream_bytes(
-            config.primary_constellation_size, config.coordinate_bits
+            config.primary_constellation_size,
+            config.coordinate_bits,
+            normalization=True,
         ),
         "ema_decay": config.ema_decay,
         "calibration_selection_start_epoch": (
@@ -448,6 +471,7 @@ def _train_seed(
         "selection_record": str(output_dir / "selection.json"),
         "encoder_checkpoint_bytes": (output_dir / "encoder.pt").stat().st_size,
         "decoder_checkpoint_bytes": (output_dir / "decoder.pt").stat().st_size,
+        "decoder_state_dicts": decoder_files,
     }
 
 
@@ -469,6 +493,7 @@ def _evaluate_seed(
                 normals_cpu = torch.from_numpy(sample.source_normals)
                 fresh_cpu = torch.from_numpy(sample.target_points)
                 fresh_normals_cpu = torch.from_numpy(sample.target_normals)
+                original_source_cpu = torch.from_numpy(sample.original_source_points)
                 source = source_cpu.to(device)[None]
                 for latent_dim, constellation_size in zip(
                     config.latent_dims,
@@ -486,6 +511,8 @@ def _evaluate_seed(
                         features[0].cpu().numpy(),
                         bits=config.feature_bits,
                         output_points=config.num_points,
+                        normalization_center=sample.normalization_center,
+                        normalization_scale=sample.normalization_scale,
                     )
                     bitstream_encode_seconds = (
                         time.perf_counter() - serialization_started
@@ -505,6 +532,12 @@ def _evaluate_seed(
 
                     reconstruction, decode_seconds = _timed(device, decode)
                     packet = decode_features(stream)
+                    center = torch.from_numpy(packet.normalization_center).to(
+                        device=device, dtype=reconstruction.dtype
+                    )
+                    original_reconstruction = (
+                        reconstruction * packet.normalization_scale + center
+                    )
                     metrics = standardized_geometry_metrics(
                         reconstruction[0].cpu(),
                         source_cpu,
@@ -550,6 +583,32 @@ def _evaluate_seed(
                             }
                         )
                         metrics["official_elapsed_seconds"] = official.elapsed_seconds
+                        original_official = run_pc_error(
+                            Path(config.official_metric_executable),
+                            original_source_cpu.numpy(),
+                            original_reconstruction[0].cpu().numpy(),
+                            normals_cpu.numpy(),
+                            work_dir=(
+                                output_dir
+                                / "official_metric_original_frame_work"
+                                / split
+                                / f"sample_{sample_id:05d}"
+                                / f"d_{latent_dim:04d}"
+                            ),
+                            position_bits=config.official_metric_position_bits,
+                            timeout_seconds=config.official_metric_timeout_seconds,
+                            normalization_center=sample.normalization_center,
+                            normalization_scale=sample.normalization_scale,
+                        )
+                        metrics.update(
+                            {
+                                f"original_frame_official_{name}": value
+                                for name, value in original_official.metrics.items()
+                            }
+                        )
+                        metrics["original_frame_official_elapsed_seconds"] = (
+                            original_official.elapsed_seconds
+                        )
                     rows.append(
                         {
                             "split": split,
@@ -565,6 +624,7 @@ def _evaluate_seed(
                             / config.num_points,
                             "header_bytes": packet.header_bytes,
                             "payload_bytes": packet.payload_bytes,
+                            "normalization_bytes": packet.normalization_bytes,
                             "payload_bpp": packet.payload_bytes * 8 / config.num_points,
                             "stream_bytes": packet.stream_bytes,
                             "actual_stream_bpp": packet.stream_bytes
@@ -652,6 +712,11 @@ def _reference_comparisons(
                     if any(
                         feature_index[key]["stream_bytes"]
                         != reference_index[key]["stream_bytes"]
+                        + (
+                            0
+                            if "normalization_bytes" in reference_index[key]
+                            else NORMALIZATION.size
+                        )
                         for key in keys
                     ):
                         raise RuntimeError(
@@ -829,8 +894,16 @@ def _stability_reference_comparison(
     decoder_seeds = tuple(reference_config["decoder_seeds"])
     refiner_seeds = tuple(reference_config["refiner_seeds"])
     expected_bytes = expected_stream_bytes(
-        config.primary_constellation_size, config.coordinate_bits
+        config.primary_constellation_size,
+        config.coordinate_bits,
+        normalization=True,
     )
+
+    def normalized_total_bytes(row: dict[str, Any]) -> int:
+        return int(row["stream_bytes"]) + (
+            0 if "normalization_bytes" in row else NORMALIZATION.size
+        )
+
     comparisons = []
     split_names = {"validation": "validation", "ood": "category_ood"}
     for split_index, (coordinate_split, feature_split) in enumerate(
@@ -843,7 +916,10 @@ def _stability_reference_comparison(
             and row["split"] == coordinate_split
             and row["method"] == "refiner"
         ]
-        if any(row["stream_bytes"] != expected_bytes for row in selected_coordinates):
+        if any(
+            normalized_total_bytes(row) != expected_bytes
+            for row in selected_coordinates
+        ):
             raise ValueError("stability reference stream size is not rate matched")
         first_cell = [
             row
@@ -879,7 +955,10 @@ def _stability_reference_comparison(
                 and row["method"] == "feature_latent"
                 and row["constellation_size"] == config.primary_constellation_size
             ]
-            if any(row["stream_bytes"] != expected_bytes for row in selected_features):
+            if any(
+                normalized_total_bytes(row) != expected_bytes
+                for row in selected_features
+            ):
                 raise ValueError("feature stream size is not rate matched")
             indexed = {
                 (row["family"], row["model_id"]): row for row in selected_features
@@ -1002,7 +1081,22 @@ def run_feature_codec_benchmark(
                 "model_seed": model_seed,
                 "data_seed": config.data_seed,
                 "model": model,
-                "summary": _average_rows(rows),
+                "summary": [
+                    {
+                        **row,
+                        **model_amortization(
+                            row["stream_bytes"],
+                            config.num_points,
+                            {
+                                precision: record["bytes"]
+                                for precision, record in model[
+                                    "decoder_state_dicts"
+                                ].items()
+                            },
+                        ),
+                    }
+                    for row in _average_rows(rows)
+                ],
                 "monotonicity": _monotonicity(_average_rows(rows)),
                 "per_cloud": rows,
                 "evaluation_elapsed_seconds": evaluation_seconds,
@@ -1044,6 +1138,12 @@ def run_feature_codec_benchmark(
             "stream_bytes": expected_stream_bytes(
                 config.primary_constellation_size, config.coordinate_bits
             ),
+            "normalization_bytes": NORMALIZATION.size,
+            "total_stream_bytes": expected_stream_bytes(
+                config.primary_constellation_size,
+                config.coordinate_bits,
+                normalization=True,
+            ),
             "metric": "validation source-cloud Chamfer RMSE",
             "criterion": (
                 "stabilized constellation relative improvement confidence interval "
@@ -1067,6 +1167,12 @@ def run_feature_codec_benchmark(
             "feature_bits": config.feature_bits,
             "stream_bytes": expected_stream_bytes(
                 constellation_size, config.coordinate_bits
+            ),
+            "normalization_bytes": NORMALIZATION.size,
+            "total_stream_bytes": expected_stream_bytes(
+                constellation_size,
+                config.coordinate_bits,
+                normalization=True,
             ),
         }
         for latent_dim, constellation_size in zip(
@@ -1094,13 +1200,17 @@ def run_feature_codec_benchmark(
             "payload_rate_definition": (
                 "byte-aligned feature payload bits / input points"
             ),
-            "rate_match": "exact bytes including each format's complete header",
+            "rate_match": (
+                "exact bytes including each format's header and normalization"
+            ),
             "rate_points": rate_points,
             "feature_latent_is_not_coordinate_only": True,
+            "normalization_payload_bytes_per_object": 8,
             "shared_model_cost_excluded_from_per_cloud_rate": True,
             "ema_checkpoint_selection_uses_calibration_source_only": (
                 config.ema_decay is not None
             ),
+            "shared_model_cost_reported_as_amortized_bpp": True,
         },
         "data_protocol": data_protocol,
         "device": str(device),
@@ -1118,7 +1228,9 @@ def run_feature_codec_benchmark(
             "all_stream_sizes_match_declared_rates": all(
                 row["stream_bytes"]
                 == expected_stream_bytes(
-                    row["constellation_size"], config.coordinate_bits
+                    row["constellation_size"],
+                    config.coordinate_bits,
+                    normalization=True,
                 )
                 for seed_result in seed_results
                 for row in seed_result["per_cloud"]

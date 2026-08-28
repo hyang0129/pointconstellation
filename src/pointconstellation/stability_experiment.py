@@ -46,6 +46,7 @@ from pointconstellation.models.bottleneck import VariableConstellationDecoder
 from pointconstellation.models.gradient_free import adam_ste_search
 from pointconstellation.models.refiner import CompetitiveConstellationRefiner
 from pointconstellation.quantization import quantize_ste
+from pointconstellation.rate_accounting import model_amortization
 from pointconstellation.refiner_experiment import _fps, _state_hash
 from pointconstellation.train import select_device, set_seed
 
@@ -652,10 +653,31 @@ def _train_decoders(
             },
             checkpoint,
         )
+        deployment_files = {}
+        for precision, dtype in (("fp32", torch.float32), ("fp16", torch.float16)):
+            deployment_path = decoder_dir / arm / f"decoder_state_dict_{precision}.pt"
+            deployment_path.parent.mkdir(exist_ok=True)
+            torch.save(
+                {
+                    name: (
+                        value.detach().cpu().to(dtype)
+                        if value.is_floating_point()
+                        else value.detach().cpu()
+                    )
+                    for name, value in state.items()
+                },
+                deployment_path,
+            )
+            deployment_files[precision] = {
+                "path": str(deployment_path),
+                "bytes": deployment_path.stat().st_size,
+                "sha256": file_sha256(deployment_path),
+            }
         arm_records[arm] = {
             "state_hash": state_hash,
             "checkpoint": str(checkpoint),
             "selection": selection,
+            "decoder_state_dicts": deployment_files,
         }
     record = {
         "decoder_seed": decoder_seed,
@@ -794,36 +816,58 @@ def _serialized_coordinates(
     coordinates: Tensor,
     *,
     config: StabilityExperimentConfig,
-    mode: str = MODE_FIXED,
+    mode: int | str = MODE_FIXED,
+    normalization_centers: Tensor | None = None,
+    normalization_scales: Tensor | None = None,
 ) -> tuple[Tensor, list[ConstellationPacket], bool, bool]:
+    if (normalization_centers is None) != (normalization_scales is None):
+        raise ValueError("normalization centers and scales must be supplied together")
+    if normalization_centers is not None and len(normalization_centers) < len(
+        coordinates
+    ):
+        raise ValueError("normalization batch is smaller than the coordinate batch")
     decoded = []
     packets = []
     exact = True
     lattice_exact = True
-    for row in coordinates.detach().cpu().numpy():
+    for index, row in enumerate(coordinates.detach().cpu().numpy()):
+        center = (
+            None
+            if normalization_centers is None
+            else normalization_centers[index].detach().cpu().numpy()
+        )
+        scale = (
+            None
+            if normalization_scales is None
+            else float(normalization_scales[index].item())
+        )
         stream = encode_constellation(
             row,
             bits=config.coordinate_bits,
             mode=mode,
             output_points=config.num_points,
+            normalization_center=center,
+            normalization_scale=scale,
         )
         packet = decode_constellation(stream)
         levels = (1 << packet.bits) - 1
-        lattice_values = (packet.coordinates + 1.0) * 0.5 * levels
+        lattice_values = (packet.normalized_coordinates + 1.0) * 0.5 * levels
         lattice_exact = lattice_exact and bool(
             np.all(np.abs(lattice_values - np.rint(lattice_values)) <= 1e-9)
         )
         exact = (
             exact
             and encode_constellation(
-                packet.coordinates,
+                packet.normalized_coordinates,
                 bits=packet.bits,
                 mode=packet.mode,
                 output_points=packet.output_points,
+                normalization_center=packet.normalization_center,
+                normalization_scale=packet.normalization_scale,
             )
             == stream
         )
-        decoded.append(torch.from_numpy(packet.coordinates).float())
+        decoded.append(torch.from_numpy(packet.normalized_coordinates).float())
         packets.append(packet)
     return (
         torch.stack(decoded).to(coordinates.device),
@@ -839,10 +883,12 @@ def _entropy_rate_fields(
     """Return exact optional-stream rates without changing the declared packet."""
 
     entropy_stream = encode_constellation(
-        packet.coordinates,
+        packet.normalized_coordinates,
         bits=packet.bits,
         mode=MODE_ENTROPY,
         output_points=packet.output_points,
+        normalization_center=packet.normalization_center,
+        normalization_scale=packet.normalization_scale,
     )
     entropy_packet = decode_constellation(entropy_stream)
     if not np.array_equal(packet.coordinates, entropy_packet.coordinates):
@@ -851,8 +897,9 @@ def _entropy_rate_fields(
         "entropy_stream_bytes": len(entropy_stream),
         "entropy_bpp": 8.0 * len(entropy_stream) / num_points,
         "entropy_bound_bytes": entropy_bound_bytes(
-            packet.coordinates, bits=packet.bits
-        ),
+            packet.normalized_coordinates, bits=packet.bits
+        )
+        + packet.normalization_bytes,
     }
 
 
@@ -874,6 +921,8 @@ def _evaluate_pair(
         for batch in _loader(datasets[split], config=config, shuffle=False):
             source = _source(batch, device)
             fresh = _fresh_target(batch, source)
+            normalization_centers = batch.get("normalization_center")
+            normalization_scales = batch.get("normalization_scale")
             fps = _fps(source, config.constellation_size, config.coordinate_bits)
             refiner_coordinates = refiner(
                 source,
@@ -919,8 +968,13 @@ def _evaluate_pair(
                 probed += probe_count
 
             for method, (coordinates, source_only_probe) in methods.items():
+                mode = "fps" if method == "fps" else "free"
                 decoded, packets, exact, lattice_exact = _serialized_coordinates(
-                    coordinates, config=config
+                    coordinates,
+                    config=config,
+                    mode=mode,
+                    normalization_centers=normalization_centers,
+                    normalization_scales=normalization_scales,
                 )
                 with torch.no_grad():
                     reconstruction = decoder(
@@ -954,6 +1008,7 @@ def _evaluate_pair(
                             "coordinate_bits": config.coordinate_bits,
                             "header_bytes": packet.header_bytes,
                             "payload_bytes": packet.payload_bytes,
+                            "normalization_bytes": packet.normalization_bytes,
                             "payload_bpp": 8.0
                             * packet.payload_bytes
                             / config.num_points,
@@ -1004,6 +1059,17 @@ def _summaries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "split": split,
                 "method": method,
                 "clouds": len(group),
+                "header_bytes": float(np.mean([row["header_bytes"] for row in group])),
+                "payload_bytes": float(
+                    np.mean([row["payload_bytes"] for row in group])
+                ),
+                "normalization_bytes": float(
+                    np.mean([row.get("normalization_bytes", 0) for row in group])
+                ),
+                "stream_bytes": float(np.mean([row["stream_bytes"] for row in group])),
+                "actual_stream_bpp": float(
+                    np.mean([row["actual_stream_bpp"] for row in group])
+                ),
                 "chamfer_mse": mse,
                 "chamfer_rmse": math.sqrt(mse),
                 "fresh_chamfer_mse": fresh_mse,
@@ -1076,6 +1142,33 @@ def _summaries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 / max(baseline["fresh_chamfer_rmse"], 1e-12)
             )
     return result
+
+
+def _amortize_stability_summaries(
+    summaries: list[dict[str, Any]],
+    decoder_records: list[dict[str, Any]],
+    *,
+    input_points: int,
+) -> list[dict[str, Any]]:
+    model_bytes = {
+        (record["decoder_seed"], arm): {
+            precision: file_record["bytes"]
+            for precision, file_record in arm_record["decoder_state_dicts"].items()
+        }
+        for record in decoder_records
+        for arm, arm_record in record["arms"].items()
+    }
+    return [
+        {
+            **row,
+            **model_amortization(
+                row["stream_bytes"],
+                input_points,
+                model_bytes[(row["decoder_seed"], row["arm"])],
+            ),
+        }
+        for row in summaries
+    ]
 
 
 def _two_way_components(
@@ -1547,7 +1640,9 @@ def _feature_reference_comparison(
     reference_metrics = json.loads(metrics_path.read_text())
     reference_config = reference_metrics["config"]
     expected_bytes = expected_stream_bytes(
-        config.constellation_size, config.coordinate_bits
+        config.constellation_size,
+        config.coordinate_bits,
+        normalization=config.dataset_kind == "mesh_manifest",
     )
     protocol_checks = {
         "data_seed_matches": reference_config["data_seed"] == config.data_seed,
@@ -1607,7 +1702,23 @@ def _feature_reference_comparison(
                 and row["method"] == "feature_latent"
                 and row["constellation_size"] == config.constellation_size
             ]
-            if any(row["stream_bytes"] != expected_bytes for row in selected):
+            if any(
+                row["stream_bytes"]
+                + (
+                    0
+                    if "normalization_bytes" in row
+                    else (
+                        expected_stream_bytes(
+                            1, config.coordinate_bits, normalization=True
+                        )
+                        - expected_stream_bytes(1, config.coordinate_bits)
+                        if config.dataset_kind == "mesh_manifest"
+                        else 0
+                    )
+                )
+                != expected_bytes
+                for row in selected
+            ):
                 raise ValueError("feature reference stream size is not rate matched")
             indexed = {(row["family"], row["model_id"]): row for row in selected}
             if list(indexed) != cloud_keys and set(indexed) != set(cloud_keys):
@@ -1808,7 +1919,9 @@ def run_stability_experiment(
                     flush=True,
                 )
 
-    summaries = _summaries(all_rows)
+    summaries = _amortize_stability_summaries(
+        _summaries(all_rows), decoder_records, input_points=config.num_points
+    )
     initial_hashes_matched = all(
         len(
             {
@@ -1836,7 +1949,12 @@ def run_stability_experiment(
         "config": asdict(config),
         "device": str(device),
         "scientific_contract": {
-            "message": "unordered quantized K x 3 coordinates only",
+            "learned_message": "unordered quantized K x 3 coordinates only",
+            "per_object_side_information": (
+                "8-byte binary16 center/scale normalization"
+                if config.dataset_kind == "mesh_manifest"
+                else "none"
+            ),
             "source_only_encoder_feedback": True,
             "actual_bitstream_round_trip": True,
             "decoder_frozen_during_refiner_and_adam": True,
@@ -1885,7 +2003,9 @@ def run_stability_experiment(
             "all_stream_sizes_match_declared_rate": all(
                 row["stream_bytes"]
                 == expected_stream_bytes(
-                    config.constellation_size, config.coordinate_bits
+                    config.constellation_size,
+                    config.coordinate_bits,
+                    normalization=config.dataset_kind == "mesh_manifest",
                 )
                 for row in all_rows
             ),
@@ -1897,7 +2017,10 @@ def run_stability_experiment(
                 for row in all_rows
             ),
             "all_header_payload_splits_exact": all(
-                row["header_bytes"] + row["payload_bytes"] == row["stream_bytes"]
+                row["header_bytes"]
+                + row["payload_bytes"]
+                + row.get("normalization_bytes", 0)
+                == row["stream_bytes"]
                 for row in all_rows
             ),
         },
@@ -1928,7 +2051,9 @@ def reaggregate_stability_result(config: StabilityExperimentConfig) -> dict[str,
     if not result.get("factorial", {}).get("complete"):
         raise ValueError("cannot aggregate an incomplete factorial result")
     rows = result["per_cloud"]
-    summaries = _summaries(rows)
+    summaries = _amortize_stability_summaries(
+        _summaries(rows), result["decoder_records"], input_points=config.num_points
+    )
     started = time.perf_counter()
     result.update(
         {
