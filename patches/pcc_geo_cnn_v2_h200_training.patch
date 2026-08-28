@@ -1,0 +1,36 @@
+diff --git a/src/tr_train.py b/src/tr_train.py
+index 2c23b5e..f4b3757 100644
+--- a/src/tr_train.py
++++ b/src/tr_train.py
+@@ -13,6 +13,7 @@ import os
+ import argparse
+ import numpy as np
+ import tensorflow.compat.v1 as tf
++from tensorflow.python.ops import math_grad
+ from utils import pc_io
+ from tqdm import tqdm, trange
+ from model_types import input_fn
+@@ -20,6 +21,23 @@ from model_configs import ModelConfigType
+ np.random.seed(42)
+ tf.set_random_seed(42)
+ 
++# CUDA 10 predates Hopper and its batched GEMM fails for TensorFlow
++# Compression's tiny entropy-bottleneck matrices. Keep only those linalg
++# matrix operations and their gradients on CPU; 3D convolutions and the
++# remaining optimization graph stay on GPU.
++@tf.RegisterGradient('CpuBatchMatMulV2')
++def _cpu_batch_matmul_grad(op, grad):
++    with tf.device('/cpu:0'):
++        return math_grad._BatchMatMulV2(op, grad)
++
++_gpu_incompatible_matmul = tf.linalg.matmul
++def _cpu_entropy_matmul(*args, **kwargs):
++    graph = tf.get_default_graph()
++    with graph.gradient_override_map({'BatchMatMulV2': 'CpuBatchMatMulV2'}):
++        with tf.device('/cpu:0'):
++            return _gpu_incompatible_matmul(*args, **kwargs)
++tf.linalg.matmul = _cpu_entropy_matmul
++
+ 
+ def train():
+     p_min, p_max, dense_tensor_shape = pc_io.get_shape_data(args.resolution, args.data_format)

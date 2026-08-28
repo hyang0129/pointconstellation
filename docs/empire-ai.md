@@ -1,12 +1,15 @@
 # EmpireAI GPU workflow
 
-This tooling is adapted from the working HalluLens EmpireAI workflow. It keeps
+This tooling is adapted from the working HalluLens EmpireAI workflow. Point
+Constellation reserves ports `8600` through `8699`; HalluLens uses a separate
+port namespace. Port separation makes workstream ownership machine-checkable,
+even when multiple logical allocations share one physical GPU host. It keeps
 credentials out of the repository and deliberately has no job-cancellation
 command.
 
 ## What was ported
 
-- a guarded SLURM Jupyter launcher with hard allocation caps;
+- a guarded SLURM Jupyter launcher with a six-allocation cap;
 - live discovery of `jupyter_*_<port>` allocations through `squeue`;
 - authenticated Jupyter REST/WebSocket execution;
 - GPU health and free-VRAM inspection;
@@ -48,17 +51,18 @@ Preview only:
 
 ```bash
 ssh empire-ai \
-  'cd ~/pointconstellation && .venv/bin/python scripts/launch_empire_jupyter.py 8882'
+  'cd ~/pointconstellation && .venv/bin/python scripts/launch_empire_jupyter.py 8600'
 ```
 
-The preview checks the HalluLens-derived caps: at most four running Jupyter
-allocations and six total queued/running jobs. It also rejects port collisions.
+The preview permits at most six Point Constellation allocations, counting only
+jobs in the reserved `86xx` namespace. Other workstreams do not consume this
+project cap. It also rejects namespace violations and port collisions.
 
 After explicitly deciding to allocate the GPU, submit with:
 
 ```bash
 ssh empire-ai \
-  'cd ~/pointconstellation && .venv/bin/python scripts/launch_empire_jupyter.py 8882 --submit'
+  'cd ~/pointconstellation && .venv/bin/python scripts/launch_empire_jupyter.py 8600 --submit'
 ```
 
 The launcher invokes `~/rit_rc_scripts/empire_jupyter_lab.sh` by default. Set
@@ -111,13 +115,13 @@ GPU nodes are reachable through the login node. After `sync` reports a node and
 port, open a local tunnel:
 
 ```bash
-ssh -N -L 18882:alphagpuXX:8882 empire-ai
+ssh -N -L 18600:alphagpuXX:8600 empire-ai
 ```
 
 In another shell:
 
 ```bash
-export POINTCONSTELLATION_JUPYTER_URL=http://localhost:18882
+export POINTCONSTELLATION_JUPYTER_URL=http://localhost:18600
 export POINTCONSTELLATION_JUPYTER_PASSWORD='<cluster-jupyter-password>'
 python -m pointconstellation.cluster.jupyter \
   'import torch; print(torch.cuda.get_device_name(0))'
@@ -126,6 +130,11 @@ python -m pointconstellation.cluster.jupyter \
 ## Safety rules
 
 - The login node is for Git, SLURM inspection, and dispatch only—never training.
+- Never launch compute by directly SSHing to an `alphagpu*` host. Submit through
+  SLURM or execute through the selected `hostname-port` Jupyter endpoint so the
+  process inherits that logical allocation's GPU cgroup and visibility.
+- Treat `hostname-port`, not hostname alone, as the logical node identity. Two
+  jobs on the same physical host are distinct allocations.
 - Preview allocation commands before using `--submit`.
 - Never work around an allocation-cap or port-collision refusal.
 - Confirm remote job state before retrying a timed-out submission.
