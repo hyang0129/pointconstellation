@@ -1,0 +1,271 @@
+# End-to-end rate accounting
+
+This note re-summarizes the existing Experiment 017 seed-7 artifacts. It is an
+accounting correction, not a new training or codec run. The validation split
+has 128 ModelNet40 clouds of 2,048 source points each.
+
+## Definitions
+
+`actual_stream_bpp` remains the complete serialized file size in bits divided
+by the source point count. `payload_bpp` uses the byte-aligned payload size, so
+padding in the final payload byte is still counted.
+
+Mesh experiments normalize an object with its bounding-box center and maximum
+vertex radius. That transform is not shared. New `PCON` streams therefore use
+the existing domain byte to signal an 8-byte normalization payload: three
+binary16 center values followed by one positive binary16 isotropic scale.
+Feature-codec, G-PCC, and published external learned-codec evaluations store
+the same 8 bytes as per-object side information. `header_bytes`, `payload_bytes`,
+and `normalization_bytes` sum to the full per-object byte count. Old domain-1
+`PCON` streams remain decodable and have `normalization_bytes = 0`; they
+represent only the shared pre-normalized domain.
+
+Binary16 rounds each normal center component and the scale with relative error
+at most `2^-11`; subnormal values have an absolute spacing of `2^-24`. Values
+outside the finite binary16 range and scales that round to zero are rejected.
+Original-frame reconstruction uses the serialized center and scale, so this
+rounding is included in every `original_frame_*` distortion field (named
+`original_frame_official_*` in the standardized benchmark). The unprefixed
+official fields continue to measure the shared normalized frame.
+For `pc_error`, original-frame source and reconstruction coordinates are mapped
+to its integer grid with the encoder's declared mesh box; only the decoded
+reconstruction uses the rounded transmitted transform.
+
+For the constellation stream, the complete 14-byte `PCON` header is excluded
+from payload-only rate. For TMC13 v23, the parser reads the stream's one-byte
+type, four-byte big-endian length, and declared value for every TLV unit. SPS
+and GPS byte counts include their TLV framing. `slice_header_bytes` is the
+five-byte geometry-brick TLV framing, and the geometry-brick value is counted
+as payload. This is conservative: syntax inside the geometry-brick value is
+not estimated or subtracted.
+
+The optional sequence-amortized G-PCC accounting for a parameter-set period
+of `n` clouds is
+
+```text
+total - sps - gps + (sps + gps) / n
+```
+
+It is an accounting point only. The resulting per-cloud byte count is not an
+independently decodable stream. Set `amortize_parameter_sets_over` in a
+standardized benchmark's `gpcc` configuration to emit this accounting rate in
+new benchmark rows.
+
+## Shared-decoder amortization
+
+For a complete per-object stream of `s` bytes, a decoder state dict of `m`
+bytes, `N=2048` source points, and a corpus of `n` independently coded objects,
+the reported total rate is
+
+```text
+amortized_bpp(n) = 8 * (s + m / n) / N.
+```
+
+The state-dict sizes below are exact `torch.save` file sizes regenerated from
+the Experiment 019 seed-7 stabilized decoder and Experiment 018 seed-7 feature
+decoder. Floating tensors are stored entirely as the named precision; integer
+buffers retain their native type. Encoder and refiner weights are excluded
+because they are not needed for decoding. The per-object point is `K=8,q=12`.
+This is why the fp32 deployment number is smaller than the earlier approximate
+405 KB inventory, which combined decoder and encoder-side refiner checkpoints.
+The G-PCC row uses the measured Experiment 017 validation
+`octree_s1_640` mean. The `pcc_geo_cnn_v2` row uses its smallest released-rate
+smoke stream and, conservatively, the complete five-point release bundle because
+the retained local Experiment 020 artifact does not contain the runner's
+single-checkpoint `model_bytes` row. It is an upper-bound accounting row, not a
+single-rate deployment size.
+
+| Codec / model representation | Object bytes without normalization | Object bytes with normalization | Model bytes | bpp at n=128 | n=672 | n=2,468 | n=10k | n=100k |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Constellation decoder, fp32 | 50.000 | 58.000 | 337,942 | 10.539734 | 2.190976 | 0.761443 | 0.358571 | 0.239763 |
+| Constellation decoder, fp16 | 50.000 | 58.000 | 174,294 | 5.545593 | 1.239711 | 0.502428 | 0.294646 | 0.233371 |
+| Feature-codec decoder, fp32 | 50.000 | 58.000 | 871,110 | 26.810730 | 5.290213 | 1.605320 | 0.566840 | 0.260590 |
+| Feature-codec decoder, fp16 | 50.000 | 58.000 | 438,470 | 13.607605 | 2.775332 | 0.920555 | 0.397840 | 0.243690 |
+| `pcc_geo_cnn_v2`, native release bundle upper bound | 1,751.000 | 1,759.000 | 5,523,313,425 | 168,565.020050 | 32,113.185181 | 8,748.946891 | 2,164.415400 | 222.625524 |
+| G-PCC full independently decodable stream | 61.281 | 69.281 | 0 | 0.270630 | 0.270630 | 0.270630 | 0.270630 | 0.270630 |
+| G-PCC sequence accounting, SPS/GPS shared | 61.281 | 69.281 | 0 | 0.146606 | 0.145816 | 0.145681 | 0.145642 | 0.145631 |
+
+The last row shares the measured mean 32 SPS/GPS bytes and retains the 8-byte
+normalization for every object. It is not an independently decodable stream.
+New G-PCC summaries report both the zero-model `amortized_bpp` table (identical
+to the full-stream rate) and `sequence_amortized_bpp`.
+
+Against G-PCC's 0.270630-bpp full per-object `octree_s1_640` stream, the
+normalization-complete constellation falls below the G-PCC rate after 29,957
+objects with the fp32 state dict and after 15,450 objects with fp16. Thus it is
+still above G-PCC at `n=10k` but below it at the next requested corpus size,
+`n=100k`. This crossover is rate accounting for these measured streams; it is
+not a rate-distortion superiority claim.
+
+## Experiment 017 seed-7 validation rates
+
+The G-PCC table includes the measured points whose mean full-stream rate is
+approximately 0.18 through 0.45 bpp. Values are means over clouds; consequently
+mean byte counts need not be integers. Chamfer RMSE is included only to locate
+the rates on the existing curve.
+
+| Stream | Rate point | Mean header bytes | Full bpp | Payload bpp | Mean Chamfer RMSE |
+| --- | --- | ---: | ---: | ---: | ---: |
+| G-PCC | `octree_s1_4096` | 37.000 | 0.1797 | 0.0352 | 1.1684 |
+| G-PCC | `octree_s1_1536` | 37.000 | 0.1873 | 0.0427 | 0.3363 |
+| G-PCC | `octree_s1_1280` | 37.000 | 0.1891 | 0.0446 | 0.2808 |
+| G-PCC | `octree_s1_2048` | 37.000 | 0.1911 | 0.0466 | 0.4127 |
+| G-PCC | `octree_s1_1024` | 37.000 | 0.2125 | 0.0680 | 0.2151 |
+| G-PCC | `octree_s1_768` | 37.000 | 0.2139 | 0.0694 | 0.1627 |
+| G-PCC | `octree_s1_640` | 37.000 | 0.2394 | 0.0948 | 0.1344 |
+| G-PCC | `octree_s1_512` | 37.133 | 0.2729 | 0.1278 | 0.1058 |
+| G-PCC | `octree_s1_256` | 37.055 | 0.4463 | 0.3015 | 0.0548 |
+| Constellation, free | `K=4` | 14.000 | 0.1250 | 0.0703 | 0.1612 |
+| Constellation, free | `K=8` | 14.000 | 0.1953 | 0.1406 | 0.1445 |
+| Constellation, free | `K=16` | 14.000 | 0.3359 | 0.2812 | 0.1282 |
+| Constellation, free | `K=32` | 14.000 | 0.6172 | 0.5625 | 0.1166 |
+
+The apparent constellation advantage around 0.19--0.25 full-stream bpp does
+not survive payload-only accounting. At full-stream rate, `K=8` has 0.1953 bpp
+and 0.1445 mean Chamfer RMSE, while the measured G-PCC points at or below that
+rate have higher distortion. After removing the outer headers, the G-PCC
+`octree_s1_512` point has both lower rate (0.1278 versus 0.1406 payload bpp) and
+lower distortion (0.1058 versus 0.1445). This is a statement about these
+measured validation points, not a general codec claim.
+
+## Optional entropy-stream diagnostic
+
+The declared constellation stream remains mode 0: a lexicographically sorted,
+fixed-width lattice payload. Mode 1 is an exactly decodable diagnostic over the
+same coordinates. It stores the first sorted point at full precision, zigzag
+maps subsequent signed deltas, chooses the Rice parameter that minimizes coded
+length over the stream, and signals that parameter in one byte. Both modes use
+the same 14-byte header. New Experiment 019 and official Experiment 020 rows
+report mode 1 as `entropy_stream_bytes` and `entropy_bpp` alongside the unchanged
+mode-0 fields. `entropy_bound_bytes` is an oracle per-axis order-0 bound that
+includes the header, parameter byte, and full-precision first point, but does
+not include the cost of communicating the empirical delta distributions. It is
+therefore not a decodable rate.
+
+On the 128-cloud Experiment 019 validation split at `K=8`, `q=12`, the sealed
+stabilized refiner factorial contributes 2,304 streams. The fixed stream is
+50 bytes (0.1953 bpp) per cloud. The entropy variant averaged 51.888 bytes
+(0.2027 bpp; range 43--54), an expansion of 1.888 bytes or 3.776%. The matched
+768 FPS rows averaged 52.117 bytes (0.2036 bpp; range 45--54), an expansion of
+4.234%. The refiner oracle bound averaged 26.852 bytes (0.1049 bpp), leaving a
+25.036-byte mean gap between the implemented Rice stream and the optimistic
+bound. Thus this exact mode-1 coder realizes no coding gain on these messages;
+the oracle result only identifies distribution-modeling headroom and is not a
+compression result.
+
+These values were regenerated from the sealed Experiment 019 models, using the
+Experiment 020 official rows only to select the validation messages. The source
+hashes were:
+
+- `official_per_cloud.jsonl`: `03694b58ff00ff8c55fa9ce4adb4090afe9588e805cb4e76ba6ca2898b1c9b15`
+- `experiment_019_stability_modelnet40.json`: `1dba8d5b6e0533f6da6b6ce34d6837b0dbc0c22b6a1bda388b952c9203f08683`
+
+Reproduce the inference-only resummary without modifying either experiment:
+
+```bash
+python scripts/resummarize_entropy_headroom.py \
+  --config configs/experiment_020_official_stability.json \
+  --official-rows \
+    artifacts/local/experiment_020_official_stability/official_per_cloud.jsonl \
+  --split validation \
+    --output /tmp/experiment_019_validation_entropy_headroom.json
+```
+
+## Learned entropy stream
+
+The learned mode preserves the mode-0 coordinate contract and 14-byte `PCON`
+header. Its public API value remains `MODE_LEARNED = 2`; the integrated stream
+uses wire ID 5 because IDs 2--4 identify the pre-existing `free`,
+`strict_subset`, and `fps` representation modes. It
+codes the same lexicographically sorted lattice with a 32-bit integer arithmetic
+coder and appends a four-byte CRC-32 integrity check. The decoder also
+re-encodes the decoded lattice and requires the canonical bytes, so truncation,
+trailing bytes, a mismatched shared model, and non-canonical arithmetic streams
+are rejected. The CRC and any padding are counted in `learned_stream_bytes`.
+When normalization is present, its eight serialized bytes are also counted and
+are restored identically by the fixed, Rice, and learned streams.
+The declared paper stream remains mode 0.
+
+Two shared-model candidates are implemented:
+
+- `octree` traverses the `q`-level lattice octree, codes child-occupancy bits
+  with training-seeded and within-stream adaptive integer contexts, and handles
+  duplicate lattice points through exact child-count allocation;
+- `autoregressive` uses a small fixed-point MLP conditioned on previously coded
+  sorted coordinates. It codes each predicted residual with a stored integer
+  discretized-logistic probability table.
+
+Both candidates are fitted from regenerated `split=train` constellations. Their
+integer arrays are shared decoder state, are excluded from per-cloud bytes, and
+are reported separately as both uncompressed parameter bytes and actual
+serialized model bytes. Candidate selection uses validation bytes. The script
+checks every round trip against mode 0 and pads only when necessary to prevent a
+decodable stream from falling below the existing oracle diagnostic bound.
+
+The predeclared complete factorial ran on an EmpireAI H200 (`--device cuda`,
+`complete_factorial: true`, all 18 refiner cells, 9,728 regenerated
+`split=train` constellations for fitting, 3,072 official validation rows;
+181.6 s). Validation-byte selection chose `autoregressive`:
+
+| Candidate | Mean fixed bytes | Mean mode-1 bytes | Mean mode-2 bytes | Fraction of fixed | Serialized shared model |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Octree | 50.000 | 51.945 | 52.364 (min 47, max 54) | 1.047 | 14,332 B |
+| Autoregressive | 50.000 | 51.945 | 52.058 (min 50, max 55) | 1.041 | 13,088 B |
+
+**Gate G-A2 fails.** Neither shared context model beats the fixed-width
+stream; both sit at the sorted-delta mode-1 level, so the learned coder expands
+rather than compresses the 50-byte fixed stream and the 40-byte threshold is not
+approached. The reading is that eight lexicographically sorted 12-bit
+coordinates are close to incompressible for any causal model that must be shared
+across clouds: conditional on the shape prior the constellations are near-uniform
+on the lattice, and the 26.852-byte oracle diagnostic bound above is not
+reachable by a shared model. The declared paper stream therefore stays mode 0,
+and the rate lever established by Experiment 025 is coordinate precision, not
+entropy coding. The selected model hash is
+`3e5c1a19f96ee35d85d519ccc66bf6d2a92d858c4b6c5f199aee02b902377c22`
+(793,536 uncompressed shared bytes); the 13,088-byte NPZ file SHA-256 is
+`5fc9cf21a4fba3ff3a496f26022be947a38e1d0496da14e9d29d52742ac64d87`.
+All 3,072 mode-2 streams were at or above the oracle diagnostic bound. The
+earlier bounded single-cell smoke (256 rows, decoder seed 7, refiner seed 101)
+gave 52.344 / 52.070 bytes and is superseded by the factorial.
+
+It used the same official-row and stability-config hashes listed above. Re-run the
+bounded single-cell check with:
+
+```bash
+python scripts/resummarize_learned_entropy.py \
+  --config configs/experiment_020_official_stability.json \
+  --official-rows \
+    artifacts/local/experiment_020_official_stability/official_per_cloud.jsonl \
+  --device cpu \
+  --inference-batch-size 32 \
+  --max-refiner-cells 1 \
+  --model-output /tmp/experiment_019_learned_entropy_model_smoke.npz \
+  --output /tmp/experiment_019_validation_learned_entropy_smoke.json
+```
+
+Omit `--max-refiner-cells` for the predeclared complete factorial. The output
+then records `complete_factorial: true`; limited runs explicitly record
+`complete_factorial: false` and their cell count.
+
+## Reproduction
+
+The table was generated from `benchmark_metrics.json`, `per_cloud.jsonl`,
+`gpcc_per_cloud.jsonl`, and every corresponding `stream.bin` under the existing
+seed-7 artifact. The input hashes were:
+
+- `benchmark_metrics.json`: `aa2cc3ae080c45c762f38a40101869e794eae32fd0744fd3448e567d65505378`
+- `gpcc_per_cloud.jsonl`: `91c7ee753f39233cb617a237fe36a3a6f7aa7b6e19a02d7e7e67c29935ffe748`
+- `per_cloud.jsonl`: `a96cdba072bed3d8292fe06aadebb21f485cd4f2314f5840b55923a0e30f448a`
+
+Run the byte-exact re-summarizer without modifying the artifacts:
+
+```bash
+python scripts/resummarize_rate_accounting.py \
+  --experiment-dir artifacts/local/experiment_017_modelnet40_multiseed/seed_7 \
+  --amortize-parameter-sets-over 128 \
+  --output /tmp/experiment_017_seed7_rate_accounting.json
+```
+
+The output contains all 13 G-PCC rate points for both recorded splits, not only
+the validation-window rows shown above.

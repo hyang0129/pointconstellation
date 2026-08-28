@@ -1,0 +1,15 @@
+{
+  "source": "Experiment 019 stabilized decoder seed 7, refiner seed 101, validation cloud airplane_0641",
+  "split": "validation",
+  "bits": 12,
+  "lattice": [
+    [480, 2767, 2002],
+    [1114, 1969, 1729],
+    [1990, 3799, 1799],
+    [2160, 1425, 1663],
+    [2161, 364, 1661],
+    [2183, 2655, 1569],
+    [3135, 2114, 1877],
+    [3513, 2762, 2007]
+  ]
+}

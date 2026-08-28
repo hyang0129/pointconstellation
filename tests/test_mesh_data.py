@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import struct
 from pathlib import Path
 
 import numpy as np
@@ -8,15 +9,21 @@ import pytest
 
 from pointconstellation.data.mesh import (
     MeshSurfaceDataset,
+    TriangleMesh,
+    file_sha256,
+    filter_degenerate_faces,
     load_mesh,
     load_mesh_manifest,
     load_obj,
     load_off,
+    load_stl,
     normalize_mesh,
 )
 from pointconstellation.mesh_manifest import (
+    build_final_slice_manifest,
     create_modelnet40_manifest,
     create_pilot_manifest,
+    create_thingi10k_manifest,
     discover_modelnet40_meshes,
     split_modelnet40_categories,
 )
@@ -47,6 +54,10 @@ def test_obj_loading_normalization_and_surface_sampling_are_deterministic() -> N
     assert np.linalg.norm(first.source_points, axis=1).max() <= 1.0 + 1e-6
     assert np.allclose(np.linalg.norm(first.source_normals, axis=1), 1.0)
     assert np.allclose(np.linalg.norm(first.target_normals, axis=1), 1.0)
+    assert np.allclose(
+        first.original_source_points,
+        first.source_points * first.normalization_scale + first.normalization_center,
+    )
 
 
 def test_off_loader_triangulates_polygons_and_accepts_inline_counts(
@@ -83,6 +94,50 @@ def test_off_loader_rejects_out_of_range_indices(tmp_path: Path) -> None:
         load_off(path)
 
 
+def test_ascii_and_binary_stl_loading_filters_degenerate_faces(
+    tmp_path: Path,
+) -> None:
+    ascii_mesh = load_stl(FIXTURE_ROOT / "ascii_with_degenerate.stl")
+    binary_path = tmp_path / "triangle.stl"
+    binary_path.write_bytes(
+        b"binary fixture".ljust(80, b"\0")
+        + struct.pack("<I", 1)
+        + struct.pack(
+            "<12fH",
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0,
+        )
+    )
+    binary_mesh = load_mesh(binary_path)
+
+    assert ascii_mesh.faces.shape == (1, 3)
+    assert binary_mesh.faces.shape == (1, 3)
+    assert np.array_equal(ascii_mesh.vertices[:3], binary_mesh.vertices)
+
+
+def test_degenerate_face_filter_preserves_valid_face_indices() -> None:
+    mesh = TriangleMesh(
+        np.asarray([[0, 0, 0], [1, 0, 0], [0, 1, 0], [2, 0, 0]], dtype=np.float32),
+        np.asarray([[0, 1, 2], [0, 1, 3]], dtype=np.int64),
+    )
+
+    filtered = filter_degenerate_faces(mesh)
+
+    assert filtered.faces.tolist() == [[0, 1, 2]]
+    assert np.array_equal(filtered.vertices, mesh.vertices)
+
+
 def test_training_target_defaults_to_encoder_visible_source() -> None:
     pytest.importorskip("torch")
     source_target = MeshSurfaceDataset(
@@ -107,6 +162,31 @@ def test_training_target_defaults_to_encoder_visible_source() -> None:
     assert not independent_target["source_points"].equal(
         independent_target["target_points"]
     )
+
+
+@pytest.mark.parametrize("num_points", (1024, 4096))
+def test_experiment_038_mesh_roles_emit_requested_point_counts(
+    num_points: int,
+) -> None:
+    pytest.importorskip("torch")
+    dataset = MeshSurfaceDataset(
+        FIXTURE_ROOT,
+        FIXTURE_MANIFEST,
+        split="validation",
+        num_points=num_points,
+        seed=1517,
+        training_target="source",
+    )
+
+    sample = dataset[0]
+
+    assert sample["source_points"].shape == (num_points, 3)
+    assert sample["target_points"].shape == (num_points, 3)
+    assert sample["fresh_points"].shape == (num_points, 3)
+    assert sample["source_normals"].shape == (num_points, 3)
+    assert sample["fresh_normals"].shape == (num_points, 3)
+    assert sample["source_points"].equal(sample["target_points"])
+    assert not sample["source_points"].equal(sample["fresh_points"])
 
 
 def test_manifest_rejects_cross_split_identity(tmp_path: Path) -> None:
@@ -219,3 +299,146 @@ def test_modelnet_category_split_is_deterministic_and_disjoint() -> None:
     assert len(heldout) == 3
     assert set(train).isdisjoint(heldout)
     assert set(train) | set(heldout) == set(categories)
+
+
+def test_final_slice_manifest_excludes_prior_meshes_and_stratifies(
+    tmp_path: Path,
+) -> None:
+    categories = ("alpha", "beta", "gamma", "delta")
+    for category in categories:
+        _write_off(
+            tmp_path / "meshes" / category / "train" / f"{category}_train.off",
+            1.0,
+        )
+        for index in range(3):
+            _write_off(
+                tmp_path / "meshes" / category / "test" / f"{category}_{index:04d}.off",
+                float(index + 1),
+            )
+
+    discovered = discover_modelnet40_meshes(tmp_path / "meshes")
+    category_partition = {
+        "train": ["alpha", "beta"],
+        "heldout": ["delta", "gamma"],
+    }
+    input_paths = []
+    for manifest_index, selected_categories in enumerate(
+        (("alpha", "gamma"), ("beta", "delta"))
+    ):
+        records = [discovered["test"][category][0] for category in selected_categories]
+        path = tmp_path / f"input_{manifest_index}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "dataset": "ModelNet40",
+                    "categories": category_partition,
+                    "splits": {"used": records},
+                }
+            )
+        )
+        input_paths.append(path)
+
+    manifest = build_final_slice_manifest(
+        tmp_path / "meshes",
+        input_manifests=input_paths,
+        validation_cap_per_category=1,
+        minimum_ood_clouds=4,
+        seed=43,
+    )
+
+    excluded = {
+        (record["category"], record["model_id"])
+        for record in manifest["excluded_meshes"]
+    }
+    selected = {
+        (record["category"], record["model_id"])
+        for records in manifest["splits"].values()
+        for record in records
+    }
+    assert excluded == {
+        ("alpha", "alpha_0000"),
+        ("beta", "beta_0000"),
+        ("gamma", "gamma_0000"),
+        ("delta", "delta_0000"),
+    }
+    assert excluded.isdisjoint(selected)
+    assert [
+        record["category"] for record in manifest["splits"]["final_validation"]
+    ] == ["alpha", "beta"]
+    assert {
+        category: sum(
+            record["category"] == category for record in manifest["splits"]["final_ood"]
+        )
+        for category in ("delta", "gamma")
+    } == {"delta": 2, "gamma": 2}
+    assert manifest["input_manifests"] == [
+        {"path": path.as_posix(), "sha256": file_sha256(path)} for path in input_paths
+    ]
+
+
+def _write_ascii_stl(path: Path, triangles: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    facets = []
+    for index in range(triangles):
+        offset = 2 * index
+        facets.append(
+            "facet normal 0 0 1\n"
+            "outer loop\n"
+            f"vertex {offset} 0 0\n"
+            f"vertex {offset + 1} 0 0\n"
+            f"vertex {offset} 1 0\n"
+            "endloop\n"
+            "endfacet\n"
+        )
+    path.write_text("solid test\n" + "".join(facets) + "endsolid test\n")
+
+
+def test_thingi10k_manifest_is_stratified_licensed_and_disjoint(
+    tmp_path: Path,
+) -> None:
+    metadata = []
+    categories = ("alpha", "alpha", "beta", "beta", "beta", "omega", "omega")
+    for index, category in enumerate(categories):
+        file_id = str(10_000 + index)
+        _write_ascii_stl(tmp_path / "raw" / f"{file_id}.stl", 1 + index % 2)
+        metadata.append(
+            {
+                "file_id": file_id,
+                "category": category,
+                "license": f"license-{index}",
+                "closed": index % 2 == 0,
+                "num_components": 1,
+                "euler_characteristic": 2 if index % 3 else 0,
+            }
+        )
+    metadata_path = tmp_path / "metadata.json"
+    metadata_path.write_text(json.dumps(metadata))
+    options = {
+        "train_count": 2,
+        "calibration_count": 1,
+        "validation_count": 1,
+        "ood_count": 1,
+        "final_count": 1,
+        "minimum_faces": 1,
+        "heldout_categories": ("omega",),
+        "seed": 47,
+    }
+
+    first = create_thingi10k_manifest(tmp_path / "raw", metadata_path, **options)
+    repeated = create_thingi10k_manifest(tmp_path / "raw", metadata_path, **options)
+    records = [record for split in first["splits"].values() for record in split]
+
+    assert first == repeated
+    assert tuple(first["splits"]) == (
+        "train",
+        "calibration",
+        "validation",
+        "ood",
+        "final",
+    )
+    assert len({record["model_id"] for record in records}) == 6
+    assert all(record["license"].startswith("license-") for record in records)
+    assert all(record["manifest_role"] in first["splits"] for record in records)
+    assert first["splits"]["ood"][0]["category"] == "omega"
+    assert first["selection"]["stratification"] == ["size_proxy", "genus_proxy"]

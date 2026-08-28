@@ -6,6 +6,10 @@ This sprint is not the full ICLR/NeurIPS experimental program. It resolves the
 uncertainties most likely to invalidate or redirect the paper before expensive
 model and benchmark scaling.
 
+The [related-work table](related-work-table.md) records the adjacent mechanism,
+representation, decoder, and codec families that bound the paper claim and its
+required comparisons.
+
 The central candidate claim is that an unordered, quantized `K x 3` same-space
 latent can outperform ordinary point selection because semi-amortized recurrent
 inference finds decoder-useful geometric constellations. Experiment 005 supports
@@ -80,6 +84,12 @@ remain geometrically meaningful under exact quantization.
 surface metrics. If it exists only for Chamfer against `X_b`, reframe the method
 as learned sample completion/private coding rather than surface compression.
 
+Status: [Experiment 031](experiment-031-geometry-gate.md) implements the
+independent three-role sampler, analytic and feature-recall metrics, exact
+lattice perturbations, and the predeclared paired gate. Its smoke validates the
+execution contract. The full three-seed run remains pending, so Gate B has not
+yet been declared passed or failed.
+
 ## Work package C: external surface pilot
 
 Build a small, reproducible ShapeNetCore pilot from mesh surfaces rather than
@@ -153,6 +163,14 @@ codec by 29.90% (95% CI 23.26--35.77). Gate D nevertheless remains open:
 published entropy-coded learned codecs, a stabilized official D1/D2 pass, and
 the multi-rate common-test-condition comparison are still required.
 
+[Experiment 020](experiment-020-official-and-published-codec.md) completes the
+stabilized official-metric pass at the primary rate: validation improves by
+16.52% D1 and 34.65% D2, category OOD improves by 18.80% and 33.78%, and all
+six decoder marginals are positive. Its pinned `pcc_geo_cnn_v2` harness is
+implemented and its released five-rate one-cloud smoke is 35--176x above the
+50-byte rate. A fair retrained, statistically evaluated curve with overlapping
+rates remains the open part of Gate D.
+
 ## Work package E: inference headroom
 
 At the primary operating points, run multi-start per-cloud Adam/STE from FPS and
@@ -169,6 +187,12 @@ the recurrent refiner 6.3% above the bound on validation and 9.7% above it on
 category OOD. This suggests that decoder stabilization was the larger immediate
 failure, but it does not complete Gate E's multi-start, substantially budgeted
 headroom study.
+
+[Experiment 022](experiment-022-headroom.md) implements the full six-decoder,
+four-start, 16/64/256-evaluation study with exact 50-byte streams, fresh
+resampling, official D1/D2, paired uncertainty, and CPU/MPS timing. Its
+predeclared Pareto gate and headline fallback are fixed; full ModelNet40
+execution remains pending.
 
 ## Four-week schedule
 

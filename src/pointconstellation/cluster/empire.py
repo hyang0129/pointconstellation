@@ -9,12 +9,59 @@ import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
-PORT_MIN = 8800
-PORT_MAX = 8899
-MAX_RUNNING_JUPYTER = 4
+PORT_MIN = 8600
+PORT_MAX = 8699
+MAX_RUNNING_JUPYTER = 6
 MAX_TOTAL_JOBS = 6
 JUPYTER_JOB_RE = re.compile(r"^jupyter_[A-Za-z0-9_-]+_(\d+)$")
+
+
+def _job_port(name: str) -> int | None:
+    match = JUPYTER_JOB_RE.match(name)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def is_pointconstellation_job(name: str) -> bool:
+    """Return whether a job occupies the reserved Point Constellation namespace."""
+
+    port = _job_port(name)
+    return port is not None and PORT_MIN <= port <= PORT_MAX
+
+
+def pointconstellation_jobs(
+    jobs: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Keep only jobs in the reserved 86xx workstream."""
+
+    return [job for job in jobs if is_pointconstellation_job(job["name"])]
+
+
+def validate_logical_node(name: str, hostname: str, jupyter_url: str) -> int:
+    """Validate a registry row and return its reserved Jupyter port."""
+
+    parsed = urlsplit(jupyter_url)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"invalid Jupyter URL for node {name}: {jupyter_url}") from exc
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or port is None:
+        raise ValueError(f"invalid Jupyter URL for node {name}: {jupyter_url}")
+    if parsed.hostname != hostname:
+        raise ValueError(
+            f"logical node {name} URL host {parsed.hostname} differs from {hostname}"
+        )
+    if not PORT_MIN <= port <= PORT_MAX:
+        raise ValueError(
+            f"logical node {name} must use a Point Constellation 86xx port"
+        )
+    expected_name = f"{hostname}-{port}"
+    if name != expected_name:
+        raise ValueError(f"logical node name must be {expected_name}, received {name}")
+    return port
 
 
 @dataclass(frozen=True)
@@ -47,10 +94,9 @@ def parse_squeue_allocations(output: str) -> list[SlurmAllocation]:
             continue
         job_id, name, state, hostname = parts[:4]
         time_left = parts[4] if len(parts) > 4 else ""
-        match = JUPYTER_JOB_RE.match(name)
-        if state != "RUNNING" or match is None:
+        port = _job_port(name)
+        if state != "RUNNING" or port is None:
             continue
-        port = int(match.group(1))
         if not PORT_MIN <= port <= PORT_MAX:
             continue
         if not hostname or "[" in hostname or "," in hostname:
@@ -140,40 +186,35 @@ def parse_all_jobs(output: str) -> list[dict[str, str]]:
         parts = [part.strip() for part in raw_line.split("|")]
         if len(parts) >= 4:
             jobs.append(
-                dict(
-                    zip(
-                        ("job_id", "name", "state", "hostname"),
-                        parts[:4],
-                        strict=True,
-                    )
-                )
+                {
+                    "job_id": parts[0],
+                    "name": parts[1],
+                    "state": parts[2],
+                    "hostname": parts[3],
+                }
             )
     return jobs
 
 
 def validate_launch(jobs: list[dict[str, str]], port: int) -> None:
-    """Raise when HalluLens-derived allocation safety caps would be exceeded."""
+    """Enforce the six-allocation Point Constellation 86xx namespace."""
 
     if not PORT_MIN <= port <= PORT_MAX:
         raise ValueError(f"port must be between {PORT_MIN} and {PORT_MAX}")
-    running = [
-        job
-        for job in jobs
-        if job["state"] == "RUNNING" and job["name"].startswith("jupyter_")
-    ]
+    project_jobs = pointconstellation_jobs(jobs)
+    running = [job for job in project_jobs if job["state"] == "RUNNING"]
     if len(running) >= MAX_RUNNING_JUPYTER:
         raise RuntimeError(
             f"refusing launch: {len(running)} Jupyter jobs already running "
             f"(cap {MAX_RUNNING_JUPYTER})"
         )
-    if len(jobs) >= MAX_TOTAL_JOBS:
+    if len(project_jobs) >= MAX_TOTAL_JOBS:
         raise RuntimeError(
-            f"refusing launch: {len(jobs)} jobs already queued or running "
-            f"(cap {MAX_TOTAL_JOBS})"
+            f"refusing launch: {len(project_jobs)} Point Constellation jobs "
+            f"already queued or running (cap {MAX_TOTAL_JOBS})"
         )
     for job in running:
-        match = JUPYTER_JOB_RE.match(job["name"])
-        if match and int(match.group(1)) == port:
+        if _job_port(job["name"]) == port:
             raise RuntimeError(f"refusing launch: port {port} is already allocated")
 
 

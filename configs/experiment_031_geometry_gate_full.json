@@ -1,0 +1,39 @@
+{
+  "num_points": 256,
+  "constellation_size": 16,
+  "coordinate_bits": 12,
+  "train_samples": 448,
+  "validation_samples": 35,
+  "parameter_ood_samples": 35,
+  "batch_size": 7,
+  "model_seeds": [
+    7,
+    17,
+    29
+  ],
+  "data_seed": 31031,
+  "decoder_epochs": 12,
+  "refiner_epochs": 24,
+  "decoder_learning_rate": 0.001,
+  "refiner_learning_rate": 0.001,
+  "feature_width": 96,
+  "num_heads": 4,
+  "num_layers": 2,
+  "recurrent_steps": 8,
+  "responsibility_temperature": 0.2,
+  "maximum_update": 0.1,
+  "use_decoder_gradient": true,
+  "distance_chunk_size": 256,
+  "boundary_band": 0.1,
+  "recall_tolerance": 0.1,
+  "perturbation_bins": [
+    1,
+    2,
+    16,
+    64
+  ],
+  "bootstrap_samples": 10000,
+  "bootstrap_seed": 20260831,
+  "confidence_level": 0.95,
+  "output_dir": "artifacts/local/experiment_031_geometry_gate_full"
+}

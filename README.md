@@ -134,6 +134,32 @@ in the first local run and was lower for all seven procedural families. See the
 [matched FPS report](docs/experiment-001-fps-comparison.md) for the result and
 its important limitations.
 
+### Regenerate figures
+
+Rebuild the machine-readable registry, then regenerate the registry-backed
+selection, rate-distortion, utility, objective, representation, and BD-rate
+figures and tables:
+
+```bash
+.venv-train/bin/python -m pointconstellation.benchmark_registry --rebuild
+.venv-train/bin/python scripts/figures/fig1_selection_baselines.py
+.venv-train/bin/python scripts/figures/fig_rd_positioning.py
+.venv-train/bin/python scripts/figures/table1_headline.py
+.venv-train/bin/python scripts/figures/table_bd_rate.py
+.venv-train/bin/python scripts/figures/fig_rate_utility.py
+.venv-train/bin/python scripts/figures/fig_objective_pareto.py
+.venv-train/bin/python scripts/figures/table_representation.py
+```
+
+The Track B outputs use actual serialized bytes, preserve representation,
+objective, and evaluation-regime labels from the source artifacts, and report
+missing utility metrics explicitly rather than filling them from another arm.
+
+The RD figure contains only measured registry points. Hollow markers identify
+dominated measurements, and bands resample model seeds and paired clouds. The
+BD table prints `insufficient overlap` unless both curves have at least four
+measured points and a common integration interval; it does not extrapolate.
+
 The next fixed-rate control sweeps constellation size and precision:
 
 ```bash
@@ -300,6 +326,11 @@ a guarded Jupyter allocation launcher, live SLURM node discovery, remote
 Jupyter execution, GPU-aware dispatch, and job tracking. It assumes the local
 SSH alias `empire-ai`; keys and passwords stay outside Git.
 
+Point Constellation exclusively reserves the `86xx` Jupyter-port namespace and
+allows up to six logical allocations. Allocation identity is `hostname-port`,
+so shared physical GPU hosts do not merge workstreams. Compute must run through
+SLURM/Jupyter rather than direct GPU-node SSH.
+
 See the [EmpireAI guide](docs/empire-ai.md). No GPU allocation or training job
 is submitted automatically.
 
@@ -310,10 +341,18 @@ theory-backed, comprehensively benchmarked ICLR/NeurIPS-quality paper. The
 plane codec, fixed-rate ML baselines, rate sweeps, and refiner benchmarks are
 runnable. [Experiment 019](docs/experiment-019-stability.md) reports a stable
 six-decoder by three-refiner ModelNet40 result at one 50-byte operating point,
-including a positive internal learned-feature-codec comparison. Claims about
-competitive general-purpose compression performance have not been made: the
-published entropy-coded codec and common-test-condition comparisons remain
-open. The [paper benchmark epic](https://github.com/hyang0129/pointconstellation/issues/3)
+including a positive internal learned-feature-codec comparison.
+[Experiment 020](docs/experiment-020-official-and-published-codec.md) confirms
+that result with official D1/D2 and adds a pinned complete-codec harness for
+`pcc_geo_cnn_v2` on its native ModelNet occupancy grid. Claims about competitive
+general-purpose compression performance have not been made: the executed
+released-checkpoint smoke is at least 35x above the 50-byte rate, while the fair
+retrained curve and common-test-condition comparisons remain open. The
+[Experiment 034 placement diagnostic](docs/experiment-034-placement-analysis.md)
+adds reproducible category-consistency, occupancy-entropy, mesh-proxy, and
+headless qualitative analyses for the coordinate messages; its full ModelNet40
+run remains pending. The
+[paper benchmark epic](https://github.com/hyang0129/pointconstellation/issues/3)
 tracks the remaining evidence.
 
 ## License

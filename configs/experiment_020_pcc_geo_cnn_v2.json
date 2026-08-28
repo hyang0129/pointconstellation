@@ -1,0 +1,8 @@
+{
+  "codec_manifest": "configs/external/pcc_geo_cnn_v2_modelnet.json",
+  "stability_config": "configs/experiment_019_stability_modelnet40.json",
+  "pc_error_executable": "artifacts/tools/mpeg-pcc-dmetric/build/Release/pc_error",
+  "splits": ["validation", "ood"],
+  "max_clouds_per_split": null,
+  "output_dir": "artifacts/local/experiment_020_pcc_geo_cnn_v2"
+}

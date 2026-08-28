@@ -23,6 +23,7 @@ from pointconstellation.cluster.empire import (  # noqa: E402
     discover_allocations,
     expand_remote_path,
     sync_node_registry,
+    validate_logical_node,
 )
 from pointconstellation.cluster.jupyter import JupyterExecutor  # noqa: E402
 
@@ -77,6 +78,7 @@ def load_config(path: Path) -> tuple[dict[str, Any], list[Node]]:
     defaults = raw.get("defaults", {})
     nodes = []
     for entry in raw.get("nodes", []):
+        validate_logical_node(entry["name"], entry["hostname"], entry["jupyter_url"])
         nodes.append(
             Node(
                 name=entry["name"],

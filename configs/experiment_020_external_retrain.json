@@ -1,0 +1,39 @@
+{
+  "stability_config": "configs/experiment_019_stability_modelnet40.json",
+  "upstream_url": "https://github.com/mauriceqch/pcc_geo_cnn_v2.git",
+  "upstream_commit": "b7a4ae2a548ad3c44a04af139dd77d804cf3a6fa",
+  "workspace_root": "/mnt/home/hyang1/LLM_research/pointconstellation-external/pcc_geo_cnn_v2",
+  "upstream_subpath": "upstream-training-v2",
+  "environment_python_subpath": "env/bin/python",
+  "environment_manifest_subpath": "environment.json",
+  "training_root_subpath": "exact-retrain",
+  "expected_stability_manifest_sha256": "d44014dd2313b8815562cde9df2ba1927e1110fcfbc218428a7db39ef6b829ac",
+  "expected_dataset_archive_sha256": "f844433174b3843102adcc1b5de6417a9d6d748be94a24156b99843710a554aa",
+  "expected_dataset_manifest_sha256": "4808da615b332599a8f57c5d8f57de1ea9a5305d02f58920fea024b75d783ddb",
+  "checkout_diff_sha256": "419ac2ca018fd7402a5624c075b9b660d1af7ce2ee2bdd5bc66edb0241e11666",
+  "timeout_seconds": 172800.0,
+  "arms": [
+    {
+      "name": "native_q9_oct3",
+      "position_bits": 9,
+      "octree_level": 3,
+      "lambdas": ["1.00e-05"],
+      "max_steps": 100000,
+      "batch_size": 32,
+      "model_config": "c3p",
+      "alpha": 0.75,
+      "gamma": 2.0
+    },
+    {
+      "name": "low_rate_q6_global",
+      "position_bits": 6,
+      "octree_level": 0,
+      "lambdas": ["1.00e-05", "3.00e-06", "1.00e-06", "3.00e-07", "1.00e-07"],
+      "max_steps": 100000,
+      "batch_size": 32,
+      "model_config": "c3p",
+      "alpha": 0.75,
+      "gamma": 2.0
+    }
+  ]
+}

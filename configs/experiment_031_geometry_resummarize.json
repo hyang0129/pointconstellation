@@ -1,0 +1,18 @@
+{
+  "stability_config": "configs/experiment_019_stability_modelnet40.json",
+  "stability_artifact_dir": "artifacts/local/experiment_019_stability_modelnet40",
+  "selection_config": "configs/experiment_021_selection_baselines.json",
+  "selection_rows": "artifacts/local/experiment_021_selection_baselines/official_per_cloud.jsonl",
+  "headroom_rows": "artifacts/local/experiment_022_headroom_modelnet40/headroom_per_cloud.jsonl",
+  "dataset_root_override": null,
+  "dataset_manifest_override": null,
+  "splits": ["validation", "ood"],
+  "max_clouds_per_split": null,
+  "point_chunk_size": 256,
+  "triangle_chunk_size": 256,
+  "normal_neighbors": 12,
+  "bootstrap_samples": 2000,
+  "bootstrap_seed": 20260831,
+  "confidence_level": 0.95,
+  "output_dir": "artifacts/local/experiment_031_geometry_resummary"
+}

@@ -15,7 +15,7 @@ import hashlib
 import json
 import math
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -26,22 +26,37 @@ from torch import Tensor, nn
 from torch.utils.data import DataLoader, Dataset, Subset
 
 from pointconstellation.bitstream import (
+    HEADER,
+    MODE_ENTROPY,
+    MODE_FIXED,
+    MODE_LEARNED,
+    ConstellationPacket,
     decode_constellation,
     encode_constellation,
+    entropy_bound_bytes,
     expected_stream_bytes,
 )
 from pointconstellation.data import (
     MeshSurfaceDataset,
     ProceduralPointCloudDataset,
+    RawPointCloudDataset,
     file_sha256,
     load_mesh_manifest,
+    load_pointcloud_manifest,
+)
+from pointconstellation.learned_entropy import (
+    LearnedEntropyModel,
+    default_octree_model,
 )
 from pointconstellation.losses import pairwise_squared
+from pointconstellation.metrics import point_set_error_metrics
 from pointconstellation.models.bottleneck import VariableConstellationDecoder
 from pointconstellation.models.gradient_free import adam_ste_search
 from pointconstellation.models.refiner import CompetitiveConstellationRefiner
 from pointconstellation.quantization import quantize_ste
+from pointconstellation.rate_accounting import model_amortization
 from pointconstellation.refiner_experiment import _fps, _state_hash
+from pointconstellation.surface_metrics import mesh_surface_metrics
 from pointconstellation.train import select_device, set_seed
 
 ARMS = ("baseline", "stabilized")
@@ -58,6 +73,8 @@ class StabilityExperimentConfig:
     calibration_split: str = "train"
     mesh_ood_split: str = "category_ood"
     verify_mesh_hashes: bool = True
+    verify_pointcloud_hashes: bool = True
+    pointcloud_normal_neighbors: int = 16
     num_points: int = 2048
     constellation_size: int = 8
     training_constellation_sizes: tuple[int, ...] = (4, 8, 16, 32)
@@ -84,23 +101,35 @@ class StabilityExperimentConfig:
     maximum_update: float = 0.1
     use_decoder_gradient: bool = True
     distance_chunk_size: int = 256
+    compute_mesh_metrics: bool = False
+    mesh_metric_point_chunk_size: int = 256
+    mesh_metric_triangle_chunk_size: int = 256
+    mesh_normal_neighbors: int = 12
     adam_probe_evaluations: int = 16
     adam_probe_learning_rate: float = 0.03
     adam_probe_clouds_per_split: int = 16
     reference_feature_dir: str | None = None
     expected_manifest_sha256: str | None = None
+    decoder_source_artifact_dir: str | None = None
+    allow_single_seed: bool = False
     bootstrap_samples: int = 2_000
     bootstrap_seed: int = 20_260_816
     confidence_level: float = 0.95
     output_dir: str = "artifacts/local/experiment_019_stability"
 
     def __post_init__(self) -> None:
-        if self.dataset_kind not in {"procedural", "mesh_manifest"}:
-            raise ValueError("dataset_kind must be procedural or mesh_manifest")
-        if self.dataset_kind == "mesh_manifest" and (
+        if self.dataset_kind not in {
+            "procedural",
+            "mesh_manifest",
+            "pointcloud_manifest",
+        }:
+            raise ValueError(
+                "dataset_kind must be procedural, mesh_manifest, or pointcloud_manifest"
+            )
+        if self.dataset_kind in {"mesh_manifest", "pointcloud_manifest"} and (
             self.dataset_root is None or self.dataset_manifest is None
         ):
-            raise ValueError("mesh_manifest datasets require root and manifest")
+            raise ValueError("manifest datasets require root and manifest")
         # Keep checkpoint selection structurally unable to read a test split.
         if self.calibration_split not in {"train", "calibration"}:
             raise ValueError("calibration_split must be train or calibration")
@@ -108,6 +137,8 @@ class StabilityExperimentConfig:
             raise ValueError("procedural calibration must be held out from train")
         if self.num_points < 8:
             raise ValueError("num_points must be at least 8")
+        if self.pointcloud_normal_neighbors < 3:
+            raise ValueError("pointcloud_normal_neighbors must be at least 3")
         if not 2 <= self.constellation_size <= self.num_points:
             raise ValueError("constellation_size must be between 2 and num_points")
         if (
@@ -133,19 +164,30 @@ class StabilityExperimentConfig:
             self.stabilized_decoder_epochs,
             self.refiner_epochs,
             self.distance_chunk_size,
+            self.mesh_metric_point_chunk_size,
+            self.mesh_metric_triangle_chunk_size,
+            self.mesh_normal_neighbors,
         )
         if min(counts) < 1:
             raise ValueError("sample, batch, epoch, and chunk counts must be positive")
+        if self.mesh_normal_neighbors < 3:
+            raise ValueError("mesh_normal_neighbors must be at least three")
         if self.stabilized_decoder_epochs <= self.baseline_decoder_epochs:
             raise ValueError("stabilized decoder training must be longer than baseline")
-        if len(self.decoder_seeds) < 2 or len(set(self.decoder_seeds)) != len(
-            self.decoder_seeds
-        ):
-            raise ValueError("decoder_seeds must contain at least two unique seeds")
-        if len(self.refiner_seeds) < 2 or len(set(self.refiner_seeds)) != len(
-            self.refiner_seeds
-        ):
-            raise ValueError("refiner_seeds must contain at least two unique seeds")
+        minimum_seeds = 1 if self.allow_single_seed else 2
+        minimum_seed_label = "one" if self.allow_single_seed else "two"
+        if len(self.decoder_seeds) < minimum_seeds or len(
+            set(self.decoder_seeds)
+        ) != len(self.decoder_seeds):
+            raise ValueError(
+                f"decoder_seeds must contain at least {minimum_seed_label} unique seeds"
+            )
+        if len(self.refiner_seeds) < minimum_seeds or len(
+            set(self.refiner_seeds)
+        ) != len(self.refiner_seeds):
+            raise ValueError(
+                f"refiner_seeds must contain at least {minimum_seed_label} unique seeds"
+            )
         if self.feature_width < 4 or self.feature_width % self.num_heads:
             raise ValueError("feature_width must be divisible by num_heads")
         if self.num_layers < 1 or self.recurrent_steps < 1:
@@ -181,6 +223,37 @@ class StabilityExperimentConfig:
 DatasetMap = dict[str, Dataset[dict[str, Any]]]
 
 
+_ARTIFACT_CONFIG_DEFAULTS: dict[str, Any] = {
+    "verify_pointcloud_hashes": True,
+    "pointcloud_normal_neighbors": 16,
+    "compute_mesh_metrics": False,
+    "mesh_metric_point_chunk_size": 256,
+    "mesh_metric_triangle_chunk_size": 256,
+    "mesh_normal_neighbors": 12,
+    "decoder_source_artifact_dir": None,
+    "allow_single_seed": False,
+}
+
+
+def _normalized_config_record(values: Mapping[str, Any]) -> dict[str, Any]:
+    """Add defaults introduced after a stability artifact was written."""
+
+    normalized = json.loads(json.dumps(values))
+    for field, default in _ARTIFACT_CONFIG_DEFAULTS.items():
+        normalized.setdefault(field, default)
+    return normalized
+
+
+def stability_config_matches_artifact(
+    artifact_config: Mapping[str, Any], config: StabilityExperimentConfig
+) -> bool:
+    """Compare configs while accepting known absent default compatibility fields."""
+
+    return _normalized_config_record(artifact_config) == _normalized_config_record(
+        asdict(config)
+    )
+
+
 def _mesh_dataset(config: StabilityExperimentConfig, split: str) -> MeshSurfaceDataset:
     assert config.dataset_root is not None and config.dataset_manifest is not None
     return MeshSurfaceDataset(
@@ -191,6 +264,21 @@ def _mesh_dataset(config: StabilityExperimentConfig, split: str) -> MeshSurfaceD
         seed=config.data_seed,
         verify_hashes=config.verify_mesh_hashes,
         training_target="source",
+    )
+
+
+def _pointcloud_dataset(
+    config: StabilityExperimentConfig, split: str
+) -> RawPointCloudDataset:
+    assert config.dataset_root is not None and config.dataset_manifest is not None
+    return RawPointCloudDataset(
+        Path(config.dataset_root),
+        Path(config.dataset_manifest),
+        split=split,
+        num_points=config.num_points,
+        seed=config.data_seed,
+        normal_neighbors=config.pointcloud_normal_neighbors,
+        verify_hashes=config.verify_pointcloud_hashes,
     )
 
 
@@ -227,7 +315,10 @@ def _datasets(config: StabilityExperimentConfig) -> DatasetMap:
             ),
         }
 
-    train = _mesh_dataset(config, "train")
+    dataset_factory = (
+        _mesh_dataset if config.dataset_kind == "mesh_manifest" else _pointcloud_dataset
+    )
+    train = dataset_factory(config, "train")
     if config.calibration_split == "train":
         expected = config.train_samples + config.calibration_samples
         if len(train) != expected:
@@ -246,15 +337,15 @@ def _datasets(config: StabilityExperimentConfig) -> DatasetMap:
                 f"manifest train has {len(train)} records; expected "
                 f"{config.train_samples}"
             )
-        calibration = _mesh_dataset(config, "calibration")
+        calibration = dataset_factory(config, "calibration")
         training = train
         if len(calibration) != config.calibration_samples:
             raise ValueError(
                 f"manifest calibration has {len(calibration)} records; expected "
                 f"{config.calibration_samples}"
             )
-    validation = _mesh_dataset(config, "validation")
-    ood = _mesh_dataset(config, config.mesh_ood_split)
+    validation = dataset_factory(config, "validation")
+    ood = dataset_factory(config, config.mesh_ood_split)
     expected_evaluation = {
         "validation": (validation, config.validation_samples),
         "ood": (ood, config.ood_samples),
@@ -275,7 +366,7 @@ def _datasets(config: StabilityExperimentConfig) -> DatasetMap:
 def _membership_records(dataset: Dataset[dict[str, Any]]) -> list[str]:
     if isinstance(dataset, Subset):
         parent = dataset.dataset
-        if isinstance(parent, MeshSurfaceDataset):
+        if isinstance(parent, (MeshSurfaceDataset, RawPointCloudDataset)):
             return [
                 f"{parent.records[index]['category']}:"
                 f"{parent.records[index]['model_id']}"
@@ -283,7 +374,7 @@ def _membership_records(dataset: Dataset[dict[str, Any]]) -> list[str]:
             ]
         if isinstance(parent, ProceduralPointCloudDataset):
             return [f"{parent.split}:{index}" for index in dataset.indices]
-    if isinstance(dataset, MeshSurfaceDataset):
+    if isinstance(dataset, (MeshSurfaceDataset, RawPointCloudDataset)):
         return [
             f"{record['category']}:{record['model_id']}" for record in dataset.records
         ]
@@ -323,10 +414,14 @@ def _data_protocol(
         "all_partitions_pairwise_disjoint": all(disjoint.values()),
         "pairwise_disjoint": disjoint,
     }
-    if config.dataset_kind == "mesh_manifest":
+    if config.dataset_kind in {"mesh_manifest", "pointcloud_manifest"}:
         assert config.dataset_manifest is not None
         manifest_path = Path(config.dataset_manifest)
-        manifest = load_mesh_manifest(manifest_path)
+        manifest = (
+            load_mesh_manifest(manifest_path)
+            if config.dataset_kind == "mesh_manifest"
+            else load_pointcloud_manifest(manifest_path)
+        )
         manifest_sha256 = file_sha256(manifest_path)
         if (
             config.expected_manifest_sha256 is not None
@@ -339,34 +434,77 @@ def _data_protocol(
         calibration_records = manifest["splits"][config.calibration_split]
         validation_records = manifest["splits"]["validation"]
         ood_records = manifest["splits"][config.mesh_ood_split]
-        if any(
-            record.get("official_split") != "train"
-            for record in (*train_records, *calibration_records)
+        all_records = (
+            *train_records,
+            *calibration_records,
+            *validation_records,
+            *ood_records,
+        )
+        has_official_splits = any("official_split" in record for record in all_records)
+        if has_official_splits:
+            if any(
+                record.get("official_split") != "train"
+                for record in (*train_records, *calibration_records)
+            ):
+                raise ValueError(
+                    "train/calibration records must be official training data"
+                )
+            if any(
+                record.get("official_split") != "test"
+                for record in (*validation_records, *ood_records)
+            ):
+                raise ValueError("validation/OOD records must be official test data")
+        elif any(
+            record.get("manifest_role") != split
+            for split, records in (
+                ("train", train_records),
+                (config.calibration_split, calibration_records),
+                ("validation", validation_records),
+                (config.mesh_ood_split, ood_records),
+            )
+            for record in records
         ):
-            raise ValueError("train/calibration records must be official training data")
-        if any(
-            record.get("official_split") != "test"
-            for record in (*validation_records, *ood_records)
-        ):
-            raise ValueError("validation/OOD records must be official test data")
+            raise ValueError("manifest record role differs from its declared split")
         trained_categories = {record["category"] for record in train_records}
         calibration_categories = {record["category"] for record in calibration_records}
+        validation_categories = {record["category"] for record in validation_records}
         heldout_categories = {record["category"] for record in ood_records}
         if not calibration_categories <= trained_categories:
             raise ValueError("calibration includes a category absent from training")
-        if calibration_categories & heldout_categories:
-            raise ValueError("calibration includes a held-out OOD category")
+        if not validation_categories <= trained_categories:
+            raise ValueError("validation includes a category absent from training")
+        if (calibration_categories | validation_categories) & heldout_categories:
+            raise ValueError("an ID evaluation role includes a held-out OOD category")
         identity.update(
             {
                 "dataset": manifest["dataset"],
                 "manifest_sha256": manifest_sha256,
                 "mesh_ood_split": config.mesh_ood_split,
-                "verify_mesh_hashes": config.verify_mesh_hashes,
+                "verify_hashes": (
+                    config.verify_mesh_hashes
+                    if config.dataset_kind == "mesh_manifest"
+                    else config.verify_pointcloud_hashes
+                ),
+                "verify_mesh_hashes": (
+                    config.verify_mesh_hashes
+                    if config.dataset_kind == "mesh_manifest"
+                    else None
+                ),
+                "verify_pointcloud_hashes": (
+                    config.verify_pointcloud_hashes
+                    if config.dataset_kind == "pointcloud_manifest"
+                    else None
+                ),
                 "official_split_checks": {
-                    "train_and_calibration_are_official_train": True,
-                    "validation_and_ood_are_official_test": True,
+                    "applicable": has_official_splits,
+                    "train_and_calibration_are_official_train": has_official_splits,
+                    "validation_and_ood_are_official_test": has_official_splits,
                     "calibration_categories_exclude_heldout": True,
+                    "validation_categories_exclude_heldout": True,
                 },
+                "normals_estimated": manifest.get("sampling", {}).get(
+                    "normals_estimated", False
+                ),
             }
         )
     return identity
@@ -452,6 +590,41 @@ def _update_ema(ema: dict[str, Tensor], module: nn.Module, decay: float) -> None
                 ema[name].copy_(current)
 
 
+def _ema_calibration_candidate(
+    module: nn.Module,
+    ema: dict[str, Tensor],
+    *,
+    epoch: int,
+    calibration_score: Callable[[nn.Module], float],
+) -> tuple[dict[str, Tensor], dict[str, Any]]:
+    """Score an EMA state without changing the continuing raw training state."""
+
+    raw_state = _clone_state(module)
+    try:
+        module.load_state_dict(ema)
+        score = calibration_score(module)
+        candidate_state = _clone_state(module)
+        candidate_hash = _state_hash(module)
+    finally:
+        module.load_state_dict(raw_state)
+    return candidate_state, {
+        "epoch": epoch,
+        "kind": "ema",
+        "calibration_chamfer_rmse": score,
+        "state_hash": candidate_hash,
+    }
+
+
+def _calibration_candidate_is_better(
+    candidate: Mapping[str, Any], selected: Mapping[str, Any] | None
+) -> bool:
+    """Use the predeclared calibration objective with stable earliest-epoch ties."""
+
+    return selected is None or (
+        candidate["calibration_chamfer_rmse"] < selected["calibration_chamfer_rmse"]
+    )
+
+
 def _calibration_rmse(
     decoder: nn.Module,
     dataset: Dataset[dict[str, Any]],
@@ -469,7 +642,7 @@ def _calibration_rmse(
                 source, config.constellation_size, config.coordinate_bits
             )
             constellation, _, exact, lattice_exact = _serialized_coordinates(
-                constellation, config=config, mode="fps"
+                constellation, config=config
             )
             if not exact or not lattice_exact:
                 raise RuntimeError("calibration FPS bitstream round trip failed")
@@ -549,29 +722,22 @@ def _train_decoders(
             )
             record["baseline_calibration_chamfer_rmse"] = baseline_calibration_rmse
         if epoch > config.baseline_decoder_epochs:
-            raw_state = _clone_state(decoder)
-            decoder.load_state_dict(ema)
-            calibration_rmse = _calibration_rmse(
+            candidate_state, candidate = _ema_calibration_candidate(
                 decoder,
-                datasets["calibration"],
-                config=config,
-                device=device,
+                ema,
+                epoch=epoch,
+                calibration_score=lambda candidate_decoder: _calibration_rmse(
+                    candidate_decoder,
+                    datasets["calibration"],
+                    config=config,
+                    device=device,
+                ),
             )
-            candidate_state = _clone_state(decoder)
-            candidate_hash = _state_hash(decoder)
-            decoder.load_state_dict(raw_state)
-            candidate = {
-                "epoch": epoch,
-                "kind": "ema",
-                "calibration_chamfer_rmse": calibration_rmse,
-                "state_hash": candidate_hash,
-            }
             candidates.append(candidate)
-            record["ema_calibration_chamfer_rmse"] = calibration_rmse
-            if (
-                stabilized_choice is None
-                or calibration_rmse < stabilized_choice["calibration_chamfer_rmse"]
-            ):
+            record["ema_calibration_chamfer_rmse"] = candidate[
+                "calibration_chamfer_rmse"
+            ]
+            if _calibration_candidate_is_better(candidate, stabilized_choice):
                 stabilized_choice = candidate
                 stabilized_state = candidate_state
         history.append(record)
@@ -619,10 +785,31 @@ def _train_decoders(
             },
             checkpoint,
         )
+        deployment_files = {}
+        for precision, dtype in (("fp32", torch.float32), ("fp16", torch.float16)):
+            deployment_path = decoder_dir / arm / f"decoder_state_dict_{precision}.pt"
+            deployment_path.parent.mkdir(exist_ok=True)
+            torch.save(
+                {
+                    name: (
+                        value.detach().cpu().to(dtype)
+                        if value.is_floating_point()
+                        else value.detach().cpu()
+                    )
+                    for name, value in state.items()
+                },
+                deployment_path,
+            )
+            deployment_files[precision] = {
+                "path": str(deployment_path),
+                "bytes": deployment_path.stat().st_size,
+                "sha256": file_sha256(deployment_path),
+            }
         arm_records[arm] = {
             "state_hash": state_hash,
             "checkpoint": str(checkpoint),
             "selection": selection,
+            "decoder_state_dicts": deployment_files,
         }
     record = {
         "decoder_seed": decoder_seed,
@@ -661,6 +848,170 @@ def _train_decoders(
         + "\n"
     )
     return arm_states, record
+
+
+def _load_reused_decoders(
+    config: StabilityExperimentConfig,
+    datasets: DatasetMap,
+    *,
+    decoder_seed: int,
+    device: torch.device,
+) -> tuple[dict[str, dict[str, Tensor]], dict[str, Any]]:
+    """Load and verify decoder arms trained by a compatible stability run."""
+
+    if config.decoder_source_artifact_dir is None:
+        raise ValueError("decoder reuse requires decoder_source_artifact_dir")
+    source_dir = Path(config.decoder_source_artifact_dir)
+    metrics_path = source_dir / "stability_metrics.json"
+    if not metrics_path.is_file():
+        raise FileNotFoundError(f"decoder source metrics are absent: {metrics_path}")
+    source_metrics = json.loads(metrics_path.read_text())
+    if not source_metrics.get("factorial", {}).get("complete"):
+        raise RuntimeError("decoder source factorial is incomplete")
+    source_checks = source_metrics.get("contract_checks")
+    if not isinstance(source_checks, dict) or not all(source_checks.values()):
+        raise RuntimeError("decoder source scientific contract failed")
+
+    source_config = _normalized_config_record(source_metrics.get("config", {}))
+    target_config = _normalized_config_record(asdict(config))
+    allowed_differences = {
+        "allow_single_seed",
+        "constellation_size",
+        "decoder_source_artifact_dir",
+        "output_dir",
+    }
+    mismatches = {
+        key: (source_config.get(key), target_config.get(key))
+        for key in sorted(set(source_config) | set(target_config))
+        if key not in allowed_differences
+        and source_config.get(key) != target_config.get(key)
+    }
+    if mismatches:
+        raise RuntimeError(f"decoder source protocol differs: {mismatches}")
+    if config.constellation_size not in tuple(
+        source_config.get("training_constellation_sizes", ())
+    ):
+        raise RuntimeError("requested K was absent from decoder source training")
+    if decoder_seed not in tuple(source_config.get("decoder_seeds", ())):
+        raise RuntimeError("requested decoder seed is absent from decoder source")
+
+    source_records = {
+        int(record["decoder_seed"]): record
+        for record in source_metrics.get("decoder_records", ())
+    }
+    if decoder_seed not in source_records:
+        raise RuntimeError("decoder source record is absent")
+    source_record = source_records[decoder_seed]
+    source_arms = source_record.get("arms")
+    if not isinstance(source_arms, dict):
+        raise RuntimeError("decoder source arm records are absent")
+    selection_path = source_dir / "decoders" / f"seed_{decoder_seed}" / "selection.json"
+    selection = json.loads(selection_path.read_text())
+    calibration_sha256 = _membership(datasets["calibration"])["sha256"]
+    if selection.get("calibration_partition_sha256") != calibration_sha256:
+        raise RuntimeError("decoder source calibration membership differs")
+
+    decoder = _decoder(config, device)
+    states: dict[str, dict[str, Tensor]] = {}
+    arms: dict[str, dict[str, Any]] = {}
+    for arm in ARMS:
+        checkpoint_path = source_dir / "decoders" / f"seed_{decoder_seed}" / f"{arm}.pt"
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        if (
+            checkpoint.get("decoder_seed") != decoder_seed
+            or checkpoint.get("arm") != arm
+        ):
+            raise RuntimeError("decoder source checkpoint is assigned to another arm")
+        state = checkpoint["model"]
+        decoder.load_state_dict(state)
+        state_hash = _state_hash(decoder)
+        selected_hash = selection["arms"][arm]["state_hash"]
+        source_arm = source_arms.get(arm)
+        if not isinstance(source_arm, dict):
+            raise RuntimeError("decoder source arm record is absent")
+        if not (
+            state_hash
+            == selected_hash
+            == checkpoint.get("state_hash")
+            == checkpoint.get("selection", {}).get("selected_state_hash")
+            == source_arm.get("state_hash")
+            == source_arm.get("selection", {}).get("selected_state_hash")
+        ):
+            raise RuntimeError("decoder source checkpoint hash verification failed")
+        states[arm] = _clone_state(decoder)
+        deployment_files = source_arm.get("decoder_state_dicts")
+        if deployment_files is None:
+            deployment_files = {}
+            for precision, dtype in (("fp32", torch.float32), ("fp16", torch.float16)):
+                deployment_path = (
+                    Path(config.output_dir)
+                    / "decoders"
+                    / f"seed_{decoder_seed}"
+                    / arm
+                    / f"decoder_state_dict_{precision}.pt"
+                )
+                deployment_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {
+                        name: (
+                            value.detach().cpu().to(dtype)
+                            if value.is_floating_point()
+                            else value.detach().cpu()
+                        )
+                        for name, value in state.items()
+                    },
+                    deployment_path,
+                )
+                deployment_files[precision] = {
+                    "path": str(deployment_path),
+                    "bytes": deployment_path.stat().st_size,
+                    "sha256": file_sha256(deployment_path),
+                }
+        elif not isinstance(deployment_files, dict) or set(deployment_files) != {
+            "fp32",
+            "fp16",
+        }:
+            raise RuntimeError("decoder source deployment file records are invalid")
+        else:
+            for file_record in deployment_files.values():
+                if not isinstance(file_record, dict):
+                    raise RuntimeError(
+                        "decoder source deployment file record is invalid"
+                    )
+                deployment_path = Path(str(file_record.get("path", "")))
+                if (
+                    not deployment_path.is_file()
+                    or deployment_path.stat().st_size != file_record.get("bytes")
+                    or file_sha256(deployment_path) != file_record.get("sha256")
+                ):
+                    raise RuntimeError(
+                        "decoder source deployment file hash verification failed"
+                    )
+        arms[arm] = {
+            "state_hash": state_hash,
+            "checkpoint": str(checkpoint_path),
+            "checkpoint_sha256": file_sha256(checkpoint_path),
+            "selection": checkpoint["selection"],
+            "decoder_state_dicts": deployment_files,
+        }
+
+    return states, {
+        "decoder_seed": decoder_seed,
+        "history": source_record.get("history", []),
+        "ema_decay": source_record.get("ema_decay", config.ema_decay),
+        "stabilized_candidates": source_record.get("stabilized_candidates", []),
+        "arms": arms,
+        "elapsed_seconds": 0.0,
+        "reuse": {
+            "decoder_training_skipped": True,
+            "source_artifact_dir": str(source_dir),
+            "source_metrics_sha256": file_sha256(metrics_path),
+            "source_selection_sha256": file_sha256(selection_path),
+            "source_constellation_size": source_config["constellation_size"],
+            "requested_constellation_size": config.constellation_size,
+            "requested_k_seen_during_source_training": True,
+        },
+    }
 
 
 def _train_refiner(
@@ -754,6 +1105,7 @@ def _batch_metadata(batch: Mapping[str, Any], index: int) -> dict[str, Any]:
         "sample_id": int(item("sample_id", index)),
         "family": str(item("family", "unknown")),
         "model_id": str(item("model_id", item("sample_id", index))),
+        "normals_estimated": bool(item("normals_estimated", False)),
     }
 
 
@@ -761,43 +1113,114 @@ def _serialized_coordinates(
     coordinates: Tensor,
     *,
     config: StabilityExperimentConfig,
-    mode: str,
-) -> tuple[Tensor, list[int], bool, bool]:
+    mode: int | str = MODE_FIXED,
+    normalization_centers: Tensor | None = None,
+    normalization_scales: Tensor | None = None,
+) -> tuple[Tensor, list[ConstellationPacket], bool, bool]:
+    if (normalization_centers is None) != (normalization_scales is None):
+        raise ValueError("normalization centers and scales must be supplied together")
+    if normalization_centers is not None and len(normalization_centers) < len(
+        coordinates
+    ):
+        raise ValueError("normalization batch is smaller than the coordinate batch")
     decoded = []
-    byte_counts = []
+    packets = []
     exact = True
     lattice_exact = True
-    for row in coordinates.detach().cpu().numpy():
+    for index, row in enumerate(coordinates.detach().cpu().numpy()):
+        center = (
+            None
+            if normalization_centers is None
+            else normalization_centers[index].detach().cpu().numpy()
+        )
+        scale = (
+            None
+            if normalization_scales is None
+            else float(normalization_scales[index].item())
+        )
         stream = encode_constellation(
             row,
             bits=config.coordinate_bits,
             mode=mode,
             output_points=config.num_points,
+            normalization_center=center,
+            normalization_scale=scale,
         )
         packet = decode_constellation(stream)
         levels = (1 << packet.bits) - 1
-        lattice_values = (packet.coordinates + 1.0) * 0.5 * levels
+        lattice_values = (packet.normalized_coordinates + 1.0) * 0.5 * levels
         lattice_exact = lattice_exact and bool(
             np.all(np.abs(lattice_values - np.rint(lattice_values)) <= 1e-9)
         )
         exact = (
             exact
             and encode_constellation(
-                packet.coordinates,
+                packet.normalized_coordinates,
                 bits=packet.bits,
                 mode=packet.mode,
                 output_points=packet.output_points,
+                normalization_center=packet.normalization_center,
+                normalization_scale=packet.normalization_scale,
             )
             == stream
         )
-        decoded.append(torch.from_numpy(packet.coordinates).float())
-        byte_counts.append(packet.stream_bytes)
+        decoded.append(torch.from_numpy(packet.normalized_coordinates).float())
+        packets.append(packet)
     return (
         torch.stack(decoded).to(coordinates.device),
-        byte_counts,
+        packets,
         exact,
         lattice_exact,
     )
+
+
+def _entropy_rate_fields(
+    packet: ConstellationPacket,
+    *,
+    num_points: int,
+    learned_model: LearnedEntropyModel | None = None,
+) -> dict[str, float | int | str]:
+    """Return exact optional-stream rates without changing the declared packet."""
+
+    entropy_stream = encode_constellation(
+        packet.normalized_coordinates,
+        bits=packet.bits,
+        mode=MODE_ENTROPY,
+        output_points=packet.output_points,
+        normalization_center=packet.normalization_center,
+        normalization_scale=packet.normalization_scale,
+    )
+    entropy_packet = decode_constellation(entropy_stream)
+    if not np.array_equal(packet.coordinates, entropy_packet.coordinates):
+        raise RuntimeError("entropy stream changed the fixed-stream lattice")
+    model = learned_model or default_octree_model(packet.bits, len(packet.coordinates))
+    learned_stream = encode_constellation(
+        packet.normalized_coordinates,
+        bits=packet.bits,
+        mode=MODE_LEARNED,
+        output_points=packet.output_points,
+        normalization_center=packet.normalization_center,
+        normalization_scale=packet.normalization_scale,
+        learned_model=model,
+    )
+    learned_packet = decode_constellation(learned_stream, learned_model=model)
+    if not np.array_equal(packet.coordinates, learned_packet.coordinates):
+        raise RuntimeError("learned stream changed the fixed-stream lattice")
+    return {
+        "entropy_stream_bytes": len(entropy_stream),
+        "entropy_bpp": 8.0 * len(entropy_stream) / num_points,
+        "entropy_bound_bytes": entropy_bound_bytes(
+            packet.normalized_coordinates, bits=packet.bits
+        )
+        + packet.normalization_bytes,
+        "learned_stream_bytes": len(learned_stream),
+        "learned_bpp": 8.0 * len(learned_stream) / num_points,
+        "learned_model_candidate": model.config.candidate,
+        "learned_model_hash": model.model_hash,
+        "learned_shared_model_bytes": (
+            model.parameter_bytes if model.training_streams else 0
+        ),
+    }
 
 
 def _evaluate_pair(
@@ -818,6 +1241,8 @@ def _evaluate_pair(
         for batch in _loader(datasets[split], config=config, shuffle=False):
             source = _source(batch, device)
             fresh = _fresh_target(batch, source)
+            normalization_centers = batch.get("normalization_center")
+            normalization_scales = batch.get("normalization_scale")
             fps = _fps(source, config.constellation_size, config.coordinate_bits)
             refiner_coordinates = refiner(
                 source,
@@ -864,8 +1289,12 @@ def _evaluate_pair(
 
             for method, (coordinates, source_only_probe) in methods.items():
                 mode = "fps" if method == "fps" else "free"
-                decoded, stream_bytes, exact, lattice_exact = _serialized_coordinates(
-                    coordinates, config=config, mode=mode
+                decoded, packets, exact, lattice_exact = _serialized_coordinates(
+                    coordinates,
+                    config=config,
+                    mode=mode,
+                    normalization_centers=normalization_centers,
+                    normalization_scales=normalization_scales,
                 )
                 with torch.no_grad():
                     reconstruction = decoder(
@@ -880,9 +1309,39 @@ def _evaluate_pair(
                         reconstruction,
                         fresh[: len(decoded)],
                         chunk_size=config.distance_chunk_size,
-                    )
+                )
                 for index in range(len(decoded)):
                     metadata = _batch_metadata(batch, index)
+                    packet = packets[index]
+                    reconstruction_points = reconstruction[index].detach().cpu().numpy()
+                    source_points = source[index].detach().cpu().numpy()
+                    fresh_points = fresh[index].detach().cpu().numpy()
+                    source_tail = point_set_error_metrics(
+                        reconstruction_points,
+                        source_points,
+                        chunk_size=config.distance_chunk_size,
+                    )
+                    fresh_tail = point_set_error_metrics(
+                        reconstruction_points,
+                        fresh_points,
+                        chunk_size=config.distance_chunk_size,
+                    )
+                    continuous_surface: dict[str, float] = {}
+                    if config.compute_mesh_metrics:
+                        dataset = datasets[split]
+                        if not isinstance(dataset, MeshSurfaceDataset):
+                            raise ValueError(
+                                "compute_mesh_metrics requires a mesh manifest dataset"
+                            )
+                        continuous_surface = mesh_surface_metrics(
+                            reconstruction_points,
+                            dataset.mesh(metadata["sample_id"]),
+                            point_chunk_size=config.mesh_metric_point_chunk_size,
+                            triangle_chunk_size=(
+                                config.mesh_metric_triangle_chunk_size
+                            ),
+                            normal_neighbors=config.mesh_normal_neighbors,
+                        )
                     rows.append(
                         {
                             "arm": arm,
@@ -896,12 +1355,28 @@ def _evaluate_pair(
                             "method": method,
                             "constellation_size": config.constellation_size,
                             "coordinate_bits": config.coordinate_bits,
-                            "stream_bytes": stream_bytes[index],
-                            "actual_stream_bpp": 8.0
-                            * stream_bytes[index]
+                            "header_bytes": packet.header_bytes,
+                            "payload_bytes": packet.payload_bytes,
+                            "normalization_bytes": packet.normalization_bytes,
+                            "payload_bpp": 8.0
+                            * packet.payload_bytes
                             / config.num_points,
+                            "stream_bytes": packet.stream_bytes,
+                            "actual_stream_bpp": 8.0
+                            * packet.stream_bytes
+                            / config.num_points,
+                            **_entropy_rate_fields(
+                                packet, num_points=config.num_points
+                            ),
                             "chamfer_mse": float(source_losses[index].item()),
                             "fresh_chamfer_mse": float(fresh_losses[index].item()),
+                            "p90_euclidean": source_tail["p90_euclidean"],
+                            "p99_euclidean": source_tail["p99_euclidean"],
+                            "hausdorff": source_tail["hausdorff"],
+                            "fresh_p90_euclidean": fresh_tail["p90_euclidean"],
+                            "fresh_p99_euclidean": fresh_tail["p99_euclidean"],
+                            "fresh_hausdorff": fresh_tail["hausdorff"],
+                            **continuous_surface,
                             "source_only_optimization": source_only_probe,
                             "serialized_round_trip_exact": exact,
                             "coordinates_on_exact_lattice": lattice_exact,
@@ -940,10 +1415,35 @@ def _summaries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "split": split,
                 "method": method,
                 "clouds": len(group),
+                "header_bytes": float(np.mean([row["header_bytes"] for row in group])),
+                "payload_bytes": float(
+                    np.mean([row["payload_bytes"] for row in group])
+                ),
+                "normalization_bytes": float(
+                    np.mean([row.get("normalization_bytes", 0) for row in group])
+                ),
+                "stream_bytes": float(np.mean([row["stream_bytes"] for row in group])),
+                "actual_stream_bpp": float(
+                    np.mean([row["actual_stream_bpp"] for row in group])
+                ),
                 "chamfer_mse": mse,
                 "chamfer_rmse": math.sqrt(mse),
                 "fresh_chamfer_mse": fresh_mse,
                 "fresh_chamfer_rmse": math.sqrt(fresh_mse),
+                **{
+                    field: float(np.mean([item[field] for item in group]))
+                    for field in (
+                        "p90_euclidean",
+                        "p99_euclidean",
+                        "hausdorff",
+                        "fresh_p90_euclidean",
+                        "fresh_p99_euclidean",
+                        "fresh_hausdorff",
+                        "surface_rmse",
+                        "normal_consistency",
+                    )
+                    if all(field in item for item in group)
+                },
             }
         )
     fps = {
@@ -1014,6 +1514,33 @@ def _summaries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
+def _amortize_stability_summaries(
+    summaries: list[dict[str, Any]],
+    decoder_records: list[dict[str, Any]],
+    *,
+    input_points: int,
+) -> list[dict[str, Any]]:
+    model_bytes = {
+        (record["decoder_seed"], arm): {
+            precision: file_record["bytes"]
+            for precision, file_record in arm_record["decoder_state_dicts"].items()
+        }
+        for record in decoder_records
+        for arm, arm_record in record["arms"].items()
+    }
+    return [
+        {
+            **row,
+            **model_amortization(
+                row["stream_bytes"],
+                input_points,
+                model_bytes[(row["decoder_seed"], row["arm"])],
+            ),
+        }
+        for row in summaries
+    ]
+
+
 def _two_way_components(
     matrix: np.ndarray,
     *,
@@ -1077,6 +1604,18 @@ def _two_way_components(
 def _variance_components(
     summaries: list[dict[str, Any]], config: StabilityExperimentConfig
 ) -> list[dict[str, Any]]:
+    if len(config.decoder_seeds) < 2 or len(config.refiner_seeds) < 2:
+        return [
+            {
+                "status": "not_estimable_single_seed_smoke",
+                "reason": (
+                    "the crossed random-effects decomposition requires at least "
+                    "two decoder and two refiner seeds"
+                ),
+                "decoder_seeds": list(config.decoder_seeds),
+                "refiner_seeds": list(config.refiner_seeds),
+            }
+        ]
     indexed = {
         (
             row["arm"],
@@ -1375,10 +1914,12 @@ def _stability_gates(
             "with positive bootstrap lower bound, median no worse than -1%, and "
             ">=10% median FPS gain; OOD Q90 and FPS gain must remain positive"
         ),
+        "inferential_gate_eligible": not config.allow_single_seed,
         "primary": primary,
         "ood_primary": ood_primary,
         "overall_stability_gate_passes": bool(
-            primary["validation_material_thresholds_pass"]
+            not config.allow_single_seed
+            and primary["validation_material_thresholds_pass"]
             and ood_primary["q90_relative_rmse_reduction_percent"] > 0.0
             and ood_primary["median_decoder_level_improvement_over_fps_percent"] >= 10.0
         ),
@@ -1483,7 +2024,9 @@ def _feature_reference_comparison(
     reference_metrics = json.loads(metrics_path.read_text())
     reference_config = reference_metrics["config"]
     expected_bytes = expected_stream_bytes(
-        config.constellation_size, config.coordinate_bits
+        config.constellation_size,
+        config.coordinate_bits,
+        normalization=config.dataset_kind == "mesh_manifest",
     )
     protocol_checks = {
         "data_seed_matches": reference_config["data_seed"] == config.data_seed,
@@ -1496,7 +2039,12 @@ def _feature_reference_comparison(
         ),
     }
     if not all(protocol_checks.values()):
-        raise ValueError("feature reference protocol differs from Experiment 019")
+        return {
+            "status": "configured_reference_not_rate_matched",
+            "reference_dir": str(root),
+            "protocol_checks": protocol_checks,
+            "learned_codec_gate_passes": None,
+        }
 
     feature_seeds = tuple(
         int(path.parent.name.removeprefix("seed_")) for path in seed_paths
@@ -1543,7 +2091,23 @@ def _feature_reference_comparison(
                 and row["method"] == "feature_latent"
                 and row["constellation_size"] == config.constellation_size
             ]
-            if any(row["stream_bytes"] != expected_bytes for row in selected):
+            if any(
+                row["stream_bytes"]
+                + (
+                    0
+                    if "normalization_bytes" in row
+                    else (
+                        expected_stream_bytes(
+                            1, config.coordinate_bits, normalization=True
+                        )
+                        - expected_stream_bytes(1, config.coordinate_bits)
+                        if config.dataset_kind == "mesh_manifest"
+                        else 0
+                    )
+                )
+                != expected_bytes
+                for row in selected
+            ):
                 raise ValueError("feature reference stream size is not rate matched")
             indexed = {(row["family"], row["model_id"]): row for row in selected}
             if list(indexed) != cloud_keys and set(indexed) != set(cloud_keys):
@@ -1648,7 +2212,10 @@ def _arm_comparisons(
 
 
 def run_stability_experiment(
-    config: StabilityExperimentConfig, *, device_name: str = "auto"
+    config: StabilityExperimentConfig,
+    *,
+    device_name: str = "auto",
+    experiment_name: str = "019_decoder_refiner_stability_decomposition",
 ) -> dict[str, Any]:
     """Execute the complete decoder-arm by decoder/refiner-seed factorial."""
 
@@ -1665,13 +2232,21 @@ def run_stability_experiment(
     pair_records = []
     all_rows: list[dict[str, Any]] = []
     for decoder_seed in config.decoder_seeds:
-        arm_states, decoder_record = _train_decoders(
-            config,
-            datasets,
-            decoder_seed=decoder_seed,
-            device=device,
-            output_dir=output_dir,
-        )
+        if config.decoder_source_artifact_dir is None:
+            arm_states, decoder_record = _train_decoders(
+                config,
+                datasets,
+                decoder_seed=decoder_seed,
+                device=device,
+                output_dir=output_dir,
+            )
+        else:
+            arm_states, decoder_record = _load_reused_decoders(
+                config,
+                datasets,
+                decoder_seed=decoder_seed,
+                device=device,
+            )
         decoder_records.append(decoder_record)
         for arm in ARMS:
             for refiner_seed in config.refiner_seeds:
@@ -1744,7 +2319,9 @@ def run_stability_experiment(
                     flush=True,
                 )
 
-    summaries = _summaries(all_rows)
+    summaries = _amortize_stability_summaries(
+        _summaries(all_rows), decoder_records, input_points=config.num_points
+    )
     initial_hashes_matched = all(
         len(
             {
@@ -1768,15 +2345,25 @@ def run_stability_experiment(
         for refiner_seed in config.refiner_seeds
     )
     result = {
-        "experiment": "019_decoder_refiner_stability_decomposition",
+        "experiment": experiment_name,
         "config": asdict(config),
         "device": str(device),
         "scientific_contract": {
-            "message": "unordered quantized K x 3 coordinates only",
+            "learned_message": "unordered quantized K x 3 coordinates only",
+            "per_object_side_information": (
+                "8-byte binary16 center/scale normalization"
+                if config.dataset_kind == "mesh_manifest"
+                else "none"
+            ),
             "source_only_encoder_feedback": True,
             "actual_bitstream_round_trip": True,
             "decoder_frozen_during_refiner_and_adam": True,
             "calibration_excludes_validation_and_ood": True,
+            "decoder_training": (
+                "verified_reuse_from_variable_cardinality_source"
+                if config.decoder_source_artifact_dir is not None
+                else "trained_for_this_num_points"
+            ),
         },
         "data_protocol": data_protocol,
         "factorial": {
@@ -1821,9 +2408,39 @@ def run_stability_experiment(
             "all_stream_sizes_match_declared_rate": all(
                 row["stream_bytes"]
                 == expected_stream_bytes(
-                    config.constellation_size, config.coordinate_bits
+                    config.constellation_size,
+                    config.coordinate_bits,
+                    normalization=config.dataset_kind == "mesh_manifest",
                 )
                 for row in all_rows
+            ),
+            "all_entropy_stream_rates_present": all(
+                row["entropy_stream_bytes"] >= HEADER.size + 1
+                and row["entropy_bpp"]
+                == 8.0 * row["entropy_stream_bytes"] / config.num_points
+                and row["entropy_bound_bytes"] <= row["entropy_stream_bytes"]
+                for row in all_rows
+            ),
+            "all_learned_stream_rates_present": all(
+                row["learned_stream_bytes"] >= HEADER.size + 5
+                and row["learned_bpp"]
+                == 8.0 * row["learned_stream_bytes"] / config.num_points
+                and row["learned_shared_model_bytes"] >= 0
+                for row in all_rows
+            ),
+            "all_header_payload_splits_exact": all(
+                row["header_bytes"]
+                + row["payload_bytes"]
+                + row.get("normalization_bytes", 0)
+                == row["stream_bytes"]
+                for row in all_rows
+            ),
+            "reused_decoder_source_verified": bool(
+                config.decoder_source_artifact_dir is None
+                or all(
+                    record.get("reuse", {}).get("decoder_training_skipped") is True
+                    for record in decoder_records
+                )
             ),
         },
         "per_cloud": all_rows,
@@ -1847,13 +2464,15 @@ def reaggregate_stability_result(config: StabilityExperimentConfig) -> dict[str,
             f"completed stability metrics are absent: {metrics_path}"
         )
     result = json.loads(metrics_path.read_text())
-    expected_config = json.loads(json.dumps(asdict(config)))
-    if result.get("config") != expected_config:
+    expected_config = _normalized_config_record(asdict(config))
+    if _normalized_config_record(result.get("config", {})) != expected_config:
         raise ValueError("completed result config does not match aggregate-only config")
     if not result.get("factorial", {}).get("complete"):
         raise ValueError("cannot aggregate an incomplete factorial result")
     rows = result["per_cloud"]
-    summaries = _summaries(rows)
+    summaries = _amortize_stability_summaries(
+        _summaries(rows), result["decoder_records"], input_points=config.num_points
+    )
     started = time.perf_counter()
     result.update(
         {
