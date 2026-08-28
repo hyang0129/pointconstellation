@@ -675,6 +675,8 @@ def _synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
     elif device.type == "mps":
         torch.mps.synchronize()
+    elif device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 def _evaluate_method(

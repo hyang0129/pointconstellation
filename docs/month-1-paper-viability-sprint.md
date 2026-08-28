@@ -182,6 +182,12 @@ category OOD. This suggests that decoder stabilization was the larger immediate
 failure, but it does not complete Gate E's multi-start, substantially budgeted
 headroom study.
 
+[Experiment 022](experiment-022-headroom.md) implements the full six-decoder,
+four-start, 16/64/256-evaluation study with exact 50-byte streams, fresh
+resampling, official D1/D2, paired uncertainty, and CPU/MPS timing. Its
+predeclared Pareto gate and headline fallback are fixed; full ModelNet40
+execution remains pending.
+
 ## Four-week schedule
 
 ### Week 1: freeze protocol and replicate
