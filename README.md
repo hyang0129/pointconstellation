@@ -137,12 +137,15 @@ its important limitations.
 ### Regenerate figures
 
 Rebuild the machine-readable registry, then regenerate the registry-backed
+selection, rate-distortion, utility, objective, representation, and BD-rate
 figures and tables:
 
 ```bash
 .venv-train/bin/python -m pointconstellation.benchmark_registry --rebuild
 .venv-train/bin/python scripts/figures/fig1_selection_baselines.py
+.venv-train/bin/python scripts/figures/fig_rd_positioning.py
 .venv-train/bin/python scripts/figures/table1_headline.py
+.venv-train/bin/python scripts/figures/table_bd_rate.py
 .venv-train/bin/python scripts/figures/fig_rate_utility.py
 .venv-train/bin/python scripts/figures/fig_objective_pareto.py
 .venv-train/bin/python scripts/figures/table_representation.py
@@ -151,6 +154,11 @@ figures and tables:
 The Track B outputs use actual serialized bytes, preserve representation,
 objective, and evaluation-regime labels from the source artifacts, and report
 missing utility metrics explicitly rather than filling them from another arm.
+
+The RD figure contains only measured registry points. Hollow markers identify
+dominated measurements, and bands resample model seeds and paired clouds. The
+BD table prints `insufficient overlap` unless both curves have at least four
+measured points and a common integration interval; it does not extrapolate.
 
 The next fixed-rate control sweeps constellation size and precision:
 
