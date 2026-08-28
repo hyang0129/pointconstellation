@@ -1,0 +1,43 @@
+{
+  "regimes": [
+    {
+      "name": "k2_n16",
+      "num_points": 16,
+      "constellation_size": 2,
+      "stability_config": "configs/experiment_019_stability_smoke.json",
+      "stability_artifact_dir": "artifacts/local/experiment_019_stability_smoke"
+    }
+  ],
+  "pc_error_executable": "artifacts/tools/mpeg-pcc-dmetric/build/Release/pc_error",
+  "objectives": ["chamfer", "point_to_plane", "feature_matching", "mixed"],
+  "required_coordinate_bits": 8,
+  "position_bits": 8,
+  "timeout_seconds": 120.0,
+  "decoder_seeds": [1901, 1903],
+  "start_methods": ["fps"],
+  "decoder_evaluation_budget": 2,
+  "adam_learning_rate": 0.03,
+  "mixed_chamfer_weight": 0.5,
+  "normal_neighbors": 4,
+  "normal_chunk_size": 8,
+  "selection_seed": 20260833,
+  "splits": ["validation"],
+  "max_clouds_per_split": 2,
+  "batch_size": 2,
+  "classifier_regime": "k2_n16",
+  "classifier_checkpoint": null,
+  "expected_classifier_sha256": null,
+  "classifier_seed": 20260846,
+  "classifier_epochs": 1,
+  "classifier_learning_rate": 0.001,
+  "classifier_feature_width": 8,
+  "classifier_feature_dim": 8,
+  "bootstrap_samples": 100,
+  "bootstrap_seed": 20260833,
+  "confidence_level": 0.95,
+  "gate_accuracy_delta": 0.0,
+  "gate_max_d1_d2_regression_percent": 2.0,
+  "gate_min_source_accuracy": 0.0,
+  "gate_min_regimes": 1,
+  "output_dir": "artifacts/local/experiment_033_objective_sweep_smoke"
+}
