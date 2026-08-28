@@ -283,6 +283,7 @@ class BenchmarkCloud:
     point_labels: NDArray[np.uint8]
     cloud_label: int
     removed_count: int
+    domain_scale_factor: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -315,6 +316,7 @@ class ScoredCloud:
     defect_type: str
     size_stratum: str
     declared_fraction: float
+    domain_scale_factor: float
     cloud_label: int
     arm: str
     payload_budget_bytes: int | None
@@ -826,6 +828,7 @@ def _load_raw_clouds(
                     defect_type="none",
                     size_stratum="control",
                     declared_fraction=0.0,
+                    domain_scale_factor=control.domain_scale_factor,
                     points=control.points,
                     point_labels=control.point_labels,
                     cloud_label=0,
@@ -849,6 +852,7 @@ def _load_raw_clouds(
                         defect_type=defect.defect_type,
                         size_stratum=size_stratum(defect.declared_fraction),
                         declared_fraction=defect.declared_fraction,
+                        domain_scale_factor=defect.domain_scale_factor,
                         points=defect.points,
                         point_labels=defect.point_labels,
                         cloud_label=1,
@@ -856,6 +860,7 @@ def _load_raw_clouds(
                     )
                 )
     flat = [value for rows in memberships.values() for value in rows]
+    defect_samples = [sample for sample in samples if sample.cloud_label == 1]
     return (
         normal_training,
         samples,
@@ -872,6 +877,17 @@ def _load_raw_clouds(
                 for split, rows in memberships.items()
             },
             "identities_unique": len(flat) == len(set(flat)),
+            "defect_domain_policy": {
+                "declared_domain": [-1.0, 1.0],
+                "policy": "uniform_displacement_attenuation_without_clipping",
+                "attenuated_conditions": sum(
+                    sample.domain_scale_factor < 1.0 for sample in defect_samples
+                ),
+                "minimum_domain_scale_factor": min(
+                    (sample.domain_scale_factor for sample in defect_samples),
+                    default=1.0,
+                ),
+            },
         },
     )
 
@@ -884,6 +900,7 @@ def _decode_samples(
     exact_matches = []
     within_tolerance = []
     accounting_checks = []
+    codec_inputs_match_raw = []
     for sample in samples:
         decoded.append(
             DecodedCloud(
@@ -904,7 +921,9 @@ def _decode_samples(
         )
         exact_streams: dict[int, dict[str, bytes]] = {}
         for arm in arms:
-            stream = arm.codec.encode(sample.points.copy())
+            codec_source = sample.points.copy()
+            codec_inputs_match_raw.append(np.array_equal(codec_source, sample.points))
+            stream = arm.codec.encode(codec_source)
             if not isinstance(stream, bytes) or not stream:
                 raise TypeError("codec encode must return nonempty bytes")
             actual_bytes = len(stream)
@@ -970,6 +989,7 @@ def _decode_samples(
         "all_exact_arms_match_target_bytes": all(exact_matches),
         "all_nearest_rate_arms_within_declared_tolerance": all(within_tolerance),
         "all_declared_codec_byte_accounting_is_consistent": all(accounting_checks),
+        "all_codec_inputs_equal_raw_input_coordinates": all(codec_inputs_match_raw),
     }
 
 
@@ -1003,6 +1023,7 @@ def _score_decodes(
                     defect_type=row.sample.defect_type,
                     size_stratum=row.sample.size_stratum,
                     declared_fraction=row.sample.declared_fraction,
+                    domain_scale_factor=row.sample.domain_scale_factor,
                     cloud_label=row.sample.cloud_label,
                     arm=row.arm,
                     payload_budget_bytes=row.payload_budget_bytes,
@@ -1421,6 +1442,10 @@ def run_defect_anomaly_benchmark(
             or config.minimum_defect_fraction
             <= row.declared_fraction
             <= config.maximum_defect_fraction
+            for row in samples
+        ),
+        "all_injected_clouds_respect_declared_codec_domain": all(
+            np.all(row.points >= -1.0) and np.all(row.points <= 1.0)
             for row in samples
         ),
         "nearest_target_point_label_transfer_is_explicit": True,

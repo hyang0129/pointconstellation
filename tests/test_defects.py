@@ -143,6 +143,14 @@ def test_undefected_control_is_an_exact_copy() -> None:
     assert result.defect_type == "none"
 
 
+def test_injection_rejects_source_outside_declared_codec_domain() -> None:
+    points, normals = _sphere(128)
+    points[0, 0] = 1.001
+
+    with pytest.raises(ValueError, match="defect source points.*codec domain"):
+        inject_defect(points, "bump", seed=61, normals=normals)
+
+
 def test_nearest_sample_label_transfer_handles_changed_cardinality() -> None:
     reference = np.asarray(
         [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],

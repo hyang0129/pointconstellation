@@ -38,6 +38,79 @@ def _sphere(count: int = 512) -> tuple[np.ndarray, np.ndarray]:
     return (0.7 * normals).astype(np.float32), normals.astype(np.float32)
 
 
+def _near_boundary_planes(side: int = 12) -> tuple[np.ndarray, np.ndarray]:
+    first, second = np.meshgrid(
+        np.linspace(-0.25, 0.25, side),
+        np.linspace(-0.25, 0.25, side),
+    )
+    positive = np.column_stack(
+        (np.full(first.size, 0.995), first.ravel(), second.ravel())
+    )
+    negative = positive.copy()
+    negative[:, 0] = -0.995
+    points = np.concatenate((positive, negative)).astype(np.float32)
+    normals = np.zeros_like(points)
+    normals[:, 0] = np.sign(points[:, 0])
+    return points, normals
+
+
+def _install_fake_real_provider_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeProviderState:
+        def __init__(self, config, experiment_040, *, device_name):
+            del config, device_name
+            self.experiment_040 = experiment_040
+
+        def search(self, source, *, size, bits):
+            del bits
+            return np.asarray(source[:size], dtype=np.float64)
+
+        def decode(self, coordinates, output_points):
+            repeats = int(np.ceil(output_points / len(coordinates)))
+            return np.tile(coordinates, (repeats, 1))[:output_points]
+
+        def base_decode(self, source, *, size, bits):
+            return self.decode(self.search(source, size=size, bits=bits), len(source))
+
+        def score(self, source, **kwargs):
+            method = kwargs["method"]
+            offset = 1.0 if method == "random" else 0.0
+            return np.arange(len(source), dtype=np.float64) + offset
+
+    class FakeGpccFrontier:
+        def __init__(self, config, experiment_040):
+            del config, experiment_040
+            self.sources = {}
+            self.metadata_rows = {}
+
+        def encode(self, source, *, payload_budget, target_bytes):
+            stream = payload_budget.to_bytes(2, "big") + bytes(target_bytes + 1)
+            self.sources[stream] = np.asarray(source, dtype=np.float32).copy()
+            payload_bytes = payload_budget + 1
+            self.metadata_rows[(stream, payload_budget)] = {
+                "codec_header_bytes": len(stream) - payload_bytes,
+                "codec_payload_bytes": payload_bytes,
+                "payload_byte_delta": 1,
+                "complete_stream_byte_delta": len(stream) - target_bytes,
+                "codec_rate_point": "fake_nearest",
+            }
+            return stream
+
+        def decode(self, stream):
+            return self.sources[stream].copy()
+
+        def metadata(self, stream, *, payload_budget):
+            return self.metadata_rows[(stream, payload_budget)]
+
+    monkeypatch.setattr(
+        "pointconstellation.exp040_defect_codecs._ProviderState", FakeProviderState
+    )
+    monkeypatch.setattr(
+        "pointconstellation.exp040_defect_codecs._GpccFrontier", FakeGpccFrontier
+    )
+
+
 def test_nonlearned_scorer_exceeds_raw_smoke_auroc() -> None:
     normal, normals = _sphere()
     scorer = KNNNormalManifoldScorer(
@@ -144,58 +217,7 @@ def test_real_provider_arms_declare_consistent_bytes(
 ) -> None:
     from pointconstellation.exp040_defect_codecs import build_codec_arms
 
-    class FakeProviderState:
-        def __init__(self, config, experiment_040, *, device_name):
-            del config, device_name
-            self.experiment_040 = experiment_040
-
-        def search(self, source, *, size, bits):
-            del bits
-            return np.asarray(source[:size], dtype=np.float64)
-
-        def decode(self, coordinates, output_points):
-            repeats = int(np.ceil(output_points / len(coordinates)))
-            return np.tile(coordinates, (repeats, 1))[:output_points]
-
-        def base_decode(self, source, *, size, bits):
-            return self.decode(self.search(source, size=size, bits=bits), len(source))
-
-        def score(self, source, **kwargs):
-            method = kwargs["method"]
-            offset = 1.0 if method == "random" else 0.0
-            return np.arange(len(source), dtype=np.float64) + offset
-
-    class FakeGpccFrontier:
-        def __init__(self, config, experiment_040):
-            del config, experiment_040
-            self.sources = {}
-            self.metadata_rows = {}
-
-        def encode(self, source, *, payload_budget, target_bytes):
-            stream = payload_budget.to_bytes(2, "big") + bytes(target_bytes + 1)
-            self.sources[stream] = np.asarray(source, dtype=np.float32).copy()
-            payload_bytes = payload_budget + 1
-            self.metadata_rows[(stream, payload_budget)] = {
-                "codec_header_bytes": len(stream) - payload_bytes,
-                "codec_payload_bytes": payload_bytes,
-                "payload_byte_delta": 1,
-                "complete_stream_byte_delta": len(stream) - target_bytes,
-                "codec_rate_point": "fake_nearest",
-            }
-            return stream
-
-        def decode(self, stream):
-            return self.sources[stream].copy()
-
-        def metadata(self, stream, *, payload_budget):
-            return self.metadata_rows[(stream, payload_budget)]
-
-    monkeypatch.setattr(
-        "pointconstellation.exp040_defect_codecs._ProviderState", FakeProviderState
-    )
-    monkeypatch.setattr(
-        "pointconstellation.exp040_defect_codecs._GpccFrontier", FakeGpccFrontier
-    )
+    _install_fake_real_provider_dependencies(monkeypatch)
     config = DefectAnomalyBenchmarkConfig.from_json(
         Path("configs/experiment_041_defect_anomaly_smoke.json")
     )
@@ -216,6 +238,89 @@ def test_real_provider_arms_declare_consistent_bytes(
         if arm.name != config.gpcc_arm:
             assert len(stream) == arm.target_bytes
         assert arm.codec.decode(stream).shape[1] == 3
+
+
+def test_boundary_defects_round_trip_through_every_real_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pointconstellation.exp040_defect_codecs import build_codec_arms
+
+    _install_fake_real_provider_dependencies(monkeypatch)
+    config = DefectAnomalyBenchmarkConfig.from_json(
+        Path("configs/experiment_041_defect_anomaly_smoke.json")
+    )
+    config = replace(config, payload_budgets=(40,), primary_payload_budget=40)
+    provider_arms = build_codec_arms(config=config, device_name="cpu")
+
+    class CapturingCodec:
+        def __init__(self, codec):
+            self.codec = codec
+            self.sources = []
+
+        def encode(self, source):
+            self.sources.append(np.asarray(source, dtype=np.float32).copy())
+            return self.codec.encode(source)
+
+        def decode(self, stream):
+            return self.codec.decode(stream)
+
+        def rate_metadata(self, stream):
+            return self.codec.rate_metadata(stream)
+
+    captures = []
+    arms = []
+    for arm in provider_arms:
+        capture = CapturingCodec(arm.codec)
+        captures.append(capture)
+        arms.append(replace(arm, codec=capture))
+
+    points, normals = _near_boundary_planes()
+    samples = []
+    injected = []
+    for index, defect_type in enumerate(DEFECT_TYPES):
+        defect = inject_defect(
+            points,
+            defect_type,
+            seed=100 + index,
+            fraction=0.03,
+            normals=normals,
+        )
+        injected.append(defect)
+        samples.append(
+            BenchmarkCloud(
+                split="validation",
+                cloud_id=f"boundary:{defect_type}",
+                category="boundary_fixture",
+                defect_type=defect_type,
+                size_stratum="medium_2_4pct",
+                declared_fraction=defect.declared_fraction,
+                points=defect.points,
+                point_labels=defect.point_labels,
+                cloud_label=1,
+                removed_count=defect.removed_count,
+                domain_scale_factor=defect.domain_scale_factor,
+            )
+        )
+
+    decoded, checks = _decode_samples(samples, arms)
+
+    assert all(checks.values())
+    assert all(
+        len(result.point_labels) == len(result.points)
+        and np.all(result.points >= -1.0)
+        and np.all(result.points <= 1.0)
+        for result in injected
+    )
+    assert any(result.domain_scale_factor < 1.0 for result in injected)
+    for capture in captures:
+        assert len(capture.sources) == len(samples)
+        for source, sample in zip(capture.sources, samples, strict=True):
+            assert np.array_equal(source, sample.points)
+    raw_rows = [row for row in decoded if row.arm == "raw"]
+    assert len(raw_rows) == len(samples)
+    for row, sample in zip(raw_rows, samples, strict=True):
+        assert np.array_equal(row.decoded_points, sample.points)
+        assert np.array_equal(row.decoded_labels, sample.point_labels)
 
 
 def test_gpcc_provider_fresh_frontier_matches_payload_and_declares_delta(

@@ -24,6 +24,18 @@ DefectType = Literal["dent", "bump", "hole", "thin_spur", "surface_noise"]
 FloatArray = NDArray[np.float32]
 IntArray = NDArray[np.int64]
 LabelArray = NDArray[np.uint8]
+CODEC_DOMAIN_LOWER = -1.0
+CODEC_DOMAIN_UPPER = 1.0
+
+
+def _require_codec_domain(points: FloatArray, *, context: str) -> None:
+    minimum = float(points.min())
+    maximum = float(points.max())
+    if minimum < CODEC_DOMAIN_LOWER or maximum > CODEC_DOMAIN_UPPER:
+        raise ValueError(
+            f"{context} must lie in the declared codec domain [-1, 1]; "
+            f"observed coordinate range [{minimum:.9g}, {maximum:.9g}]"
+        )
 
 
 @dataclass(frozen=True)
@@ -78,12 +90,14 @@ class DefectResult:
     removed_count: int
     source_indices: IntArray
     seed: int
+    domain_scale_factor: float = 1.0
 
     def __post_init__(self) -> None:
         if self.points.ndim != 2 or self.points.shape[1:] != (3,):
             raise ValueError("defect points must have shape (N, 3)")
         if not np.isfinite(self.points).all():
             raise ValueError("defect points must be finite")
+        _require_codec_domain(self.points, context="injected defect points")
         if self.point_labels.shape != (len(self.points),):
             raise ValueError("point labels must align with defect points")
         if self.source_indices.shape != (len(self.points),):
@@ -98,6 +112,14 @@ class DefectResult:
             raise ValueError("cloud label differs from defect type")
         if self.removed_count < 0:
             raise ValueError("removed_count cannot be negative")
+        if not math.isfinite(self.domain_scale_factor) or not (
+            0.0 < self.domain_scale_factor <= 1.0
+        ):
+            raise ValueError("domain_scale_factor must lie in (0, 1]")
+        if self.defect_type in {"none", "hole"} and self.domain_scale_factor != 1.0:
+            raise ValueError(
+                "non-displacement defects must have domain_scale_factor equal to 1"
+            )
         if self.defect_type == "hole":
             if len(self.points) != self.original_point_count - self.removed_count:
                 raise ValueError("hole output size differs from removed_count")
@@ -125,6 +147,7 @@ def _points(points: ArrayLike) -> FloatArray:
         raise ValueError("points must have shape (N, 3) with N >= 8")
     if not np.isfinite(array).all():
         raise ValueError("points must be finite")
+    _require_codec_domain(array, context="defect source points")
     return array
 
 
@@ -203,6 +226,59 @@ def _patch_weights(points: FloatArray, patch: IntArray) -> FloatArray:
     return weights.astype(np.float32)
 
 
+def _domain_preserving_displacement(
+    base: FloatArray, displacement: NDArray[np.float64]
+) -> tuple[FloatArray, float]:
+    """Uniformly attenuate one generated displacement to stay in the codec cube.
+
+    A single scale preserves the generated defect's directions and relative
+    taper/radius.  This is a bound on the injection magnitude, not coordinate
+    clipping: coordinates that already fit retain scale one, and an attenuated
+    injection records its realized multiplier in ``DefectResult``.
+    """
+
+    original = np.asarray(base, dtype=np.float64)
+    delta = np.asarray(displacement, dtype=np.float64)
+    if (
+        original.shape != delta.shape
+        or original.ndim != 2
+        or original.shape[1:] != (3,)
+    ):
+        raise ValueError("defect displacement must align with base points")
+    if not np.isfinite(delta).all():
+        raise ValueError("defect displacement must be finite")
+    if not np.any(delta):
+        raise ValueError("defect displacement must be nonzero")
+
+    limits = [1.0]
+    positive = delta > 0.0
+    if positive.any():
+        limits.append(
+            float(np.min((CODEC_DOMAIN_UPPER - original)[positive] / delta[positive]))
+        )
+    negative = delta < 0.0
+    if negative.any():
+        limits.append(
+            float(
+                np.min(
+                    (original - CODEC_DOMAIN_LOWER)[negative] / -delta[negative]
+                )
+            )
+        )
+    scale = min(limits)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError(
+            "cannot realize a nonzero defect displacement inside the declared "
+            "codec domain [-1, 1]"
+        )
+    scale = min(1.0, scale)
+    if scale < 1.0:
+        scale = float(np.nextafter(scale, 0.0))
+    output = (original + scale * delta).astype(np.float32)
+    _require_codec_domain(output, context="domain-preserving defect points")
+    return output, scale
+
+
 def _control(points: FloatArray, *, seed: int) -> DefectResult:
     count = len(points)
     return DefectResult(
@@ -217,6 +293,7 @@ def _control(points: FloatArray, *, seed: int) -> DefectResult:
         removed_count=0,
         source_indices=np.arange(count, dtype=np.int64),
         seed=seed,
+        domain_scale_factor=1.0,
     )
 
 
@@ -270,6 +347,7 @@ def inject_defect(
     source_indices = np.arange(len(source), dtype=np.int64)
     output = source.copy()
     removed_count = 0
+    domain_scale_factor = 1.0
 
     if defect_name in {"dent", "bump"}:
         direction = -1.0 if defect_name == "dent" else 1.0
@@ -279,15 +357,19 @@ def inject_defect(
             * local_scale
             * _patch_weights(source, patch)
         )
-        output[patch] += displacement[:, None] * unit_normals[patch]
+        output[patch], domain_scale_factor = _domain_preserving_displacement(
+            source[patch],
+            displacement[:, None].astype(np.float64)
+            * unit_normals[patch].astype(np.float64),
+        )
         labels[patch] = 1
     elif defect_name == "surface_noise":
         noise = rng.normal(size=(defective_count, 3))
         noise /= np.maximum(np.linalg.norm(noise, axis=1, keepdims=True), 1e-12)
         amplitudes = rng.uniform(0.5, 1.0, size=(defective_count, 1))
-        output[patch] += (
-            settings.noise_scale * local_scale * amplitudes * noise
-        ).astype(np.float32)
+        output[patch], domain_scale_factor = _domain_preserving_displacement(
+            source[patch], settings.noise_scale * local_scale * amplitudes * noise
+        )
         labels[patch] = 1
     elif defect_name == "thin_spur":
         anchor = int(patch[0])
@@ -303,12 +385,15 @@ def inject_defect(
         radii = (
             settings.spur_radius_scale * local_scale * rng.random((defective_count, 1))
         )
-        spur = (
-            source[anchor].astype(np.float64)[None]
-            + settings.spur_length_scale * local_scale * distances * axis[None]
+        spur_displacement = (
+            settings.spur_length_scale * local_scale * distances * axis[None]
             + radii
             * (np.cos(angles) * tangent[None] + np.sin(angles) * bitangent[None])
-        ).astype(np.float32)
+        )
+        spur, domain_scale_factor = _domain_preserving_displacement(
+            np.repeat(source[anchor][None], defective_count, axis=0),
+            spur_displacement,
+        )
         output = np.concatenate((source, spur), axis=0)
         labels = np.concatenate(
             (
@@ -337,6 +422,7 @@ def inject_defect(
         labels[rim] = 1
 
     output = output.astype(np.float32, copy=False)
+    _require_codec_domain(output, context=f"injected {defect_name} points")
     return DefectResult(
         points=output,
         point_labels=labels,
@@ -349,6 +435,7 @@ def inject_defect(
         removed_count=removed_count,
         source_indices=source_indices,
         seed=seed,
+        domain_scale_factor=domain_scale_factor,
     )
 
 
@@ -434,6 +521,8 @@ def size_stratum(fraction: float) -> str:
 
 
 __all__ = [
+    "CODEC_DOMAIN_LOWER",
+    "CODEC_DOMAIN_UPPER",
     "DEFECT_TYPES",
     "DefectInjectionConfig",
     "DefectResult",

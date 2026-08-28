@@ -2,7 +2,9 @@
 
 Status: implementation and real-codec CPU smoke complete. Full benchmark
 results are pending selection of the Experiment 040 score/split cell and the
-predeclared full run.
+predeclared full run. The first full cluster attempt is invalid: defect
+injection could leave the codecs' declared domain and stopped before producing
+a complete result.
 
 ## Question and hypothesis
 
@@ -52,6 +54,35 @@ a label, so a hole labels the equally sized nearest surviving rim and separately
 records the deleted count. This is a point-task convention, not a claim that
 the finite observed cloud samples the interior of an underlying continuous
 hole.
+
+The mesh loader's existing bounding-box-center, unit-maximum-radius transform
+is the shared normalization for this benchmark. It correctly places each
+undefected finite sample in the codecs' declared `[-1, 1]^3` domain. The failed
+full-run attempt exposed a later protocol bug: bump, thin-spur, and surface-noise
+generation (and, depending on local normal direction, a dent) could displace a
+valid normalized sample beyond that domain. The interior fixture smoke did not
+exercise this boundary case.
+
+Experiment 041 now preserves the fixed domain during injection. It first
+asserts that the source lies in `[-1, 1]^3`. For every displacement defect, it
+forms the originally declared displacement field and multiplies the complete
+field by the largest single factor in `(0, 1]` that keeps every returned
+coordinate in the cube. The one factor preserves directions and relative
+taper, length, and radius instead of clipping individual coordinates. Hole and
+control conditions use factor one. An injection that cannot realize any
+nonzero displacement in the domain fails with an explicit error. The realized
+`domain_scale_factor`, number of attenuated conditions, and minimum factor are
+written to the machine-readable rows and data protocol so boundary attenuation
+cannot be hidden when interpreting defect-stratified results.
+
+This choice does not introduce a new per-cloud normalization or inverse
+transform. The raw arm and every codec arm receive the exact same final
+post-injection coordinate array, and the runner checks this path. The existing
+shared normalized-domain codec contract and complete serialized-byte accounting
+therefore remain unchanged; the injection factor describes construction of the
+synthetic benchmark input and is not decoder side information. Point labels are
+created and validated against the final returned array, so attenuation does not
+change their alignment or the declared cardinality conventions.
 
 Decoded labels use nearest-defected-target-point transfer when output
 cardinality differs. This is explicitly a nearest distance to a finite sampled
