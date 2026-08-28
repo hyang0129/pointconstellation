@@ -1,0 +1,102 @@
+{
+  "stability_config": "configs/experiment_019_stability_modelnet40.json",
+  "stability_artifact_dir": "artifacts/local/experiment_019_stability_modelnet40",
+  "official_stability_artifact_dir": "artifacts/local/experiment_020_official_stability",
+  "feature_config": "configs/experiment_018_feature_codec_multiseed.json",
+  "feature_artifact_dir": "artifacts/local/experiment_018_feature_codec_multiseed",
+  "constellation_sizes": [4, 8, 16, 32],
+  "feature_latent_dims": [20, 38, 74, 146],
+  "decoder_seed": 7,
+  "refiner_seed": 101,
+  "feature_model_seed": 7,
+  "classifier_seeds": [3001, 3011, 3023],
+  "adam_budget": 64,
+  "adam_learning_rate": 0.03,
+  "primary_constellation_size": 8,
+  "max_samples_per_category": null,
+  "extraction_batch_size": 4,
+  "classifier_epochs": 40,
+  "classifier_batch_size": 32,
+  "classifier_learning_rate": 0.001,
+  "classifier_weight_decay": 0.0001,
+  "classifier_hidden_width": 64,
+  "classifier_embedding_dim": 64,
+  "retrieval_k": 10,
+  "bootstrap_samples": 10000,
+  "bootstrap_seed": 20260830,
+  "confidence_level": 0.95,
+  "include_adam": true,
+  "include_refiner": true,
+  "include_fps": true,
+  "include_feature": true,
+  "include_source": true,
+  "gpcc": {
+    "executable": "artifacts/tools/mpeg-pcc-tmc13/build/tmc3/tmc3",
+    "position_bits": 12,
+    "timeout_seconds": 120.0,
+    "encoder_args": [
+      "--neighbourAvailBoundaryLog2=8",
+      "--intra_pred_max_node_size_log2=6",
+      "--maxNumQtBtBeforeOt=4",
+      "--minQtbtSizeLog2=0",
+      "--planarEnabled=1",
+      "--planarModeIdcmUse=0",
+      "--trisoupNodeSizeLog2=0"
+    ],
+    "rate_points": [
+      {
+        "name": "octree_s1_4096",
+        "encoder_args": ["--positionQuantizationScale=0.000244140625"]
+      },
+      {
+        "name": "octree_s1_2048",
+        "encoder_args": ["--positionQuantizationScale=0.00048828125"]
+      },
+      {
+        "name": "octree_s1_1536",
+        "encoder_args": ["--positionQuantizationScale=0.0006510416666666666"]
+      },
+      {
+        "name": "octree_s1_1280",
+        "encoder_args": ["--positionQuantizationScale=0.00078125"]
+      },
+      {
+        "name": "octree_s1_1024",
+        "encoder_args": ["--positionQuantizationScale=0.0009765625"]
+      },
+      {
+        "name": "octree_s1_768",
+        "encoder_args": ["--positionQuantizationScale=0.0013020833333333333"]
+      },
+      {
+        "name": "octree_s1_640",
+        "encoder_args": ["--positionQuantizationScale=0.0015625"]
+      },
+      {
+        "name": "octree_s1_512",
+        "encoder_args": ["--positionQuantizationScale=0.001953125"]
+      },
+      {
+        "name": "octree_s1_256",
+        "encoder_args": ["--positionQuantizationScale=0.00390625"]
+      },
+      {
+        "name": "octree_s1_128",
+        "encoder_args": ["--positionQuantizationScale=0.0078125"]
+      },
+      {
+        "name": "octree_s1_64",
+        "encoder_args": ["--positionQuantizationScale=0.015625"]
+      },
+      {
+        "name": "octree_s1_32",
+        "encoder_args": ["--positionQuantizationScale=0.03125"]
+      },
+      {
+        "name": "octree_s1_16",
+        "encoder_args": ["--positionQuantizationScale=0.0625"]
+      }
+    ]
+  },
+  "output_dir": "artifacts/local/experiment_030_downstream"
+}

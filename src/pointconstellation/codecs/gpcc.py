@@ -102,16 +102,19 @@ class GpccStreamBreakdown:
 class GpccResult:
     reconstruction: NDArray[np.float32]
     stream_bytes: int
-    stream_breakdown: GpccStreamBreakdown
     encode_seconds: float
     decode_seconds: float
     encoder_command: tuple[str, ...]
     decoder_command: tuple[str, ...]
     encoder_stdout: str
     decoder_stdout: str
+    stream_breakdown: GpccStreamBreakdown | None = None
 
     def __post_init__(self) -> None:
-        if self.stream_bytes != self.stream_breakdown.total_bytes:
+        if (
+            self.stream_breakdown is not None
+            and self.stream_bytes != self.stream_breakdown.total_bytes
+        ):
             raise ValueError("G-PCC result size differs from its stream breakdown")
 
 
