@@ -1,6 +1,6 @@
 # Experiment 033: encoder objective sweep
 
-Status: `k8_n2048` regime complete; Gate G-B2 fails under its predeclared rules (single regime, classifier below 0.70, D1 regressions above 2%), while the measured trade-offs show the objectives are Pareto-distinct.
+Status: full twelve-regime factorial complete; Gate G-B2 fails in every regime under its predeclared rules, while the objectives are Pareto-distinct in all of them.
 
 ## Question and hypothesis
 
@@ -154,6 +154,74 @@ Generated classifiers, streams, metric scratch files, and results stay under
 `artifacts/local/` and are not committed.
 
 ## Results
+
+### Full factorial (2026-08-28)
+
+With the eleven Experiment 038 decoder cells in place, the predeclared full
+factorial ran on an EmpireAI H200: twelve `K x N` regimes, four objectives,
+six decoders, validation and category-OOD splits, 46,080 per-cloud rows,
+6.3 h. The frozen PointNet classifier was retrained on the training partition
+only (source-cloud accuracy 0.539 at N=1024, 0.547 at N=2048, 0.555 at
+N=4096).
+
+**Gate G-B2 fails in all 36 regime x candidate comparisons**, for the same
+reasons as the single-regime run: the source classifier is below the required
+0.70 in every regime, and no candidate keeps D1 within 2 %. The factorial
+nevertheless settles the shape of the trade-off across regimes.
+
+| Candidate vs Chamfer | Accuracy delta, range over 12 regimes (95 % CI excludes 0 in) | D1 regression range | D2 regression range |
+|---|---|---|---|
+| `point_to_plane` | -0.008 to +0.033 (5 of 12) | +8.1 % to +34.0 % | -3.8 % to +1.1 % (better in 5 of 12 with CI excluding 0) |
+| `feature_matching` | +0.150 to +0.305 (12 of 12) | +45.9 % to +105.0 % | +101 % to +162 % |
+| `mixed` | +0.151 to +0.301 (12 of 12) | +39.4 % to +74.7 % | +81 % to +131 % |
+
+Per-regime values (validation, Chamfer control -> candidate):
+
+| Regime | p2p acc / D1 / D2 | feature acc / D1 / D2 | mixed acc / D1 / D2 |
+|---|---|---|---|
+| k4_n1024 | +0.022 / +12.8 % / -3.3 % | +0.208 / +45.9 % / +101 % | +0.207 / +39.4 % / +85 % |
+| k8_n1024 | +0.014 / +14.4 % / -2.3 % | +0.245 / +57.0 % / +108 % | +0.237 / +49.3 % / +92 % |
+| k16_n1024 | +0.033 / +20.4 % / -1.9 % | +0.305 / +73.9 % / +115 % | +0.301 / +57.6 % / +94 % |
+| k32_n1024 | -0.008 / +34.0 % / -3.0 % | +0.288 / +95.9 % / +106 % | +0.288 / +54.2 % / +81 % |
+| k4_n2048 | +0.020 / +10.3 % / -2.3 % | +0.169 / +59.4 % / +113 % | +0.171 / +52.2 % / +96 % |
+| k8_n2048 | +0.020 / +12.5 % / -1.9 % | +0.202 / +68.2 % / +123 % | +0.198 / +58.1 % / +100 % |
+| k16_n2048 | +0.005 / +16.0 % / -3.8 % | +0.243 / +81.6 % / +141 % | +0.238 / +66.9 % / +114 % |
+| k32_n2048 | +0.017 / +28.3 % / -0.3 % | +0.289 / +105.0 % / +142 % | +0.296 / +70.2 % / +112 % |
+| k4_n4096 | -0.003 / +8.1 % / +0.3 % | +0.150 / +61.6 % / +141 % | +0.151 / +52.6 % / +119 % |
+| k8_n4096 | +0.012 / +10.4 % / -2.1 % | +0.230 / +74.5 % / +156 % | +0.220 / +63.4 % / +129 % |
+| k16_n4096 | +0.010 / +14.2 % / +0.4 % | +0.253 / +90.2 % / +162 % | +0.263 / +74.7 % / +131 % |
+| k32_n4096 | +0.007 / +24.7 % / +1.1 % | +0.296 / +102.0 % / +137 % | +0.294 / +69.3 % / +108 % |
+
+Reconstruction recognizability under the Chamfer objective rises with K
+(validation top-1 0.062 at k4_n2048 to 0.103 at k32_n2048) and feature
+matching lifts it to 0.23-0.44 in every regime; the mixed objective is on the
+distortion-accuracy Pareto front in all twelve regimes while pure feature
+matching falls off it in five.
+
+### Reading across regimes
+
+1. **The Pareto structure is regime-independent.** Feature matching buys
+   +15 to +30 accuracy points in every regime at +46 % to +105 % D1; there is
+   no K or N at which the two objectives stop trading off, so "PSNR versus
+   utility" is a property of the representation, not of one operating point.
+2. **Point-to-plane is a free D2 win only at small K.** Its D2 advantage is
+   CI-backed at K <= 8 and vanishes at K = 32 and N = 4096, while its D1 cost
+   grows with K (8 % to 34 %). It is a defensible primary objective if D2 is
+   the headline metric at K <= 8, and not otherwise.
+3. **Larger K helps feature matching more than Chamfer.** The accuracy delta
+   of feature matching grows from ~0.15-0.21 at K = 4 to ~0.29-0.31 at K = 32;
+   extra coordinates are worth more as semantic degrees of freedom than as
+   fidelity, mirroring Experiment 038's finding that K barely moves D1.
+4. Passing G-B2 as written still needs a stronger frozen classifier (>= 0.70
+   source accuracy) and a candidate within 2 % D1; neither exists in this
+   family of objectives, so the gate's 2 % bound, not the regime coverage, is
+   the binding constraint.
+
+Artifacts: `artifacts/local/experiment_033_objective_sweep/`
+(`objective_sweep_metrics.json`, `objective_sweep_per_cloud.jsonl`,
+`pointnet_classifier.pt`) on the cluster (`~/LLM_research/pointconstellation-tracks-b`).
+
+### Single-regime run (k8_n2048, 2026-08-27)
 
 Executed on an EmpireAI H200 for the one regime with sealed stabilized decoders (`k8_n2048`, six decoders,
 Adam-STE search, 3840 rows). The other eleven `K x N` regimes require the Experiment 038 decoders,
