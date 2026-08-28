@@ -66,6 +66,7 @@ class OfficialStabilityConfig:
     selection_seed: int = 20_260_821
     splits: tuple[str, ...] = SPLITS
     max_clouds_per_split: int | None = None
+    allow_single_seed: bool = False
     compute_mesh_metrics: bool = False
     mesh_metric_point_chunk_size: int = 256
     mesh_metric_triangle_chunk_size: int = 256
@@ -84,14 +85,20 @@ class OfficialStabilityConfig:
             raise ValueError("position_bits must be between 2 and 24")
         if self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
-        if len(self.decoder_seeds) < 2 or len(set(self.decoder_seeds)) != len(
-            self.decoder_seeds
-        ):
-            raise ValueError("decoder_seeds must contain at least two unique seeds")
-        if len(self.refiner_seeds) < 2 or len(set(self.refiner_seeds)) != len(
-            self.refiner_seeds
-        ):
-            raise ValueError("refiner_seeds must contain at least two unique seeds")
+        minimum_seeds = 1 if self.allow_single_seed else 2
+        minimum_seed_label = "one" if self.allow_single_seed else "two"
+        if len(self.decoder_seeds) < minimum_seeds or len(
+            set(self.decoder_seeds)
+        ) != len(self.decoder_seeds):
+            raise ValueError(
+                f"decoder_seeds must contain at least {minimum_seed_label} unique seeds"
+            )
+        if len(self.refiner_seeds) < minimum_seeds or len(
+            set(self.refiner_seeds)
+        ) != len(self.refiner_seeds):
+            raise ValueError(
+                f"refiner_seeds must contain at least {minimum_seed_label} unique seeds"
+            )
         if not self.methods or len(set(self.methods)) != len(self.methods):
             raise ValueError("methods must be nonempty and unique")
         unknown_methods = set(self.methods) - ({"refiner"} | set(SELECTION_METHODS))
@@ -282,6 +289,31 @@ def _evaluation_datasets(
     }
 
 
+def _stability_config_matches(
+    recorded: dict[str, Any], stability: StabilityExperimentConfig
+) -> bool:
+    return stability_config_matches_artifact(recorded, stability)
+
+
+def _official_manifest_matches(
+    recorded: dict[str, Any], expected: dict[str, Any]
+) -> bool:
+    normalized = _json_ready(recorded)
+    config = normalized.get("config")
+    if isinstance(config, dict):
+        config.setdefault("allow_single_seed", False)
+        expected_config = expected.get("config", {})
+        for field in (
+            "compute_mesh_metrics",
+            "mesh_metric_point_chunk_size",
+            "mesh_metric_triangle_chunk_size",
+            "mesh_normal_neighbors",
+        ):
+            if field in expected_config:
+                config.setdefault(field, expected_config[field])
+    return normalized == expected
+
+
 def _contains_forbidden_key(value: Any) -> bool:
     if isinstance(value, dict):
         return any(
@@ -304,6 +336,11 @@ def _row_key(row: dict[str, Any]) -> tuple[Any, ...]:
         row["model_id"],
         row["sample_id"],
     )
+
+
+def _sample_identity(sample: dict[str, Any]) -> tuple[str, str, int]:
+    sample_id = int(sample["sample_id"])
+    return str(sample["family"]), str(sample.get("model_id", sample_id)), sample_id
 
 
 def _load_rows(path: Path) -> list[dict[str, Any]]:
@@ -627,10 +664,12 @@ def summarize_official_rows(
             "replicate; primary quantity is relative RMSE computed from official "
             "symmetric MSE"
         ),
+        "inferential_gate_eligible": not config.allow_single_seed,
         "comparisons": comparisons,
         "tail_and_surface_summary": diagnostic_summary,
         "official_metric_gate_passes": bool(
-            len(validation_fps) == len(METRICS)
+            not config.allow_single_seed
+            and len(validation_fps) == len(METRICS)
             and all(
                 row["every_decoder_candidate_better"]
                 and row["passes_positive_interval"]
@@ -638,7 +677,8 @@ def summarize_official_rows(
             )
         ),
         "selection_baseline_gate_passes": bool(
-            len(validation_refiner) == len(selection_methods) * len(METRICS)
+            not config.allow_single_seed
+            and len(validation_refiner) == len(selection_methods) * len(METRICS)
             and all(row["passes_positive_interval"] for row in validation_refiner)
         ),
     }
@@ -653,11 +693,16 @@ def _load_models(
     device: torch.device,
 ) -> tuple[torch.nn.Module, torch.nn.Module | None, dict[str, Any]]:
     artifact_dir = Path(official.stability_artifact_dir)
-    selection_path = artifact_dir / f"decoders/seed_{decoder_seed}/selection.json"
+    decoder_artifact_dir = Path(
+        stability.decoder_source_artifact_dir or official.stability_artifact_dir
+    )
+    selection_path = (
+        decoder_artifact_dir / f"decoders/seed_{decoder_seed}/selection.json"
+    )
     selection = json.loads(selection_path.read_text())
     if _contains_forbidden_key(selection):
         raise RuntimeError("sealed calibration selection contains a test-field key")
-    decoder_path = artifact_dir / f"decoders/seed_{decoder_seed}/stabilized.pt"
+    decoder_path = decoder_artifact_dir / f"decoders/seed_{decoder_seed}/stabilized.pt"
     decoder_checkpoint = torch.load(
         decoder_path, map_location=device, weights_only=True
     )
@@ -678,6 +723,10 @@ def _load_models(
         "decoder_checkpoint_sha256": file_sha256(decoder_path),
         "decoder_state_hash": decoder_hash,
         "calibration_selection": decoder_checkpoint["selection"],
+        "decoder_artifact_dir": str(decoder_artifact_dir),
+        "decoder_reused_from_source_artifact": bool(
+            stability.decoder_source_artifact_dir is not None
+        ),
     }
     if refiner_seed is None:
         return decoder, None, metadata
@@ -713,6 +762,7 @@ def _method_seed(
     split: str,
     sample: dict[str, Any],
 ) -> int:
+    family, model_id, sample_id = _sample_identity(sample)
     seed_family = {
         "fps_random_start_best_of_8": "fps_random_start",
         "random_best_of_1": "random_best_of_n",
@@ -723,9 +773,9 @@ def _method_seed(
             config.selection_seed,
             seed_family,
             split,
-            str(sample["family"]),
-            str(sample["model_id"]),
-            int(sample["sample_id"]),
+            family,
+            model_id,
+            sample_id,
         ],
         separators=(",", ":"),
     )
@@ -783,8 +833,16 @@ def _evaluate_method(
     method: str | None = None,
     mesh: TriangleMesh | None = None,
 ) -> dict[str, Any]:
-    source = sample["source_points"].unsqueeze(0).to(device)
-    normals = sample["source_normals"].cpu().numpy()
+    source_points = sample.get("source_points", sample.get("points"))
+    source_normals = sample.get("source_normals", sample.get("normals"))
+    if not isinstance(source_points, torch.Tensor) or not isinstance(
+        source_normals, torch.Tensor
+    ):
+        raise ValueError("official evaluation sample lacks points or normals")
+    source = source_points.unsqueeze(0).to(device)
+    normals = source_normals.cpu().numpy()
+    family, model_id, sample_id = _sample_identity(sample)
+    sample = {**sample, "sample_id": sample_id, "family": family, "model_id": model_id}
     normalization_center = sample.get("normalization_center")
     normalization_scale = sample.get("normalization_scale")
     method = method or ("fps" if refiner is None else "refiner")
@@ -936,9 +994,9 @@ def _evaluate_method(
         "method": method,
         "decoder_seed": decoder_seed,
         "refiner_seed": refiner_seed,
-        "family": str(sample["family"]),
-        "model_id": str(sample["model_id"]),
-        "sample_id": int(sample["sample_id"]),
+        "family": family,
+        "model_id": model_id,
+        "sample_id": sample_id,
         "constellation_size": stability.constellation_size,
         "coordinate_bits": stability.coordinate_bits,
         "header_bytes": packet.header_bytes,
@@ -1005,7 +1063,7 @@ def run_official_stability(
     artifact_dir = Path(config.stability_artifact_dir)
     stability_metrics_path = artifact_dir / "stability_metrics.json"
     stability_metrics = json.loads(stability_metrics_path.read_text())
-    if not stability_config_matches_artifact(stability_metrics["config"], stability):
+    if not _stability_config_matches(stability_metrics["config"], stability):
         raise RuntimeError("Experiment 019 artifact config differs from checked config")
     if not all(stability_metrics["contract_checks"].values()):
         raise RuntimeError("Experiment 019 artifact has a failed scientific contract")
@@ -1038,18 +1096,9 @@ def run_official_stability(
     if config.evaluation_manifest is not None:
         run_manifest["experiment_019_data_protocol"] = training_protocol
     if manifest_path.exists():
-        existing_manifest = json.loads(manifest_path.read_text())
-        existing_config = dict(existing_manifest.get("config", {}))
-        expected_config = run_manifest["config"]
-        for field in (
-            "compute_mesh_metrics",
-            "mesh_metric_point_chunk_size",
-            "mesh_metric_triangle_chunk_size",
-            "mesh_normal_neighbors",
+        if not _official_manifest_matches(
+            json.loads(manifest_path.read_text()), run_manifest
         ):
-            existing_config.setdefault(field, expected_config[field])
-        existing_manifest["config"] = existing_config
-        if existing_manifest != run_manifest:
             raise RuntimeError(f"existing Experiment {experiment[:3]} manifest differs")
     else:
         manifest_path.write_text(json.dumps(run_manifest, indent=2) + "\n")
@@ -1089,14 +1138,15 @@ def run_official_stability(
                 )
                 for sample_index in range(count):
                     sample = dataset[sample_index]
+                    family, model_id, sample_id = _sample_identity(sample)
                     key = (
                         split,
                         method,
                         decoder_seed,
                         None,
-                        str(sample["family"]),
-                        str(sample["model_id"]),
-                        int(sample["sample_id"]),
+                        family,
+                        model_id,
+                        sample_id,
                     )
                     if key in completed:
                         continue
@@ -1153,14 +1203,15 @@ def run_official_stability(
                 )
                 for sample_index in range(count):
                     sample = dataset[sample_index]
+                    family, model_id, sample_id = _sample_identity(sample)
                     key = (
                         split,
                         "refiner",
                         decoder_seed,
                         refiner_seed,
-                        str(sample["family"]),
-                        str(sample["model_id"]),
-                        int(sample["sample_id"]),
+                        family,
+                        model_id,
+                        sample_id,
                     )
                     if key in completed:
                         continue

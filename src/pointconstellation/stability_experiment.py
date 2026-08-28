@@ -110,6 +110,8 @@ class StabilityExperimentConfig:
     adam_probe_clouds_per_split: int = 16
     reference_feature_dir: str | None = None
     expected_manifest_sha256: str | None = None
+    decoder_source_artifact_dir: str | None = None
+    allow_single_seed: bool = False
     bootstrap_samples: int = 2_000
     bootstrap_seed: int = 20_260_816
     confidence_level: float = 0.95
@@ -172,14 +174,20 @@ class StabilityExperimentConfig:
             raise ValueError("mesh_normal_neighbors must be at least three")
         if self.stabilized_decoder_epochs <= self.baseline_decoder_epochs:
             raise ValueError("stabilized decoder training must be longer than baseline")
-        if len(self.decoder_seeds) < 2 or len(set(self.decoder_seeds)) != len(
-            self.decoder_seeds
-        ):
-            raise ValueError("decoder_seeds must contain at least two unique seeds")
-        if len(self.refiner_seeds) < 2 or len(set(self.refiner_seeds)) != len(
-            self.refiner_seeds
-        ):
-            raise ValueError("refiner_seeds must contain at least two unique seeds")
+        minimum_seeds = 1 if self.allow_single_seed else 2
+        minimum_seed_label = "one" if self.allow_single_seed else "two"
+        if len(self.decoder_seeds) < minimum_seeds or len(
+            set(self.decoder_seeds)
+        ) != len(self.decoder_seeds):
+            raise ValueError(
+                f"decoder_seeds must contain at least {minimum_seed_label} unique seeds"
+            )
+        if len(self.refiner_seeds) < minimum_seeds or len(
+            set(self.refiner_seeds)
+        ) != len(self.refiner_seeds):
+            raise ValueError(
+                f"refiner_seeds must contain at least {minimum_seed_label} unique seeds"
+            )
         if self.feature_width < 4 or self.feature_width % self.num_heads:
             raise ValueError("feature_width must be divisible by num_heads")
         if self.num_layers < 1 or self.recurrent_steps < 1:
@@ -215,21 +223,35 @@ class StabilityExperimentConfig:
 DatasetMap = dict[str, Dataset[dict[str, Any]]]
 
 
+_ARTIFACT_CONFIG_DEFAULTS: dict[str, Any] = {
+    "verify_pointcloud_hashes": True,
+    "pointcloud_normal_neighbors": 16,
+    "compute_mesh_metrics": False,
+    "mesh_metric_point_chunk_size": 256,
+    "mesh_metric_triangle_chunk_size": 256,
+    "mesh_normal_neighbors": 12,
+    "decoder_source_artifact_dir": None,
+    "allow_single_seed": False,
+}
+
+
+def _normalized_config_record(values: Mapping[str, Any]) -> dict[str, Any]:
+    """Add defaults introduced after a stability artifact was written."""
+
+    normalized = json.loads(json.dumps(values))
+    for field, default in _ARTIFACT_CONFIG_DEFAULTS.items():
+        normalized.setdefault(field, default)
+    return normalized
+
+
 def stability_config_matches_artifact(
     artifact_config: Mapping[str, Any], config: StabilityExperimentConfig
 ) -> bool:
-    """Compare configs while accepting absent default Experiment 031 fields."""
+    """Compare configs while accepting known absent default compatibility fields."""
 
-    actual = dict(artifact_config)
-    expected = json.loads(json.dumps(asdict(config)))
-    for field in (
-        "compute_mesh_metrics",
-        "mesh_metric_point_chunk_size",
-        "mesh_metric_triangle_chunk_size",
-        "mesh_normal_neighbors",
-    ):
-        actual.setdefault(field, expected[field])
-    return actual == expected
+    return _normalized_config_record(artifact_config) == _normalized_config_record(
+        asdict(config)
+    )
 
 
 def _mesh_dataset(config: StabilityExperimentConfig, split: str) -> MeshSurfaceDataset:
@@ -828,6 +850,170 @@ def _train_decoders(
     return arm_states, record
 
 
+def _load_reused_decoders(
+    config: StabilityExperimentConfig,
+    datasets: DatasetMap,
+    *,
+    decoder_seed: int,
+    device: torch.device,
+) -> tuple[dict[str, dict[str, Tensor]], dict[str, Any]]:
+    """Load and verify decoder arms trained by a compatible stability run."""
+
+    if config.decoder_source_artifact_dir is None:
+        raise ValueError("decoder reuse requires decoder_source_artifact_dir")
+    source_dir = Path(config.decoder_source_artifact_dir)
+    metrics_path = source_dir / "stability_metrics.json"
+    if not metrics_path.is_file():
+        raise FileNotFoundError(f"decoder source metrics are absent: {metrics_path}")
+    source_metrics = json.loads(metrics_path.read_text())
+    if not source_metrics.get("factorial", {}).get("complete"):
+        raise RuntimeError("decoder source factorial is incomplete")
+    source_checks = source_metrics.get("contract_checks")
+    if not isinstance(source_checks, dict) or not all(source_checks.values()):
+        raise RuntimeError("decoder source scientific contract failed")
+
+    source_config = _normalized_config_record(source_metrics.get("config", {}))
+    target_config = _normalized_config_record(asdict(config))
+    allowed_differences = {
+        "allow_single_seed",
+        "constellation_size",
+        "decoder_source_artifact_dir",
+        "output_dir",
+    }
+    mismatches = {
+        key: (source_config.get(key), target_config.get(key))
+        for key in sorted(set(source_config) | set(target_config))
+        if key not in allowed_differences
+        and source_config.get(key) != target_config.get(key)
+    }
+    if mismatches:
+        raise RuntimeError(f"decoder source protocol differs: {mismatches}")
+    if config.constellation_size not in tuple(
+        source_config.get("training_constellation_sizes", ())
+    ):
+        raise RuntimeError("requested K was absent from decoder source training")
+    if decoder_seed not in tuple(source_config.get("decoder_seeds", ())):
+        raise RuntimeError("requested decoder seed is absent from decoder source")
+
+    source_records = {
+        int(record["decoder_seed"]): record
+        for record in source_metrics.get("decoder_records", ())
+    }
+    if decoder_seed not in source_records:
+        raise RuntimeError("decoder source record is absent")
+    source_record = source_records[decoder_seed]
+    source_arms = source_record.get("arms")
+    if not isinstance(source_arms, dict):
+        raise RuntimeError("decoder source arm records are absent")
+    selection_path = source_dir / "decoders" / f"seed_{decoder_seed}" / "selection.json"
+    selection = json.loads(selection_path.read_text())
+    calibration_sha256 = _membership(datasets["calibration"])["sha256"]
+    if selection.get("calibration_partition_sha256") != calibration_sha256:
+        raise RuntimeError("decoder source calibration membership differs")
+
+    decoder = _decoder(config, device)
+    states: dict[str, dict[str, Tensor]] = {}
+    arms: dict[str, dict[str, Any]] = {}
+    for arm in ARMS:
+        checkpoint_path = source_dir / "decoders" / f"seed_{decoder_seed}" / f"{arm}.pt"
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        if (
+            checkpoint.get("decoder_seed") != decoder_seed
+            or checkpoint.get("arm") != arm
+        ):
+            raise RuntimeError("decoder source checkpoint is assigned to another arm")
+        state = checkpoint["model"]
+        decoder.load_state_dict(state)
+        state_hash = _state_hash(decoder)
+        selected_hash = selection["arms"][arm]["state_hash"]
+        source_arm = source_arms.get(arm)
+        if not isinstance(source_arm, dict):
+            raise RuntimeError("decoder source arm record is absent")
+        if not (
+            state_hash
+            == selected_hash
+            == checkpoint.get("state_hash")
+            == checkpoint.get("selection", {}).get("selected_state_hash")
+            == source_arm.get("state_hash")
+            == source_arm.get("selection", {}).get("selected_state_hash")
+        ):
+            raise RuntimeError("decoder source checkpoint hash verification failed")
+        states[arm] = _clone_state(decoder)
+        deployment_files = source_arm.get("decoder_state_dicts")
+        if deployment_files is None:
+            deployment_files = {}
+            for precision, dtype in (("fp32", torch.float32), ("fp16", torch.float16)):
+                deployment_path = (
+                    Path(config.output_dir)
+                    / "decoders"
+                    / f"seed_{decoder_seed}"
+                    / arm
+                    / f"decoder_state_dict_{precision}.pt"
+                )
+                deployment_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {
+                        name: (
+                            value.detach().cpu().to(dtype)
+                            if value.is_floating_point()
+                            else value.detach().cpu()
+                        )
+                        for name, value in state.items()
+                    },
+                    deployment_path,
+                )
+                deployment_files[precision] = {
+                    "path": str(deployment_path),
+                    "bytes": deployment_path.stat().st_size,
+                    "sha256": file_sha256(deployment_path),
+                }
+        elif not isinstance(deployment_files, dict) or set(deployment_files) != {
+            "fp32",
+            "fp16",
+        }:
+            raise RuntimeError("decoder source deployment file records are invalid")
+        else:
+            for file_record in deployment_files.values():
+                if not isinstance(file_record, dict):
+                    raise RuntimeError(
+                        "decoder source deployment file record is invalid"
+                    )
+                deployment_path = Path(str(file_record.get("path", "")))
+                if (
+                    not deployment_path.is_file()
+                    or deployment_path.stat().st_size != file_record.get("bytes")
+                    or file_sha256(deployment_path) != file_record.get("sha256")
+                ):
+                    raise RuntimeError(
+                        "decoder source deployment file hash verification failed"
+                    )
+        arms[arm] = {
+            "state_hash": state_hash,
+            "checkpoint": str(checkpoint_path),
+            "checkpoint_sha256": file_sha256(checkpoint_path),
+            "selection": checkpoint["selection"],
+            "decoder_state_dicts": deployment_files,
+        }
+
+    return states, {
+        "decoder_seed": decoder_seed,
+        "history": source_record.get("history", []),
+        "ema_decay": source_record.get("ema_decay", config.ema_decay),
+        "stabilized_candidates": source_record.get("stabilized_candidates", []),
+        "arms": arms,
+        "elapsed_seconds": 0.0,
+        "reuse": {
+            "decoder_training_skipped": True,
+            "source_artifact_dir": str(source_dir),
+            "source_metrics_sha256": file_sha256(metrics_path),
+            "source_selection_sha256": file_sha256(selection_path),
+            "source_constellation_size": source_config["constellation_size"],
+            "requested_constellation_size": config.constellation_size,
+            "requested_k_seen_during_source_training": True,
+        },
+    }
+
+
 def _train_refiner(
     config: StabilityExperimentConfig,
     datasets: DatasetMap,
@@ -1418,6 +1604,18 @@ def _two_way_components(
 def _variance_components(
     summaries: list[dict[str, Any]], config: StabilityExperimentConfig
 ) -> list[dict[str, Any]]:
+    if len(config.decoder_seeds) < 2 or len(config.refiner_seeds) < 2:
+        return [
+            {
+                "status": "not_estimable_single_seed_smoke",
+                "reason": (
+                    "the crossed random-effects decomposition requires at least "
+                    "two decoder and two refiner seeds"
+                ),
+                "decoder_seeds": list(config.decoder_seeds),
+                "refiner_seeds": list(config.refiner_seeds),
+            }
+        ]
     indexed = {
         (
             row["arm"],
@@ -1716,10 +1914,12 @@ def _stability_gates(
             "with positive bootstrap lower bound, median no worse than -1%, and "
             ">=10% median FPS gain; OOD Q90 and FPS gain must remain positive"
         ),
+        "inferential_gate_eligible": not config.allow_single_seed,
         "primary": primary,
         "ood_primary": ood_primary,
         "overall_stability_gate_passes": bool(
-            primary["validation_material_thresholds_pass"]
+            not config.allow_single_seed
+            and primary["validation_material_thresholds_pass"]
             and ood_primary["q90_relative_rmse_reduction_percent"] > 0.0
             and ood_primary["median_decoder_level_improvement_over_fps_percent"] >= 10.0
         ),
@@ -1839,7 +2039,12 @@ def _feature_reference_comparison(
         ),
     }
     if not all(protocol_checks.values()):
-        raise ValueError("feature reference protocol differs from Experiment 019")
+        return {
+            "status": "configured_reference_not_rate_matched",
+            "reference_dir": str(root),
+            "protocol_checks": protocol_checks,
+            "learned_codec_gate_passes": None,
+        }
 
     feature_seeds = tuple(
         int(path.parent.name.removeprefix("seed_")) for path in seed_paths
@@ -2007,7 +2212,10 @@ def _arm_comparisons(
 
 
 def run_stability_experiment(
-    config: StabilityExperimentConfig, *, device_name: str = "auto"
+    config: StabilityExperimentConfig,
+    *,
+    device_name: str = "auto",
+    experiment_name: str = "019_decoder_refiner_stability_decomposition",
 ) -> dict[str, Any]:
     """Execute the complete decoder-arm by decoder/refiner-seed factorial."""
 
@@ -2024,13 +2232,21 @@ def run_stability_experiment(
     pair_records = []
     all_rows: list[dict[str, Any]] = []
     for decoder_seed in config.decoder_seeds:
-        arm_states, decoder_record = _train_decoders(
-            config,
-            datasets,
-            decoder_seed=decoder_seed,
-            device=device,
-            output_dir=output_dir,
-        )
+        if config.decoder_source_artifact_dir is None:
+            arm_states, decoder_record = _train_decoders(
+                config,
+                datasets,
+                decoder_seed=decoder_seed,
+                device=device,
+                output_dir=output_dir,
+            )
+        else:
+            arm_states, decoder_record = _load_reused_decoders(
+                config,
+                datasets,
+                decoder_seed=decoder_seed,
+                device=device,
+            )
         decoder_records.append(decoder_record)
         for arm in ARMS:
             for refiner_seed in config.refiner_seeds:
@@ -2129,7 +2345,7 @@ def run_stability_experiment(
         for refiner_seed in config.refiner_seeds
     )
     result = {
-        "experiment": "019_decoder_refiner_stability_decomposition",
+        "experiment": experiment_name,
         "config": asdict(config),
         "device": str(device),
         "scientific_contract": {
@@ -2143,6 +2359,11 @@ def run_stability_experiment(
             "actual_bitstream_round_trip": True,
             "decoder_frozen_during_refiner_and_adam": True,
             "calibration_excludes_validation_and_ood": True,
+            "decoder_training": (
+                "verified_reuse_from_variable_cardinality_source"
+                if config.decoder_source_artifact_dir is not None
+                else "trained_for_this_num_points"
+            ),
         },
         "data_protocol": data_protocol,
         "factorial": {
@@ -2214,6 +2435,13 @@ def run_stability_experiment(
                 == row["stream_bytes"]
                 for row in all_rows
             ),
+            "reused_decoder_source_verified": bool(
+                config.decoder_source_artifact_dir is None
+                or all(
+                    record.get("reuse", {}).get("decoder_training_skipped") is True
+                    for record in decoder_records
+                )
+            ),
         },
         "per_cloud": all_rows,
         "elapsed_seconds": time.perf_counter() - started,
@@ -2236,8 +2464,8 @@ def reaggregate_stability_result(config: StabilityExperimentConfig) -> dict[str,
             f"completed stability metrics are absent: {metrics_path}"
         )
     result = json.loads(metrics_path.read_text())
-    expected_config = json.loads(json.dumps(asdict(config)))
-    if result.get("config") != expected_config:
+    expected_config = _normalized_config_record(asdict(config))
+    if _normalized_config_record(result.get("config", {})) != expected_config:
         raise ValueError("completed result config does not match aggregate-only config")
     if not result.get("factorial", {}).get("complete"):
         raise ValueError("cannot aggregate an incomplete factorial result")

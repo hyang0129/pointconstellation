@@ -164,6 +164,31 @@ def test_training_target_defaults_to_encoder_visible_source() -> None:
     )
 
 
+@pytest.mark.parametrize("num_points", (1024, 4096))
+def test_experiment_038_mesh_roles_emit_requested_point_counts(
+    num_points: int,
+) -> None:
+    pytest.importorskip("torch")
+    dataset = MeshSurfaceDataset(
+        FIXTURE_ROOT,
+        FIXTURE_MANIFEST,
+        split="validation",
+        num_points=num_points,
+        seed=1517,
+        training_target="source",
+    )
+
+    sample = dataset[0]
+
+    assert sample["source_points"].shape == (num_points, 3)
+    assert sample["target_points"].shape == (num_points, 3)
+    assert sample["fresh_points"].shape == (num_points, 3)
+    assert sample["source_normals"].shape == (num_points, 3)
+    assert sample["fresh_normals"].shape == (num_points, 3)
+    assert sample["source_points"].equal(sample["target_points"])
+    assert not sample["source_points"].equal(sample["fresh_points"])
+
+
 def test_manifest_rejects_cross_split_identity(tmp_path: Path) -> None:
     manifest = json.loads(FIXTURE_MANIFEST.read_text())
     manifest["splits"]["category_ood"][0] = manifest["splits"]["train"][0]
