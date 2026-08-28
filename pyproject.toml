@@ -33,11 +33,15 @@ cluster = [
   "websocket-client>=1.7",
 ]
 dev = [
+  "h5py>=3.8",
   "pytest>=8",
   "ruff>=0.6",
 ]
 figures = [
   "matplotlib>=3.8",
+]
+datasets = [
+  "h5py>=3.8",
 ]
 train = [
   "torch>=2.2",

@@ -38,8 +38,10 @@ from pointconstellation.bitstream import (
 from pointconstellation.data import (
     MeshSurfaceDataset,
     ProceduralPointCloudDataset,
+    RawPointCloudDataset,
     file_sha256,
     load_mesh_manifest,
+    load_pointcloud_manifest,
 )
 from pointconstellation.losses import pairwise_squared
 from pointconstellation.models.bottleneck import VariableConstellationDecoder
@@ -64,6 +66,8 @@ class StabilityExperimentConfig:
     calibration_split: str = "train"
     mesh_ood_split: str = "category_ood"
     verify_mesh_hashes: bool = True
+    verify_pointcloud_hashes: bool = True
+    pointcloud_normal_neighbors: int = 16
     num_points: int = 2048
     constellation_size: int = 8
     training_constellation_sizes: tuple[int, ...] = (4, 8, 16, 32)
@@ -101,12 +105,18 @@ class StabilityExperimentConfig:
     output_dir: str = "artifacts/local/experiment_019_stability"
 
     def __post_init__(self) -> None:
-        if self.dataset_kind not in {"procedural", "mesh_manifest"}:
-            raise ValueError("dataset_kind must be procedural or mesh_manifest")
-        if self.dataset_kind == "mesh_manifest" and (
+        if self.dataset_kind not in {
+            "procedural",
+            "mesh_manifest",
+            "pointcloud_manifest",
+        }:
+            raise ValueError(
+                "dataset_kind must be procedural, mesh_manifest, or pointcloud_manifest"
+            )
+        if self.dataset_kind in {"mesh_manifest", "pointcloud_manifest"} and (
             self.dataset_root is None or self.dataset_manifest is None
         ):
-            raise ValueError("mesh_manifest datasets require root and manifest")
+            raise ValueError("manifest datasets require root and manifest")
         # Keep checkpoint selection structurally unable to read a test split.
         if self.calibration_split not in {"train", "calibration"}:
             raise ValueError("calibration_split must be train or calibration")
@@ -114,6 +124,8 @@ class StabilityExperimentConfig:
             raise ValueError("procedural calibration must be held out from train")
         if self.num_points < 8:
             raise ValueError("num_points must be at least 8")
+        if self.pointcloud_normal_neighbors < 3:
+            raise ValueError("pointcloud_normal_neighbors must be at least 3")
         if not 2 <= self.constellation_size <= self.num_points:
             raise ValueError("constellation_size must be between 2 and num_points")
         if (
@@ -200,6 +212,21 @@ def _mesh_dataset(config: StabilityExperimentConfig, split: str) -> MeshSurfaceD
     )
 
 
+def _pointcloud_dataset(
+    config: StabilityExperimentConfig, split: str
+) -> RawPointCloudDataset:
+    assert config.dataset_root is not None and config.dataset_manifest is not None
+    return RawPointCloudDataset(
+        Path(config.dataset_root),
+        Path(config.dataset_manifest),
+        split=split,
+        num_points=config.num_points,
+        seed=config.data_seed,
+        normal_neighbors=config.pointcloud_normal_neighbors,
+        verify_hashes=config.verify_pointcloud_hashes,
+    )
+
+
 def _datasets(config: StabilityExperimentConfig) -> DatasetMap:
     """Build disjoint train/calibration data and untouched evaluation splits."""
 
@@ -233,7 +260,10 @@ def _datasets(config: StabilityExperimentConfig) -> DatasetMap:
             ),
         }
 
-    train = _mesh_dataset(config, "train")
+    dataset_factory = (
+        _mesh_dataset if config.dataset_kind == "mesh_manifest" else _pointcloud_dataset
+    )
+    train = dataset_factory(config, "train")
     if config.calibration_split == "train":
         expected = config.train_samples + config.calibration_samples
         if len(train) != expected:
@@ -252,15 +282,15 @@ def _datasets(config: StabilityExperimentConfig) -> DatasetMap:
                 f"manifest train has {len(train)} records; expected "
                 f"{config.train_samples}"
             )
-        calibration = _mesh_dataset(config, "calibration")
+        calibration = dataset_factory(config, "calibration")
         training = train
         if len(calibration) != config.calibration_samples:
             raise ValueError(
                 f"manifest calibration has {len(calibration)} records; expected "
                 f"{config.calibration_samples}"
             )
-    validation = _mesh_dataset(config, "validation")
-    ood = _mesh_dataset(config, config.mesh_ood_split)
+    validation = dataset_factory(config, "validation")
+    ood = dataset_factory(config, config.mesh_ood_split)
     expected_evaluation = {
         "validation": (validation, config.validation_samples),
         "ood": (ood, config.ood_samples),
@@ -281,7 +311,7 @@ def _datasets(config: StabilityExperimentConfig) -> DatasetMap:
 def _membership_records(dataset: Dataset[dict[str, Any]]) -> list[str]:
     if isinstance(dataset, Subset):
         parent = dataset.dataset
-        if isinstance(parent, MeshSurfaceDataset):
+        if isinstance(parent, (MeshSurfaceDataset, RawPointCloudDataset)):
             return [
                 f"{parent.records[index]['category']}:"
                 f"{parent.records[index]['model_id']}"
@@ -289,7 +319,7 @@ def _membership_records(dataset: Dataset[dict[str, Any]]) -> list[str]:
             ]
         if isinstance(parent, ProceduralPointCloudDataset):
             return [f"{parent.split}:{index}" for index in dataset.indices]
-    if isinstance(dataset, MeshSurfaceDataset):
+    if isinstance(dataset, (MeshSurfaceDataset, RawPointCloudDataset)):
         return [
             f"{record['category']}:{record['model_id']}" for record in dataset.records
         ]
@@ -329,10 +359,14 @@ def _data_protocol(
         "all_partitions_pairwise_disjoint": all(disjoint.values()),
         "pairwise_disjoint": disjoint,
     }
-    if config.dataset_kind == "mesh_manifest":
+    if config.dataset_kind in {"mesh_manifest", "pointcloud_manifest"}:
         assert config.dataset_manifest is not None
         manifest_path = Path(config.dataset_manifest)
-        manifest = load_mesh_manifest(manifest_path)
+        manifest = (
+            load_mesh_manifest(manifest_path)
+            if config.dataset_kind == "mesh_manifest"
+            else load_pointcloud_manifest(manifest_path)
+        )
         manifest_sha256 = file_sha256(manifest_path)
         if (
             config.expected_manifest_sha256 is not None
@@ -345,34 +379,77 @@ def _data_protocol(
         calibration_records = manifest["splits"][config.calibration_split]
         validation_records = manifest["splits"]["validation"]
         ood_records = manifest["splits"][config.mesh_ood_split]
-        if any(
-            record.get("official_split") != "train"
-            for record in (*train_records, *calibration_records)
+        all_records = (
+            *train_records,
+            *calibration_records,
+            *validation_records,
+            *ood_records,
+        )
+        has_official_splits = any("official_split" in record for record in all_records)
+        if has_official_splits:
+            if any(
+                record.get("official_split") != "train"
+                for record in (*train_records, *calibration_records)
+            ):
+                raise ValueError(
+                    "train/calibration records must be official training data"
+                )
+            if any(
+                record.get("official_split") != "test"
+                for record in (*validation_records, *ood_records)
+            ):
+                raise ValueError("validation/OOD records must be official test data")
+        elif any(
+            record.get("manifest_role") != split
+            for split, records in (
+                ("train", train_records),
+                (config.calibration_split, calibration_records),
+                ("validation", validation_records),
+                (config.mesh_ood_split, ood_records),
+            )
+            for record in records
         ):
-            raise ValueError("train/calibration records must be official training data")
-        if any(
-            record.get("official_split") != "test"
-            for record in (*validation_records, *ood_records)
-        ):
-            raise ValueError("validation/OOD records must be official test data")
+            raise ValueError("manifest record role differs from its declared split")
         trained_categories = {record["category"] for record in train_records}
         calibration_categories = {record["category"] for record in calibration_records}
+        validation_categories = {record["category"] for record in validation_records}
         heldout_categories = {record["category"] for record in ood_records}
         if not calibration_categories <= trained_categories:
             raise ValueError("calibration includes a category absent from training")
-        if calibration_categories & heldout_categories:
-            raise ValueError("calibration includes a held-out OOD category")
+        if not validation_categories <= trained_categories:
+            raise ValueError("validation includes a category absent from training")
+        if (calibration_categories | validation_categories) & heldout_categories:
+            raise ValueError("an ID evaluation role includes a held-out OOD category")
         identity.update(
             {
                 "dataset": manifest["dataset"],
                 "manifest_sha256": manifest_sha256,
                 "mesh_ood_split": config.mesh_ood_split,
-                "verify_mesh_hashes": config.verify_mesh_hashes,
+                "verify_hashes": (
+                    config.verify_mesh_hashes
+                    if config.dataset_kind == "mesh_manifest"
+                    else config.verify_pointcloud_hashes
+                ),
+                "verify_mesh_hashes": (
+                    config.verify_mesh_hashes
+                    if config.dataset_kind == "mesh_manifest"
+                    else None
+                ),
+                "verify_pointcloud_hashes": (
+                    config.verify_pointcloud_hashes
+                    if config.dataset_kind == "pointcloud_manifest"
+                    else None
+                ),
                 "official_split_checks": {
-                    "train_and_calibration_are_official_train": True,
-                    "validation_and_ood_are_official_test": True,
+                    "applicable": has_official_splits,
+                    "train_and_calibration_are_official_train": has_official_splits,
+                    "validation_and_ood_are_official_test": has_official_splits,
                     "calibration_categories_exclude_heldout": True,
+                    "validation_categories_exclude_heldout": True,
                 },
+                "normals_estimated": manifest.get("sampling", {}).get(
+                    "normals_estimated", False
+                ),
             }
         )
     return identity
@@ -809,6 +886,7 @@ def _batch_metadata(batch: Mapping[str, Any], index: int) -> dict[str, Any]:
         "sample_id": int(item("sample_id", index)),
         "family": str(item("family", "unknown")),
         "model_id": str(item("model_id", item("sample_id", index))),
+        "normals_estimated": bool(item("normals_estimated", False)),
     }
 
 

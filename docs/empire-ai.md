@@ -106,6 +106,17 @@ Inspect recorded jobs with:
 .venv/bin/python scripts/empire_gpu.py jobs --all
 ```
 
+After staging the licensed local data and ignored manifests, dispatch the two
+external-dataset stability protocols with:
+
+```bash
+scripts/launch_empire_experiment_028.sh
+scripts/launch_empire_experiment_029.sh
+```
+
+Their dataset preparation and split contracts are in
+[`datasets.md`](datasets.md).
+
 The manifest is observational. A disappeared allocation can leave a job marked
 running; compare with `squeue --me` before assuming work is active.
 
