@@ -1,8 +1,9 @@
-"""Official MPEG D1/D2 evaluation for stabilized Experiment 019 models."""
+"""Official MPEG D1/D2 evaluation through stabilized Experiment 019 models."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import tempfile
@@ -14,14 +15,20 @@ from typing import Any
 import numpy as np
 import torch
 
-from pointconstellation.bitstream import HEADER
+from pointconstellation.bitstream import HEADER, expected_stream_bytes
 from pointconstellation.codecs import run_pc_error
 from pointconstellation.data import (
     MeshSurfaceDataset,
     file_sha256,
     load_mesh_manifest,
 )
-from pointconstellation.refiner_experiment import _fps, _state_hash
+from pointconstellation.losses import chamfer_squared_chunked
+from pointconstellation.refiner_experiment import _state_hash
+from pointconstellation.selection_baselines import (
+    SELECTION_METHODS,
+    SELECTION_REPRESENTATIONS,
+    SELECTION_TRIALS,
+)
 from pointconstellation.stability_experiment import (
     StabilityExperimentConfig,
     _data_protocol,
@@ -35,11 +42,12 @@ from pointconstellation.train import select_device
 
 METRICS = ("d1_mse", "d2_mse")
 SPLITS = ("validation", "ood")
+DEFAULT_METHODS = ("fps", "refiner")
 
 
 @dataclass(frozen=True)
 class OfficialStabilityConfig:
-    """Configuration for the selected Experiment 020 official-metric pass."""
+    """Configuration for official frozen-decoder metric passes."""
 
     stability_config: str = "configs/experiment_019_stability_modelnet40.json"
     stability_artifact_dir: str = "artifacts/local/experiment_019_stability_modelnet40"
@@ -48,6 +56,8 @@ class OfficialStabilityConfig:
     timeout_seconds: float = 120.0
     decoder_seeds: tuple[int, ...] = (7, 17, 29, 41, 53, 67)
     refiner_seeds: tuple[int, ...] = (101, 211, 307)
+    methods: tuple[str, ...] = DEFAULT_METHODS
+    selection_seed: int = 20_260_821
     splits: tuple[str, ...] = SPLITS
     max_clouds_per_split: int | None = None
     bootstrap_samples: int = 10_000
@@ -72,6 +82,15 @@ class OfficialStabilityConfig:
             self.refiner_seeds
         ):
             raise ValueError("refiner_seeds must contain at least two unique seeds")
+        if not self.methods or len(set(self.methods)) != len(self.methods):
+            raise ValueError("methods must be nonempty and unique")
+        unknown_methods = set(self.methods) - ({"refiner"} | set(SELECTION_METHODS))
+        if unknown_methods:
+            raise ValueError(f"unknown official methods: {sorted(unknown_methods)}")
+        if not {"fps", "refiner"}.issubset(self.methods):
+            raise ValueError("methods must include fps and refiner for paired gates")
+        if not 0 <= self.selection_seed < 2**63:
+            raise ValueError("selection_seed must be a nonnegative 63-bit integer")
         if not self.splits or len(set(self.splits)) != len(self.splits):
             raise ValueError("splits must be nonempty and unique")
         if set(self.splits) - set(SPLITS):
@@ -108,7 +127,7 @@ class OfficialStabilityConfig:
     @classmethod
     def from_json(cls, path: Path) -> OfficialStabilityConfig:
         values = json.loads(path.read_text())
-        for key in ("decoder_seeds", "refiner_seeds", "splits"):
+        for key in ("decoder_seeds", "refiner_seeds", "methods", "splits"):
             if key in values:
                 values[key] = tuple(values[key])
         return cls(**values)
@@ -377,13 +396,59 @@ def _bootstrap_comparison(
     }
 
 
+def _named_bootstrap_comparison(
+    baseline: np.ndarray,
+    candidate: np.ndarray,
+    categories: np.ndarray,
+    *,
+    baseline_method: str,
+    candidate_method: str,
+    samples: int,
+    confidence_level: float,
+    seed: int,
+    decoder_seeds: tuple[int, ...],
+) -> dict[str, Any]:
+    comparison = _bootstrap_comparison(
+        baseline,
+        candidate,
+        categories,
+        samples=samples,
+        confidence_level=confidence_level,
+        seed=seed,
+    )
+    comparison["baseline_method"] = baseline_method
+    comparison["candidate_method"] = candidate_method
+    comparison["candidate_replicate_count"] = comparison.pop("refiner_count")
+    comparison["aggregate_baseline_rmse_grid_units"] = comparison.pop(
+        "aggregate_fps_rmse_grid_units"
+    )
+    comparison["aggregate_candidate_rmse_grid_units"] = comparison.pop(
+        "aggregate_refiner_rmse_grid_units"
+    )
+    comparison["decoders_candidate_better"] = comparison.pop("decoders_better_than_fps")
+    comparison["every_decoder_candidate_better"] = comparison.pop(
+        "every_decoder_better_than_fps"
+    )
+    for decoder_seed, per_decoder in zip(
+        decoder_seeds, comparison["per_decoder"], strict=True
+    ):
+        per_decoder["decoder_seed"] = decoder_seed
+        per_decoder.pop("decoder_index")
+        per_decoder["baseline_rmse_grid_units"] = per_decoder.pop("fps_rmse_grid_units")
+        per_decoder["candidate_rmse_grid_units"] = per_decoder.pop(
+            "refiner_rmse_grid_units"
+        )
+    return comparison
+
+
 def summarize_official_rows(
     rows: list[dict[str, Any]], config: OfficialStabilityConfig
 ) -> dict[str, Any]:
     """Aggregate complete official rows into the predeclared paired gates."""
 
     indexed = {_row_key(row): row for row in rows}
-    comparisons = []
+    comparisons: list[dict[str, Any]] = []
+    selection_methods = [method for method in config.methods if method != "refiner"]
     for split_index, split in enumerate(config.splits):
         cloud_keys = sorted(
             {
@@ -396,24 +461,27 @@ def summarize_official_rows(
             raise RuntimeError(f"no official rows for split={split}")
         categories = np.asarray([key[0] for key in cloud_keys])
         for metric_index, metric in enumerate(METRICS):
-            fps = np.asarray(
-                [
+            selections = {
+                method: np.asarray(
                     [
-                        indexed[
-                            (
-                                split,
-                                "fps",
-                                decoder_seed,
-                                None,
-                                *cloud_key,
-                            )
-                        ][metric]
-                        for cloud_key in cloud_keys
-                    ]
-                    for decoder_seed in config.decoder_seeds
-                ],
-                dtype=np.float64,
-            )
+                        [
+                            indexed[
+                                (
+                                    split,
+                                    method,
+                                    decoder_seed,
+                                    None,
+                                    *cloud_key,
+                                )
+                            ][metric]
+                            for cloud_key in cloud_keys
+                        ]
+                        for decoder_seed in config.decoder_seeds
+                    ],
+                    dtype=np.float64,
+                )
+                for method in selection_methods
+            }
             refiner = np.asarray(
                 [
                     [
@@ -435,34 +503,79 @@ def summarize_official_rows(
                 ],
                 dtype=np.float64,
             )
-            comparison = _bootstrap_comparison(
-                fps,
-                refiner,
-                categories,
-                samples=config.bootstrap_samples,
-                confidence_level=config.confidence_level,
-                seed=config.bootstrap_seed + 10_000 * split_index + metric_index,
+            comparison_seed = (
+                config.bootstrap_seed + 10_000 * split_index + 100 * metric_index
             )
-            for decoder_seed, per_decoder in zip(
-                config.decoder_seeds, comparison["per_decoder"], strict=True
-            ):
-                per_decoder["decoder_seed"] = decoder_seed
-                per_decoder.pop("decoder_index")
-            comparisons.append({"split": split, "metric": metric, **comparison})
-    validation = [row for row in comparisons if row["split"] == "validation"]
+            for method_index, method in enumerate(selection_methods):
+                comparison = _named_bootstrap_comparison(
+                    selections[method],
+                    refiner,
+                    categories,
+                    baseline_method=method,
+                    candidate_method="refiner",
+                    samples=config.bootstrap_samples,
+                    confidence_level=config.confidence_level,
+                    seed=comparison_seed + method_index,
+                    decoder_seeds=config.decoder_seeds,
+                )
+                comparisons.append(
+                    {
+                        "split": split,
+                        "metric": metric,
+                        "comparison_role": "refiner_vs_selection",
+                        **comparison,
+                    }
+                )
+            for method_index, method in enumerate(selection_methods):
+                if method == "fps":
+                    continue
+                comparison = _named_bootstrap_comparison(
+                    selections["fps"],
+                    selections[method][:, None, :],
+                    categories,
+                    baseline_method="fps",
+                    candidate_method=method,
+                    samples=config.bootstrap_samples,
+                    confidence_level=config.confidence_level,
+                    seed=comparison_seed + len(selection_methods) + method_index,
+                    decoder_seeds=config.decoder_seeds,
+                )
+                comparisons.append(
+                    {
+                        "split": split,
+                        "metric": metric,
+                        "comparison_role": "selection_vs_fps",
+                        **comparison,
+                    }
+                )
+    validation_refiner = [
+        row
+        for row in comparisons
+        if row["split"] == "validation"
+        and row["comparison_role"] == "refiner_vs_selection"
+    ]
+    validation_fps = [
+        row for row in validation_refiner if row["baseline_method"] == "fps"
+    ]
     return {
         "comparison_definition": (
             "paired hierarchical category/cloud bootstrap with paired decoder and "
-            "common-refiner factor resampling; primary quantity is relative RMSE "
-            "computed from official symmetric MSE"
+            "common-refiner factor resampling; baseline candidates have one fixed "
+            "replicate; primary quantity is relative RMSE computed from official "
+            "symmetric MSE"
         ),
         "comparisons": comparisons,
         "official_metric_gate_passes": bool(
-            len(validation) == len(METRICS)
+            len(validation_fps) == len(METRICS)
             and all(
-                row["every_decoder_better_than_fps"] and row["passes_positive_interval"]
-                for row in validation
+                row["every_decoder_candidate_better"]
+                and row["passes_positive_interval"]
+                for row in validation_fps
             )
+        ),
+        "selection_baseline_gate_passes": bool(
+            len(validation_refiner) == len(selection_methods) * len(METRICS)
+            and all(row["passes_positive_interval"] for row in validation_refiner)
         ),
     }
 
@@ -529,6 +642,40 @@ def _load_models(
     return decoder, refiner, metadata
 
 
+def _method_seed(
+    config: OfficialStabilityConfig,
+    *,
+    method: str,
+    split: str,
+    sample: dict[str, Any],
+) -> int:
+    seed_family = {
+        "fps_random_start_best_of_8": "fps_random_start",
+        "random_best_of_1": "random_best_of_n",
+        "random_best_of_16": "random_best_of_n",
+    }.get(method, method)
+    identity = json.dumps(
+        [
+            config.selection_seed,
+            seed_family,
+            split,
+            str(sample["family"]),
+            str(sample["model_id"]),
+            int(sample["sample_id"]),
+        ],
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(identity.encode()).digest()
+    return int.from_bytes(digest[:8], "big") % (2**63)
+
+
+def _synchronize(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()
+
+
 def _evaluate_method(
     stability: StabilityExperimentConfig,
     official: OfficialStabilityConfig,
@@ -541,16 +688,39 @@ def _evaluate_method(
     sample: dict[str, Any],
     device: torch.device,
     scratch_root: Path,
+    method: str | None = None,
 ) -> dict[str, Any]:
     source = sample["source_points"].unsqueeze(0).to(device)
     normals = sample["source_normals"].cpu().numpy()
-    method = "fps" if refiner is None else "refiner"
+    method = method or ("fps" if refiner is None else "refiner")
+    if method == "refiner" and refiner is None:
+        raise ValueError("refiner evaluation requires a refiner model")
+    if method != "refiner" and refiner is not None:
+        raise ValueError("selection baseline evaluation cannot receive a refiner")
+    if method not in {"refiner"} | set(SELECTION_METHODS):
+        raise ValueError(f"unknown official method: {method}")
+
+    selection_seed: int | None = None
+    representation_class = "free-coordinate"
+    selection_trials: int | None = None
+    bitstream_mode = "free"
+
+    def scorer(candidate: torch.Tensor) -> float:
+        with torch.no_grad():
+            reconstruction = decoder(
+                candidate.unsqueeze(0), num_output_points=stability.num_points
+            )
+            loss = chamfer_squared_chunked(
+                reconstruction,
+                source,
+                chunk_size=stability.distance_chunk_size,
+            )
+        return float(loss.item())
+
+    _synchronize(device)
     encode_started = time.perf_counter()
-    if refiner is None:
-        coordinates = _fps(
-            source, stability.constellation_size, stability.coordinate_bits
-        )
-    else:
+    if method == "refiner":
+        assert refiner is not None
         coordinates = refiner(
             source,
             stability.constellation_size,
@@ -558,15 +728,35 @@ def _evaluate_method(
             target=source,
             num_output_points=stability.num_points,
         )
+    else:
+        selection_seed = _method_seed(
+            official, method=method, split=split, sample=sample
+        )
+        coordinates = SELECTION_METHODS[method](
+            source[0],
+            stability.constellation_size,
+            stability.coordinate_bits,
+            selection_seed,
+            scorer,
+        ).unsqueeze(0)
+        representation_class = SELECTION_REPRESENTATIONS[method]
+        selection_trials = SELECTION_TRIALS[method]
+        if method == "fps":
+            bitstream_mode = "fps"
+        elif representation_class == "strict-subset":
+            bitstream_mode = "strict_subset"
     decoded, packets, exact, lattice_exact = _serialized_coordinates(
         coordinates,
         config=stability,
-        mode="fps" if refiner is None else "free",
+        mode=bitstream_mode,
     )
+    _synchronize(device)
     encode_seconds = time.perf_counter() - encode_started
+    _synchronize(device)
     decode_started = time.perf_counter()
     with torch.no_grad():
         reconstruction = decoder(decoded, num_output_points=stability.num_points)
+    _synchronize(device)
     decode_seconds = time.perf_counter() - decode_started
     with tempfile.TemporaryDirectory(
         prefix=(
@@ -604,9 +794,14 @@ def _evaluate_method(
         "payload_bpp": 8.0 * packet.payload_bytes / stability.num_points,
         "stream_bytes": packet.stream_bytes,
         "actual_stream_bpp": 8.0 * packet.stream_bytes / stability.num_points,
+        "representation_class": representation_class,
+        "bitstream_mode": bitstream_mode,
+        "selection_seed": selection_seed,
+        "selection_trials": selection_trials,
         "serialized_round_trip_exact": exact,
         "coordinates_on_exact_lattice": lattice_exact,
         "source_only_decoder_gradient": True,
+        "selection_uses_source_only_information": True,
         "encode_seconds": encode_seconds,
         "decode_seconds": decode_seconds,
         "official_metric_seconds": metric.elapsed_seconds,
@@ -627,6 +822,9 @@ def run_official_stability(
         raise ValueError("official refiner seeds must match Experiment 019 exactly")
     if config.position_bits != stability.coordinate_bits:
         raise ValueError("official metric grid must match constellation precision")
+    experiment = config.experiment_name
+    if experiment == "020_official_stability" and config.methods != DEFAULT_METHODS:
+        experiment = "021_selection_baselines"
     executable = Path(config.pc_error_executable)
     if not executable.is_file() or not executable.stat().st_mode & 0o111:
         raise FileNotFoundError(f"pc_error is missing or not executable: {executable}")
@@ -657,7 +855,7 @@ def run_official_stability(
     scratch_root.mkdir(exist_ok=True)
     manifest_path = output_dir / "run_manifest.json"
     run_manifest = {
-        "experiment": config.experiment_name,
+        "experiment": experiment,
         "config": _json_ready(asdict(config)),
         "stability_config_sha256": file_sha256(stability_path),
         "stability_metrics_sha256": file_sha256(stability_metrics_path),
@@ -668,7 +866,7 @@ def run_official_stability(
         run_manifest["experiment_019_data_protocol"] = training_protocol
     if manifest_path.exists():
         if json.loads(manifest_path.read_text()) != run_manifest:
-            raise RuntimeError("existing Experiment 020 run manifest does not match")
+            raise RuntimeError(f"existing Experiment {experiment[:3]} manifest differs")
     else:
         manifest_path.write_text(json.dumps(run_manifest, indent=2) + "\n")
 
@@ -679,10 +877,16 @@ def run_official_stability(
     existing_sizes = {row["stream_bytes"] for row in rows}
     if len(existing_sizes) > 1:
         raise RuntimeError("resumed constellation streams have inconsistent sizes")
+    declared_stream_bytes = expected_stream_bytes(
+        stability.constellation_size, stability.coordinate_bits
+    )
+    if existing_sizes and existing_sizes != {declared_stream_bytes}:
+        raise RuntimeError("resumed stream size differs from the declared fixed rate")
     device = select_device(device_name)
     started = time.perf_counter()
     model_records = []
-    expected_bytes = next(iter(existing_sizes), None)
+    expected_bytes = declared_stream_bytes
+    selection_methods = [method for method in config.methods if method != "refiner"]
     for decoder_seed in config.decoder_seeds:
         decoder, _, decoder_metadata = _load_models(
             stability,
@@ -692,46 +896,50 @@ def run_official_stability(
             device=device,
         )
         decoder_hash_before = _state_hash(decoder)
-        for split in config.splits:
-            dataset = datasets[split]
-            count = (
-                len(dataset)
-                if config.max_clouds_per_split is None
-                else min(len(dataset), config.max_clouds_per_split)
-            )
-            for sample_index in range(count):
-                sample = dataset[sample_index]
-                key = (
-                    split,
-                    "fps",
-                    decoder_seed,
-                    None,
-                    str(sample["family"]),
-                    str(sample["model_id"]),
-                    int(sample["sample_id"]),
+        for method in selection_methods:
+            for split in config.splits:
+                dataset = datasets[split]
+                count = (
+                    len(dataset)
+                    if config.max_clouds_per_split is None
+                    else min(len(dataset), config.max_clouds_per_split)
                 )
-                if key in completed:
-                    continue
-                row = _evaluate_method(
-                    stability,
-                    config,
-                    decoder=decoder,
-                    refiner=None,
-                    decoder_seed=decoder_seed,
-                    refiner_seed=None,
-                    split=split,
-                    sample=sample,
-                    device=device,
-                    scratch_root=scratch_root,
-                )
-                expected_bytes = (
-                    row["stream_bytes"] if expected_bytes is None else expected_bytes
-                )
-                if row["stream_bytes"] != expected_bytes:
-                    raise RuntimeError("constellation streams have inconsistent sizes")
-                _append_row(rows_path, row)
-                rows.append(row)
-                completed.add(key)
+                for sample_index in range(count):
+                    sample = dataset[sample_index]
+                    key = (
+                        split,
+                        method,
+                        decoder_seed,
+                        None,
+                        str(sample["family"]),
+                        str(sample["model_id"]),
+                        int(sample["sample_id"]),
+                    )
+                    if key in completed:
+                        continue
+                    row = _evaluate_method(
+                        stability,
+                        config,
+                        decoder=decoder,
+                        refiner=None,
+                        decoder_seed=decoder_seed,
+                        refiner_seed=None,
+                        split=split,
+                        sample=sample,
+                        device=device,
+                        scratch_root=scratch_root,
+                        method=method,
+                    )
+                    if row["stream_bytes"] != expected_bytes:
+                        raise RuntimeError(
+                            "constellation stream differs from the declared fixed rate"
+                        )
+                    _append_row(rows_path, row)
+                    rows.append(row)
+                    completed.add(key)
+
+        if _state_hash(decoder) != decoder_hash_before:
+            raise RuntimeError("decoder changed during selection baseline evaluation")
 
         for refiner_seed in config.refiner_seeds:
             decoder, refiner, metadata = _load_models(
@@ -773,11 +981,9 @@ def run_official_stability(
                         sample=sample,
                         device=device,
                         scratch_root=scratch_root,
+                        method="refiner",
                     )
-                    if (
-                        expected_bytes is not None
-                        and row["stream_bytes"] != expected_bytes
-                    ):
+                    if row["stream_bytes"] != expected_bytes:
                         raise RuntimeError(
                             "constellation streams have inconsistent sizes"
                         )
@@ -795,11 +1001,11 @@ def run_official_stability(
                 }
             )
         if _state_hash(decoder) != decoder_hash_before:
-            raise RuntimeError("decoder state drifted during official FPS evaluation")
+            raise RuntimeError("decoder state drifted during official evaluation")
 
     summary = summarize_official_rows(rows, config)
     result = {
-        "experiment": config.experiment_name,
+        "experiment": experiment,
         "config": _json_ready(asdict(config)),
         "device": str(device),
         "resumed_rows": resumed_rows,
@@ -823,6 +1029,9 @@ def run_official_stability(
                     for row in rows
                 )
             ),
+            "identical_declared_stream_bytes": bool(
+                rows and all(row["stream_bytes"] == expected_bytes for row in rows)
+            ),
             "exact_stream_round_trip": bool(
                 rows and all(row["serialized_round_trip_exact"] for row in rows)
             ),
@@ -831,6 +1040,17 @@ def run_official_stability(
             ),
             "source_only_decoder_gradient": bool(
                 rows and all(row["source_only_decoder_gradient"] for row in rows)
+            ),
+            "source_only_selection": bool(
+                rows
+                and all(row["selection_uses_source_only_information"] for row in rows)
+            ),
+            "representation_classes_declared": bool(
+                rows
+                and all(
+                    row["representation_class"] in {"free-coordinate", "strict-subset"}
+                    for row in rows
+                )
             ),
         },
         "tool_identity": {
@@ -844,7 +1064,9 @@ def run_official_stability(
         "per_cloud_path": str(rows_path),
     }
     if not all(result["contract_checks"].values()):
-        raise RuntimeError("Experiment 020 official metric contract failed")
+        raise RuntimeError(
+            f"Experiment {experiment[:3]} official metric contract failed"
+        )
     (output_dir / "official_metrics.json").write_text(
         json.dumps(result, indent=2) + "\n"
     )
@@ -854,6 +1076,9 @@ def run_official_stability(
                 "experiment": result["experiment"],
                 "rows": result["per_cloud_rows"],
                 "official_metric_gate_passes": summary["official_metric_gate_passes"],
+                "selection_baseline_gate_passes": summary[
+                    "selection_baseline_gate_passes"
+                ],
                 "elapsed_seconds": result["elapsed_seconds"],
                 "metrics": str(output_dir / "official_metrics.json"),
             }
