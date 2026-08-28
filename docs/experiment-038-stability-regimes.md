@@ -1,7 +1,6 @@
 # Experiment 038: stabilized decoder regimes
 
 Status: complete; all eleven cells ran on EmpireAI with every contract check and gate passing.
-this worktree.
 
 ## Question and protocol
 
