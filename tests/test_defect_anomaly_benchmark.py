@@ -6,6 +6,7 @@ import inspect
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -38,13 +39,14 @@ def _sphere(count: int = 512) -> tuple[np.ndarray, np.ndarray]:
     return (0.7 * normals).astype(np.float32), normals.astype(np.float32)
 
 
-def _near_boundary_planes(side: int = 12) -> tuple[np.ndarray, np.ndarray]:
-    first, second = np.meshgrid(
-        np.linspace(-0.25, 0.25, side),
-        np.linspace(-0.25, 0.25, side),
-    )
+def _near_boundary_planes(count: int) -> tuple[np.ndarray, np.ndarray]:
+    if count % 2:
+        raise ValueError("boundary fixture count must be even")
+    rng = np.random.default_rng(79)
+    first = rng.uniform(-0.25, 0.25, size=count // 2)
+    second = rng.uniform(-0.25, 0.25, size=count // 2)
     positive = np.column_stack(
-        (np.full(first.size, 0.995), first.ravel(), second.ravel())
+        (np.full(len(first), 0.995), first, second)
     )
     negative = positive.copy()
     negative[:, 0] = -0.995
@@ -56,27 +58,30 @@ def _near_boundary_planes(side: int = 12) -> tuple[np.ndarray, np.ndarray]:
 
 def _install_fake_real_provider_dependencies(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class FakeProviderState:
-        def __init__(self, config, experiment_040, *, device_name):
-            del config, device_name
-            self.experiment_040 = experiment_040
+) -> type:
+    class MaximumEnforcingDecoderContext:
+        instances = []
 
-        def search(self, source, *, size, bits):
+        def __init__(self, config, *, decoder_seed, device_name):
+            del decoder_seed, device_name
+            self.config = config
+            self.stability = SimpleNamespace(num_points=2048)
+            self.requested_output_points = []
+            self.__class__.instances.append(self)
+
+        def search(self, source, *, constellation_size, bits, output_points):
             del bits
-            return np.asarray(source[:size], dtype=np.float64)
+            if output_points > self.stability.num_points:
+                raise ValueError("num_output_points exceeds the configured maximum")
+            self.requested_output_points.append(output_points)
+            return np.asarray(source[:constellation_size], dtype=np.float64)
 
         def decode(self, coordinates, output_points):
+            if output_points > self.stability.num_points:
+                raise ValueError("num_output_points exceeds the configured maximum")
+            self.requested_output_points.append(output_points)
             repeats = int(np.ceil(output_points / len(coordinates)))
             return np.tile(coordinates, (repeats, 1))[:output_points]
-
-        def base_decode(self, source, *, size, bits):
-            return self.decode(self.search(source, size=size, bits=bits), len(source))
-
-        def score(self, source, **kwargs):
-            method = kwargs["method"]
-            offset = 1.0 if method == "random" else 0.0
-            return np.arange(len(source), dtype=np.float64) + offset
 
     class FakeGpccFrontier:
         def __init__(self, config, experiment_040):
@@ -104,11 +109,13 @@ def _install_fake_real_provider_dependencies(
             return self.metadata_rows[(stream, payload_budget)]
 
     monkeypatch.setattr(
-        "pointconstellation.exp040_defect_codecs._ProviderState", FakeProviderState
+        "pointconstellation.exp040_defect_codecs.FrozenExperiment040CodecContext",
+        MaximumEnforcingDecoderContext,
     )
     monkeypatch.setattr(
         "pointconstellation.exp040_defect_codecs._GpccFrontier", FakeGpccFrontier
     )
+    return MaximumEnforcingDecoderContext
 
 
 def test_nonlearned_scorer_exceeds_raw_smoke_auroc() -> None:
@@ -207,7 +214,8 @@ def test_smoke_and_full_configs_are_valid_and_use_three_scorer_seeds() -> None:
     assert smoke.experiment_040_decoder_seed == 7
     assert smoke.selective_score_method == "decoder_residual"
     assert smoke.selective_preserved_fraction == 0.5
-    assert smoke.defect_types == ("dent",)
+    assert smoke.num_points == full.num_points == 2048
+    assert smoke.defect_types == ("bump", "thin_spur")
     assert len(smoke.scorer_seeds) == len(full.scorer_seeds) == 3
     assert smoke.payload_budgets == full.payload_budgets == (40, 52, 64, 78, 96, 110)
 
@@ -222,7 +230,7 @@ def test_real_provider_arms_declare_consistent_bytes(
         Path("configs/experiment_041_defect_anomaly_smoke.json")
     )
     arms = build_codec_arms(config=config, device_name="cpu")
-    points, _ = _sphere(256)
+    points, _ = _sphere(config.num_points)
 
     assert len(arms) == 4 * len(config.payload_budgets)
     for arm in arms:
@@ -240,16 +248,22 @@ def test_real_provider_arms_declare_consistent_bytes(
         assert arm.codec.decode(stream).shape[1] == 3
 
 
-def test_boundary_defects_round_trip_through_every_real_provider(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("num_points", (2048, 1024))
+def test_every_defect_preserves_regime_through_real_provider_path(
+    monkeypatch: pytest.MonkeyPatch, num_points: int
 ) -> None:
     from pointconstellation.exp040_defect_codecs import build_codec_arms
 
-    _install_fake_real_provider_dependencies(monkeypatch)
+    decoder_context = _install_fake_real_provider_dependencies(monkeypatch)
     config = DefectAnomalyBenchmarkConfig.from_json(
         Path("configs/experiment_041_defect_anomaly_smoke.json")
     )
-    config = replace(config, payload_budgets=(40,), primary_payload_budget=40)
+    config = replace(
+        config,
+        num_points=num_points,
+        payload_budgets=(40,),
+        primary_payload_budget=40,
+    )
     provider_arms = build_codec_arms(config=config, device_name="cpu")
 
     class CapturingCodec:
@@ -274,7 +288,7 @@ def test_boundary_defects_round_trip_through_every_real_provider(
         captures.append(capture)
         arms.append(replace(arm, codec=capture))
 
-    points, normals = _near_boundary_planes()
+    points, normals = _near_boundary_planes(num_points)
     samples = []
     injected = []
     for index, defect_type in enumerate(DEFECT_TYPES):
@@ -302,16 +316,25 @@ def test_boundary_defects_round_trip_through_every_real_provider(
             )
         )
 
-    decoded, checks = _decode_samples(samples, arms)
+    decoded, checks = _decode_samples(
+        samples, arms, expected_point_count=num_points
+    )
 
     assert all(checks.values())
     assert all(
-        len(result.point_labels) == len(result.points)
+        len(result.points) == num_points
+        and len(result.point_labels) == num_points
         and np.all(result.points >= -1.0)
         and np.all(result.points <= 1.0)
         for result in injected
     )
     assert any(result.domain_scale_factor < 1.0 for result in injected)
+    assert decoder_context.instances
+    assert all(
+        request == num_points
+        for context in decoder_context.instances
+        for request in context.requested_output_points
+    )
     for capture in captures:
         assert len(capture.sources) == len(samples)
         for source, sample in zip(capture.sources, samples, strict=True):
@@ -321,6 +344,38 @@ def test_boundary_defects_round_trip_through_every_real_provider(
     for row, sample in zip(raw_rows, samples, strict=True):
         assert np.array_equal(row.decoded_points, sample.points)
         assert np.array_equal(row.decoded_labels, sample.point_labels)
+
+
+def test_real_provider_rejects_source_outside_declared_regime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pointconstellation.exp040_defect_codecs import build_codec_arms
+
+    _install_fake_real_provider_dependencies(monkeypatch)
+    config = DefectAnomalyBenchmarkConfig.from_json(
+        Path("configs/experiment_041_defect_anomaly_smoke.json")
+    )
+    config = replace(config, payload_budgets=(40,), primary_payload_budget=40)
+    arm = build_codec_arms(config=config, device_name="cpu")[0]
+    points, _ = _sphere(config.num_points + 1)
+
+    with pytest.raises(ValueError, match="declared Experiment 041 regime"):
+        arm.codec.encode(points)
+
+
+def test_real_provider_rejects_regime_above_sealed_decoder_maximum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pointconstellation.exp040_defect_codecs import build_codec_arms
+
+    _install_fake_real_provider_dependencies(monkeypatch)
+    config = DefectAnomalyBenchmarkConfig.from_json(
+        Path("configs/experiment_041_defect_anomaly_smoke.json")
+    )
+    config = replace(config, num_points=2049)
+
+    with pytest.raises(ValueError, match="sealed decoder maximum"):
+        build_codec_arms(config=config, device_name="cpu")
 
 
 def test_gpcc_provider_fresh_frontier_matches_payload_and_declares_delta(
@@ -373,7 +428,9 @@ def test_gpcc_provider_fresh_frontier_matches_payload_and_declares_delta(
     monkeypatch.setattr(
         "pointconstellation.exp040_defect_codecs.run_tmc3", fake_run_tmc3
     )
-    benchmark = DefectAnomalyBenchmarkConfig(output_dir=str(tmp_path / "output"))
+    benchmark = DefectAnomalyBenchmarkConfig(
+        num_points=64, output_dir=str(tmp_path / "output")
+    )
     experiment_040 = SelectiveExperimentConfig(
         gpcc_reference_path=str(reference), decoder_seeds=(7,)
     )
@@ -432,7 +489,9 @@ def test_codec_execution_never_receives_defect_labels() -> None:
         codec=codec,
     )
 
-    decoded, checks = _decode_samples([sample], [arm])
+    decoded, checks = _decode_samples(
+        [sample], [arm], expected_point_count=len(points)
+    )
 
     assert len(codec.encoded) == len(codec.decoded) == 1
     assert np.array_equal(codec.encoded[0], points)

@@ -54,7 +54,9 @@ DoubleArray = NDArray[np.float64]
 _UNIFORM_PADDING_BYTES = SELECTIVE_HEADER.size - HEADER.size
 
 
-def _source_points(source: FloatArray) -> FloatArray:
+def _source_points(
+    source: FloatArray, *, expected_point_count: int | None = None
+) -> FloatArray:
     values = np.asarray(source, dtype=np.float32)
     if values.ndim != 2 or values.shape[1] != 3 or not len(values):
         raise ValueError("codec source must have shape (N, 3) with N > 0")
@@ -62,11 +64,18 @@ def _source_points(source: FloatArray) -> FloatArray:
         raise ValueError("codec source must contain finite coordinates")
     if np.any(values < -1.0) or np.any(values > 1.0):
         raise ValueError("codec source must lie in [-1, 1]")
+    if expected_point_count is not None and len(values) != expected_point_count:
+        raise ValueError(
+            "codec source cardinality differs from the declared Experiment 041 "
+            f"regime: expected N={expected_point_count}, observed N={len(values)}"
+        )
     return values
 
 
-def _canonical_source(source: FloatArray) -> FloatArray:
-    values = _source_points(source)
+def _canonical_source(
+    source: FloatArray, *, expected_point_count: int | None = None
+) -> FloatArray:
+    values = _source_points(source, expected_point_count=expected_point_count)
     order = np.lexsort((values[:, 2], values[:, 1], values[:, 0]))
     return np.ascontiguousarray(values[order])
 
@@ -121,20 +130,38 @@ class _ProviderState:
             decoder_seed=config.experiment_040_decoder_seed,
             device_name=device_name,
         )
+        self.output_points = config.num_points
+        self.decoder_maximum_output_points = self.context.stability.num_points
+        if self.output_points > self.decoder_maximum_output_points:
+            raise ValueError(
+                "Experiment 041 regime exceeds the sealed decoder maximum: "
+                f"N={self.output_points}, maximum={self.decoder_maximum_output_points}"
+            )
         self._searches: dict[tuple[str, int, int], DoubleArray] = {}
         self._base_decodes: dict[tuple[str, int, int], DoubleArray] = {}
         self._geometry: dict[str, Any] = {}
 
     def search(self, source: FloatArray, *, size: int, bits: int) -> DoubleArray:
-        digest = _source_digest(source)
+        values = _canonical_source(
+            source, expected_point_count=self.output_points
+        )
+        digest = _source_digest(values)
         key = (digest, size, bits)
         if key not in self._searches:
             self._searches[key] = self.context.search(
-                _canonical_source(source), constellation_size=size, bits=bits
+                values,
+                constellation_size=size,
+                bits=bits,
+                output_points=self.output_points,
             )
         return self._searches[key].copy()
 
     def decode(self, coordinates: DoubleArray, output_points: int) -> DoubleArray:
+        if output_points != self.output_points:
+            raise ValueError(
+                "decoder request differs from the declared Experiment 041 regime: "
+                f"expected N={self.output_points}, observed N={output_points}"
+            )
         return self.context.decode(coordinates, output_points)
 
     def base_decode(
@@ -144,7 +171,7 @@ class _ProviderState:
         key = (digest, size, bits)
         if key not in self._base_decodes:
             self._base_decodes[key] = self.decode(
-                self.search(source, size=size, bits=bits), len(source)
+                self.search(source, size=size, bits=bits), self.output_points
             )
         return self._base_decodes[key].copy()
 
@@ -157,7 +184,9 @@ class _ProviderState:
         payload_budget: int,
         preserved_fraction: float,
     ) -> DoubleArray:
-        values = _source_points(source).astype(np.float64)
+        values = _source_points(
+            source, expected_point_count=self.output_points
+        ).astype(np.float64)
         if method == "decoder_residual":
             return decoder_residual_score(
                 values,
@@ -216,13 +245,15 @@ class _ConstellationCodec:
         self.payload_bytes = expected_payload_bytes(size, bits)
 
     def encode(self, source: FloatArray) -> bytes:
-        values = _canonical_source(source)
+        values = _canonical_source(
+            source, expected_point_count=self.state.output_points
+        )
         coordinates = self.state.search(values, size=self.size, bits=self.bits)
         canonical = encode_constellation(
             coordinates,
             bits=self.bits,
             mode=MODE_FIXED,
-            output_points=len(values),
+            output_points=self.state.output_points,
         )
         stream = canonical + bytes(_UNIFORM_PADDING_BYTES)
         if len(stream) != self.target_bytes:
@@ -235,6 +266,8 @@ class _ConstellationCodec:
         if any(stream[-_UNIFORM_PADDING_BYTES:]):
             raise ValueError("constellation rate-matching padding is nonzero")
         packet = decode_constellation(stream[:-_UNIFORM_PADDING_BYTES])
+        if packet.output_points != self.state.output_points:
+            raise ValueError("constellation stream output count differs from regime")
         return self.state.decode(packet.coordinates, packet.output_points).astype(
             np.float32
         )
@@ -273,7 +306,9 @@ class _SelectiveCodec:
         self.payload_bytes = expected_payload_bytes(k1 + k2, bits)
 
     def encode(self, source: FloatArray) -> bytes:
-        values = _canonical_source(source)
+        values = _canonical_source(
+            source, expected_point_count=self.state.output_points
+        )
         coordinates = self.state.search(values, size=self.k1, bits=self.bits)
         base = self.state.base_decode(values, size=self.k1, bits=self.bits)
         scores = self.state.score(
@@ -293,7 +328,7 @@ class _SelectiveCodec:
             coordinates,
             values[indices],
             bits=self.bits,
-            output_points=len(values),
+            output_points=self.state.output_points,
         )
         if len(stream) != self.target_bytes:
             raise RuntimeError("selective stream differs from target bytes")
@@ -303,6 +338,8 @@ class _SelectiveCodec:
         if len(stream) != self.target_bytes:
             raise ValueError("selective stream differs from target bytes")
         decoded = decode_selective_message(stream, decoder=self.state.decode)
+        if decoded.packet.output_points != self.state.output_points:
+            raise ValueError("selective stream output count differs from regime")
         return decoded.reconstruction.astype(np.float32)
 
     def rate_metadata(self, stream: bytes) -> dict[str, Any]:
@@ -343,7 +380,9 @@ class _GpccFrontier:
         self._metadata: dict[tuple[str, int], dict[str, Any]] = {}
 
     def _frontier(self, source: FloatArray) -> tuple[_GpccCell, ...]:
-        values = _canonical_source(source)
+        values = _canonical_source(
+            source, expected_point_count=self.config.num_points
+        )
         digest = _source_digest(values)
         if digest not in self._frontiers:
             cells = []

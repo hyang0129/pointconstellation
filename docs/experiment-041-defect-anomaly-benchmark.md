@@ -4,7 +4,9 @@ Status: implementation and real-codec CPU smoke complete. Full benchmark
 results are pending selection of the Experiment 040 score/split cell and the
 predeclared full run. The first full cluster attempt is invalid: defect
 injection could leave the codecs' declared domain and stopped before producing
-a complete result.
+a complete result. The second full cluster attempt is also invalid: its first
+thin-spur condition exceeded the sealed decoder's fixed cardinality regime and
+again stopped before producing a complete result.
 
 ## Question and hypothesis
 
@@ -38,27 +40,44 @@ defect:
 
 - `dent`: a cosine-tapered local inward displacement;
 - `bump`: the corresponding outward displacement;
-- `hole`: deletion of a local disk of finite samples;
-- `thin_spur`: addition of a narrow, outward point sequence; and
+- `hole`: removal of a local disk followed by deterministic resampling from the
+  surviving finite samples;
+- `thin_spur`: relocation of a local patch into a narrow, outward point
+  sequence; and
 - `surface_noise`: a local, randomly directed displacement patch.
 
 The seed is the SHA-256-derived tuple `(defect_seed, cloud_id, defect_type)`, so
 the result does not depend on dataloader or manifest traversal order. A defect
 fraction is sampled in `[0.01, 0.05]` and rounded to an integer count that stays
-inside those bounds. Dent, bump, and noise preserve `N`; a spur returns `N + K`
-points; and a hole returns `N - K` points. The runner records requested and
-realized fractions and the hole's removed count.
+inside those bounds. The declared regime is exactly `N=2048` source points for
+the checked full and smoke configurations. Every control and defect returns
+exactly that `N`: dent, bump, and noise displace selected source samples; a spur
+relocates its selected local patch rather than appending samples; and a hole
+removes its patch and restores `N` by deterministically resampling points from
+the surviving empirical cloud. The hole resamples existing coordinates without
+jitter, so it does not invent a continuous surface. The runner records the
+requested and realized fractions and the hole's removed count; under this
+policy the replacement count equals that removed count.
 
-Every returned point has an aligned binary label. A deleted point cannot carry
-a label, so a hole labels the equally sized nearest surviving rim and separately
-records the deleted count. This is a point-task convention, not a claim that
-the finite observed cloud samples the interior of an underlying continuous
-hole.
+Every returned point has an aligned binary label of length `N`. A deleted point
+cannot carry a label, so a hole labels the equally sized nearest surviving rim,
+labels its resampled duplicates as normal, and separately records the deleted
+count. This is a point-task convention, not a claim that the finite observed
+cloud samples the interior of an underlying continuous hole.
+
+The cardinality policy is a hard protocol constraint, not a decode-time repair.
+`DefectResult` rejects every injection whose returned coordinate or label count
+differs from its source count; the benchmark additionally rejects any condition
+that differs from configured `num_points`; and the real Experiment 040 provider
+rejects any source that differs from that declared regime. There is no
+variable-cardinality configuration and no silent source or decode resampling.
+A future defect type that lacks a cardinality-preserving construction must
+remain absent from the config-level `defect_types` set until it has one.
 
 The mesh loader's existing bounding-box-center, unit-maximum-radius transform
 is the shared normalization for this benchmark. It correctly places each
-undefected finite sample in the codecs' declared `[-1, 1]^3` domain. The failed
-full-run attempt exposed a later protocol bug: bump, thin-spur, and surface-noise
+undefected finite sample in the codecs' declared `[-1, 1]^3` domain. The first
+failed full-run attempt exposed a protocol bug: bump, thin-spur, and surface-noise
 generation (and, depending on local normal direction, a dent) could displace a
 valid normalized sample beyond that domain. The interior fixture smoke did not
 exercise this boundary case.
@@ -75,14 +94,16 @@ nonzero displacement in the domain fails with an explicit error. The realized
 written to the machine-readable rows and data protocol so boundary attenuation
 cannot be hidden when interpreting defect-stratified results.
 
-This choice does not introduce a new per-cloud normalization or inverse
+These choices do not introduce a new per-cloud normalization or inverse
 transform. The raw arm and every codec arm receive the exact same final
 post-injection coordinate array, and the runner checks this path. The existing
 shared normalized-domain codec contract and complete serialized-byte accounting
 therefore remain unchanged; the injection factor describes construction of the
 synthetic benchmark input and is not decoder side information. Point labels are
-created and validated against the final returned array, so attenuation does not
-change their alignment or the declared cardinality conventions.
+created and validated against the final returned `N`-point array, so attenuation
+does not change their alignment or the declared cardinality convention. The
+machine-readable data protocol records both the domain policy and the
+fixed-cardinality construction.
 
 Decoded labels use nearest-defected-target-point transfer when output
 cardinality differs. This is explicitly a nearest distance to a finite sampled
@@ -144,6 +165,13 @@ complete stream appends two counted zero framing bytes to match the selective
 16-byte header. The resulting complete learned-arm targets are 52, 66, 79, 93,
 111, and 124 bytes. Decoding validates and removes those two bytes before
 passing only the serialized constellation coordinates to the frozen decoder.
+Every provider encoder first requires exactly configured `num_points` source
+coordinates. Both the Adam-STE scoring decode and the serialized learned stream
+request exactly that configured output count, and the provider rejects a regime
+above the sealed decoder maximum. It never derives the request from a defected
+cloud's post-injection length. This makes a cardinality defect fail at the
+benchmark/provider boundary rather than inside the decoder and does not raise
+the sealed model's maximum.
 
 Selective and random-`K2` arms use the same `K1/K2` at each rate. The selected
 source-only score and preserved fraction come directly from
@@ -168,12 +196,13 @@ labels are retained by the evaluation layer for metric computation and never
 enter either call. The runner rejects a real provider that omits any
 constellation, selective, random-`K2`, or G-PCC ladder cell.
 
-The CPU smoke now uses these real providers rather than diagnostic subset
-streams. It evaluates four fixture base clouds (two validation and two category
-OOD), each as an undefected control and a deterministic dent, for eight codec
-inputs total. It uses decoder seed 7, all six rates, all four coded arms, and the
-three scorer seeds. This remains a plumbing and reproducibility check rather
-than evidence for G-C2 or a compression result.
+The CPU smoke uses these real providers rather than diagnostic subset streams.
+It evaluates four fixture base clouds (two validation and two category OOD) at
+the full `N=2048` regime, each as an undefected control, a deterministic bump,
+and a deterministic thin spur, for twelve codec inputs total. It uses the real
+sealed decoder seed 7 when the checked artifact symlink is available, all six
+rates, all four coded arms, and the three scorer seeds. This remains a plumbing
+and reproducibility check rather than evidence for G-C2 or a compression result.
 
 ## Metrics and uncertainty
 

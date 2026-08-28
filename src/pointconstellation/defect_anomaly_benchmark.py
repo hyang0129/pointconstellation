@@ -877,6 +877,19 @@ def _load_raw_clouds(
                 for split, rows in memberships.items()
             },
             "identities_unique": len(flat) == len(set(flat)),
+            "defect_cardinality_policy": {
+                "declared_source_points": config.num_points,
+                "policy": "preserve_declared_regime_for_every_condition",
+                "thin_spur_construction": "relocate_selected_source_patch",
+                "hole_construction": (
+                    "remove_patch_and_deterministically_resample_survivors"
+                ),
+                "all_conditions_match_declared_source_points": all(
+                    len(sample.points) == config.num_points
+                    and sample.point_labels.shape == (config.num_points,)
+                    for sample in samples
+                ),
+            },
             "defect_domain_policy": {
                 "declared_domain": [-1.0, 1.0],
                 "policy": "uniform_displacement_attenuation_without_clipping",
@@ -895,6 +908,8 @@ def _load_raw_clouds(
 def _decode_samples(
     samples: Sequence[BenchmarkCloud],
     arms: Sequence[CodecArm],
+    *,
+    expected_point_count: int,
 ) -> tuple[list[DecodedCloud], dict[str, bool]]:
     decoded = []
     exact_matches = []
@@ -902,6 +917,16 @@ def _decode_samples(
     accounting_checks = []
     codec_inputs_match_raw = []
     for sample in samples:
+        if len(sample.points) != expected_point_count:
+            raise ValueError(
+                "benchmark source cardinality differs from the declared regime: "
+                f"expected N={expected_point_count}, observed N={len(sample.points)} "
+                f"for {sample.cloud_id}/{sample.defect_type}"
+            )
+        if sample.point_labels.shape != (expected_point_count,):
+            raise ValueError(
+                "benchmark source labels do not align with the declared regime"
+            )
         decoded.append(
             DecodedCloud(
                 sample=sample,
@@ -1420,7 +1445,9 @@ def run_defect_anomaly_benchmark(
         tuple(codec_arms) if codec_arms is not None else _provider(config, device_name)
     )
     _validate_codec_arms(arms, config)
-    decoded, rate_checks = _decode_samples(samples, arms)
+    decoded, rate_checks = _decode_samples(
+        samples, arms, expected_point_count=config.num_points
+    )
     scored = _score_decodes(normal_training, decoded, config)
     summaries = summarize_anomaly_rows(scored, config)
     gate = compute_gate_g_c2(scored, config)
@@ -1446,6 +1473,11 @@ def run_defect_anomaly_benchmark(
         ),
         "all_injected_clouds_respect_declared_codec_domain": all(
             np.all(row.points >= -1.0) and np.all(row.points <= 1.0)
+            for row in samples
+        ),
+        "all_benchmark_sources_match_declared_cardinality": all(
+            len(row.points) == config.num_points
+            and row.point_labels.shape == (config.num_points,)
             for row in samples
         ),
         "nearest_target_point_label_transfer_is_explicit": True,

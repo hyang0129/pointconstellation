@@ -72,11 +72,12 @@ class DefectInjectionConfig:
 class DefectResult:
     """One injected cloud and labels aligned with its returned point array.
 
-    For a hole, absent samples cannot carry labels.  The label is therefore
-    assigned to the equally sized nearest surviving rim, while
-    ``removed_count`` records the actual number of deleted samples.  This makes
-    the point task well-defined without pretending that a finite sampled hole
-    contains observed defective points.
+    Every defect preserves the input cardinality.  For a hole, absent samples
+    cannot carry labels, so the removed samples are replaced by deterministic
+    resamples from outside the patch and the label is assigned to the equally
+    sized nearest surviving rim.  ``removed_count`` records the actual number
+    of deleted samples.  This makes the point task well-defined without
+    pretending that a finite sampled hole contains observed defective points.
     """
 
     points: FloatArray
@@ -120,14 +121,12 @@ class DefectResult:
             raise ValueError(
                 "non-displacement defects must have domain_scale_factor equal to 1"
             )
-        if self.defect_type == "hole":
-            if len(self.points) != self.original_point_count - self.removed_count:
-                raise ValueError("hole output size differs from removed_count")
-        elif self.defect_type == "thin_spur":
-            if len(self.points) != self.original_point_count + self.defective_count:
-                raise ValueError("thin-spur output size differs from defective_count")
-        elif len(self.points) != self.original_point_count:
-            raise ValueError("fixed-cardinality defect changed the point count")
+        if len(self.points) != self.original_point_count:
+            raise ValueError("defect injection must preserve source cardinality")
+        if self.defect_type == "hole" and self.removed_count != self.defective_count:
+            raise ValueError("hole removed_count differs from defective_count")
+        if self.defect_type != "hole" and self.removed_count:
+            raise ValueError("only a hole may remove source samples")
 
 
 def defect_seed(base_seed: int, cloud_id: str, defect_type: str) -> int:
@@ -311,7 +310,10 @@ def inject_defect(
     ``fraction=None`` samples a continuous fraction uniformly inside the
     configured 1--5% interval.  Supplying a fraction fixes the requested size;
     the exact integer count and its fraction of the original sample are exposed
-    as ``defective_count`` and ``declared_fraction``.
+    as ``defective_count`` and ``declared_fraction``.  Every returned condition
+    has exactly the source cardinality: a thin spur relocates its selected patch
+    and a hole deterministically resamples surviving source points to replace
+    the removed samples.
     """
 
     source = _points(points)
@@ -390,34 +392,36 @@ def inject_defect(
             + radii
             * (np.cos(angles) * tangent[None] + np.sin(angles) * bitangent[None])
         )
-        spur, domain_scale_factor = _domain_preserving_displacement(
-            np.repeat(source[anchor][None], defective_count, axis=0),
-            spur_displacement,
+        spur_target = source[anchor].astype(np.float64)[None] + spur_displacement
+        output[patch], domain_scale_factor = _domain_preserving_displacement(
+            source[patch], spur_target - source[patch].astype(np.float64)
         )
-        output = np.concatenate((source, spur), axis=0)
-        labels = np.concatenate(
-            (
-                np.zeros(len(source), dtype=np.uint8),
-                np.ones(defective_count, dtype=np.uint8),
-            )
-        )
-        source_indices = np.concatenate(
-            (
-                np.arange(len(source), dtype=np.int64),
-                -np.ones(defective_count, dtype=np.int64),
-            )
-        )
+        labels[patch] = 1
     else:
         removed_count = defective_count
         keep = np.ones(len(source), dtype=bool)
         keep[patch] = False
-        output = source[keep].copy()
-        source_indices = np.flatnonzero(keep).astype(np.int64)
+        survivor_indices = np.flatnonzero(keep).astype(np.int64)
+        survivors = source[survivor_indices]
+        canonical = np.lexsort(
+            (survivors[:, 2], survivors[:, 1], survivors[:, 0])
+        )
+        replacement_positions = rng.choice(
+            len(canonical), size=defective_count, replace=False
+        )
+        replacement_indices = survivor_indices[canonical[replacement_positions]]
+        output = np.concatenate((survivors, source[replacement_indices]), axis=0)
+        source_indices = np.concatenate((survivor_indices, replacement_indices))
         anchor = source[int(patch[0])].astype(np.float64)
-        rim_distances = np.linalg.norm(output.astype(np.float64) - anchor, axis=1)
-        rim = np.lexsort((output[:, 2], output[:, 1], output[:, 0], rim_distances))[
-            :defective_count
-        ]
+        rim_distances = np.linalg.norm(survivors.astype(np.float64) - anchor, axis=1)
+        rim = np.lexsort(
+            (
+                survivors[:, 2],
+                survivors[:, 1],
+                survivors[:, 0],
+                rim_distances,
+            )
+        )[:defective_count]
         labels = np.zeros(len(output), dtype=np.uint8)
         labels[rim] = 1
 

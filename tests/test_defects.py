@@ -46,13 +46,15 @@ def test_defect_injection_is_deterministic_and_labels_declared_count(
     assert np.array_equal(first.points, repeated.points)
     assert np.array_equal(first.point_labels, repeated.point_labels)
     assert np.array_equal(first.source_indices, repeated.source_indices)
+    assert len(first.points) == len(points)
+    assert len(first.point_labels) == len(points)
     assert first.defective_count == round(0.03 * len(points))
     assert int(first.point_labels.sum()) == first.defective_count
     assert 0.01 <= first.declared_fraction <= 0.05
     assert first.cloud_label == 1
 
 
-def test_hole_reduces_cardinality_by_declared_count() -> None:
+def test_hole_resamples_survivors_to_preserve_cardinality() -> None:
     points, normals = _sphere(400)
     result = inject_defect(
         points,
@@ -63,10 +65,11 @@ def test_hole_reduces_cardinality_by_declared_count() -> None:
     )
 
     assert result.removed_count == 20
-    assert len(result.points) == len(points) - 20
+    assert len(result.points) == len(points)
     assert len(result.point_labels) == len(result.points)
     assert int(result.point_labels.sum()) == 20
     assert np.all(result.source_indices >= 0)
+    assert len(np.unique(result.source_indices)) == len(points) - 20
 
 
 def test_cloud_seed_is_stable_and_traversal_order_independent() -> None:

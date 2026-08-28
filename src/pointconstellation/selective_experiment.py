@@ -478,12 +478,20 @@ class FrozenExperiment040CodecContext:
         *,
         constellation_size: int,
         bits: int,
+        output_points: int | None = None,
     ) -> NDArray[np.float64]:
         """Run Experiment 040's source-only FPS-start Adam-STE search once."""
 
         values = self._canonical_source(source)
         if constellation_size > len(values):
             raise ValueError("constellation size exceeds source cardinality")
+        requested_output_points = (
+            len(values) if output_points is None else output_points
+        )
+        if requested_output_points != len(values):
+            raise ValueError("provider output count must equal source cardinality")
+        if requested_output_points > self.stability.num_points:
+            raise ValueError("provider output count exceeds the sealed decoder maximum")
         digest = hashlib.sha256(values.astype(">f4").tobytes()).hexdigest()
         tensor = torch.from_numpy(values).unsqueeze(0).to(self.device)
         coordinates, _ = _search_coordinates(
@@ -495,7 +503,7 @@ class FrozenExperiment040CodecContext:
             bits=bits,
             stability=self.stability,
             config=self.config,
-            output_points=len(values),
+            output_points=requested_output_points,
         )
         self.assert_frozen()
         return coordinates[0].detach().cpu().numpy().astype(np.float64)
