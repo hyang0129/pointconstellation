@@ -1,8 +1,8 @@
 # Experiment 041: defect-injection anomaly benchmark
 
-Status: implementation complete for deterministic injection, the non-learned
-raw-only scorer, codec-independent evaluation, statistics, and the bounded CPU
-smoke. Full codec results are pending Experiment 040's selected codec provider.
+Status: implementation and real-codec CPU smoke complete. Full benchmark
+results are pending selection of the Experiment 040 score/split cell and the
+predeclared full run.
 
 ## Question and hypothesis
 
@@ -85,7 +85,7 @@ this predeclared non-learned baseline after results are inspected.
 
 ## Arms and rate accounting
 
-The full provider must return the following arms at all six Experiment 040
+The checked provider returns the following arms at all six Experiment 040
 coordinate-payload budgets: 40, 52, 64, 78, 96, and 110 bytes.
 
 - raw input, evaluated without a coded rate as an upper bound;
@@ -104,20 +104,45 @@ is therefore counted. G-PCC may declare a nonzero maximum rate error; its actual
 complete stream length remains in every per-cloud row and is not described as
 an exact match.
 
+The real provider is
+`pointconstellation.exp040_defect_codecs:build_codec_arms`. It loads and checks
+the selected sealed Experiment 019 decoder, then uses Experiment 040's
+deterministic FPS start and Adam-STE source-Chamfer search for every required
+`K` or `K1`. The ordinary constellation stream has a 14-byte header, so its
+complete stream appends two counted zero framing bytes to match the selective
+16-byte header. The resulting complete learned-arm targets are 52, 66, 79, 93,
+111, and 124 bytes. Decoding validates and removes those two bytes before
+passing only the serialized constellation coordinates to the frozen decoder.
+
+Selective and random-`K2` arms use the same `K1/K2` at each rate. The selected
+source-only score and preserved fraction come directly from
+`selective_score_method` and `selective_preserved_fraction` in the Experiment
+041 config; they are never chosen from anomaly results. Until the full
+Experiment 040 result fixes its best cell, both configs default to
+`decoder_residual` at a 50% preserved split. Updating those two fields is the
+only selection change needed once that result exists.
+
+G-PCC reuses Experiment 040's TMC13 argument grid but freshly encodes each
+Experiment 041 source. A shared per-source frontier is matched by nearest actual
+geometry-brick payload at each ladder point. Every row declares the selected
+TMC13 rate point, parsed header and payload bytes, signed payload-budget delta,
+complete-stream target delta, and complete stream hash. The checked configs set
+a 512-byte maximum complete-stream mismatch; the run fails if it is exceeded.
+
 The provider is supplied as `module:function`. It is called as
 `function(config=config, device_name=device_name)` and returns `CodecArm`
-instances. This narrow hook lets Experiment 040 be merged without letting
-Experiment 041 see encoder internals. The provider is responsible for loading
-and hash-checking the frozen decoder and the Experiment 040 selection artifact,
-using the selected score/split without refitting on Experiment 041 labels, and
-adding G-PCC. The full runner rejects a provider that omits the constellation,
-selective, or random-`K2` cells.
+instances. This narrow hook keeps the benchmark blind to encoder internals: its
+only calls remain `encode(source_coordinates)` and `decode(stream)`. Defect
+labels are retained by the evaluation layer for metric computation and never
+enter either call. The runner rejects a real provider that omits any
+constellation, selective, random-`K2`, or G-PCC ladder cell.
 
-The smoke uses three diagnostic subset streams at every ladder point. They are
-not Experiment 040 codecs and cannot support a scientific result. Their zero
-padding is included in the returned byte strings so the complete actual-byte
-checks, round trips, changed cardinalities, label transfer, and metrics can run
-on CPU in a few seconds.
+The CPU smoke now uses these real providers rather than diagnostic subset
+streams. It evaluates four fixture base clouds (two validation and two category
+OOD), each as an undefected control and a deterministic dent, for eight codec
+inputs total. It uses decoder seed 7, all six rates, all four coded arms, and the
+three scorer seeds. This remains a plumbing and reproducibility check rather
+than evidence for G-C2 or a compression result.
 
 ## Metrics and uncertainty
 
@@ -164,8 +189,8 @@ failure does not imply that every codec erases every anomaly.
 
 ## Commands
 
-Run the checked fixture smoke. It writes under `artifacts/local/` by default;
-use `--output-dir` to redirect it:
+Run the checked eight-cloud, one-decoder fixture smoke. It writes under
+`artifacts/local/` by default; use `--output-dir` to redirect it:
 
 ```bash
 /Users/hong/code/pointconstellation/.venv-train/bin/python \
@@ -174,24 +199,24 @@ use `--output-dir` to redirect it:
   --device cpu
 ```
 
-Run the full benchmark after the Experiment 040 provider is available:
+Run the full benchmark after setting the Experiment 040-selected score and
+preserved fraction in the full config:
 
 ```bash
 /Users/hong/code/pointconstellation/.venv-train/bin/python \
   -m pointconstellation.defect_anomaly_benchmark \
   --config configs/experiment_041_defect_anomaly.json \
-  --codec-provider pointconstellation.exp040_defect_codecs:build_codec_arms \
   --device mps
 ```
 
-`--device cuda` and `--device cpu` are also accepted. The full configuration
-requires the ignored official ModelNet40 manifest/data, frozen Experiment 019
-decoder checkpoints, the completed Experiment 040 selection artifact, and the
-pinned G-PCC executable. No training job is launched by the smoke.
+`--device cuda` and `--device cpu` are also accepted. `--codec-provider` can
+still override the checked config hook for a controlled provider test. The full
+configuration requires the ignored official ModelNet40 manifest/data, frozen
+Experiment 019 decoder checkpoints, the completed Experiment 040 selection,
+and the pinned G-PCC executable. Neither command launches training.
 
 ## Results
 
-Placeholder. The diagnostic smoke is a plumbing result only. Do not infer an
-anomaly-preservation or compression conclusion until the full provider supplies
-the predeclared exact-rate arms, G-PCC is evaluated, and all three scorer seeds
-and both ModelNet40 splits are complete.
+Placeholder. The real-codec smoke is a plumbing result only. Do not infer an
+anomaly-preservation or compression conclusion until the full run evaluates the
+predeclared selected cell, all three scorer seeds, and both ModelNet40 splits.

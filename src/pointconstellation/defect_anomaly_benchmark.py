@@ -39,6 +39,12 @@ from pointconstellation.defects import (
 
 FloatArray = NDArray[np.float32]
 EXPERIMENT_040_SELECTIVE_HEADER_BYTES = 16
+EXPERIMENT_040_SCORE_METHODS = (
+    "curvature",
+    "density",
+    "decoder_residual",
+    "boundary",
+)
 
 
 @runtime_checkable
@@ -131,11 +137,15 @@ class DefectAnomalyBenchmarkConfig:
     distance_chunk_size: int = 512
     payload_budgets: tuple[int, ...] = (40, 52, 64, 78, 96, 110)
     primary_payload_budget: int = 64
+    experiment_040_config: str = "configs/experiment_040_selective.json"
     experiment_040_artifact_dir: str | None = "artifacts/local/experiment_040_selective"
-    selective_score_method: str = "experiment_040_best_validation"
-    selective_preserved_fraction: float | None = None
+    experiment_040_decoder_seed: int = 7
+    selective_score_method: str = "decoder_residual"
+    selective_preserved_fraction: float | None = 0.5
     codec_provider: str | None = None
     diagnostic_subset_codecs: bool = False
+    gpcc_arm: str = "gpcc"
+    gpcc_maximum_rate_error_bytes: int = 512
     bootstrap_samples: int = 10_000
     bootstrap_seed: int = 20_260_841
     confidence_level: float = 0.95
@@ -195,8 +205,14 @@ class DefectAnomalyBenchmarkConfig:
             raise ValueError("payload_budgets must be unique, increasing, and positive")
         if self.primary_payload_budget not in self.payload_budgets:
             raise ValueError("primary_payload_budget is absent from payload_budgets")
-        if not self.selective_score_method:
-            raise ValueError("selective_score_method must be nonempty")
+        if not self.experiment_040_config:
+            raise ValueError("experiment_040_config must be nonempty")
+        if self.experiment_040_decoder_seed < 0:
+            raise ValueError("experiment_040_decoder_seed must be nonnegative")
+        if self.selective_score_method not in EXPERIMENT_040_SCORE_METHODS:
+            raise ValueError(
+                "selective_score_method must be an Experiment 040 source score"
+            )
         if self.selective_preserved_fraction is not None and not (
             0.0 < self.selective_preserved_fraction < 1.0
         ):
@@ -210,6 +226,10 @@ class DefectAnomalyBenchmarkConfig:
             raise ValueError("gate arm names must be nonempty coded-arm names")
         if len(set(arm_names)) != len(arm_names):
             raise ValueError("gate arm names must be unique")
+        if not self.gpcc_arm or self.gpcc_arm == "raw" or self.gpcc_arm in arm_names:
+            raise ValueError("gpcc_arm must be a distinct coded-arm name")
+        if self.gpcc_maximum_rate_error_bytes < 0:
+            raise ValueError("G-PCC maximum rate error cannot be negative")
         if self.diagnostic_subset_codecs and self.codec_provider is not None:
             raise ValueError("choose a codec provider or diagnostic codecs, not both")
         if self.bootstrap_samples < 100:
@@ -275,6 +295,11 @@ class DecodedCloud:
     target_bytes: int | None
     stream_bytes: int | None
     stream_sha256: str | None
+    codec_header_bytes: int | None
+    codec_payload_bytes: int | None
+    payload_byte_delta: int | None
+    complete_stream_byte_delta: int | None
+    codec_rate_point: str | None
     decoded_points: FloatArray
     decoded_labels: NDArray[np.uint8]
 
@@ -296,6 +321,11 @@ class ScoredCloud:
     target_bytes: int | None
     stream_bytes: int | None
     stream_sha256: str | None
+    codec_header_bytes: int | None
+    codec_payload_bytes: int | None
+    payload_byte_delta: int | None
+    complete_stream_byte_delta: int | None
+    codec_rate_point: str | None
     decoded_point_count: int
     defective_point_count: int
     cloud_score: float
@@ -703,13 +733,16 @@ def _provider(
 def _validate_codec_arms(
     arms: Sequence[CodecArm], config: DefectAnomalyBenchmarkConfig
 ) -> None:
+    required_names = (
+        config.constellation_arm,
+        config.selective_arm,
+        config.random_control_arm,
+    )
+    if not config.diagnostic_subset_codecs:
+        required_names = (*required_names, config.gpcc_arm)
     expected = {
         (name, rate)
-        for name in (
-            config.constellation_arm,
-            config.selective_arm,
-            config.random_control_arm,
-        )
+        for name in required_names
         for rate in config.payload_budgets
     }
     identities = [(arm.name, arm.payload_budget_bytes) for arm in arms]
@@ -850,6 +883,7 @@ def _decode_samples(
     decoded = []
     exact_matches = []
     within_tolerance = []
+    accounting_checks = []
     for sample in samples:
         decoded.append(
             DecodedCloud(
@@ -859,6 +893,11 @@ def _decode_samples(
                 target_bytes=None,
                 stream_bytes=None,
                 stream_sha256=None,
+                codec_header_bytes=None,
+                codec_payload_bytes=None,
+                payload_byte_delta=None,
+                complete_stream_byte_delta=None,
+                codec_rate_point=None,
                 decoded_points=sample.points.copy(),
                 decoded_labels=sample.point_labels.copy(),
             )
@@ -876,6 +915,29 @@ def _decode_samples(
             )
             if arm.exact_bytes:
                 exact_streams.setdefault(arm.target_bytes, {})[arm.name] = stream
+            metadata: Mapping[str, Any] = {}
+            metadata_function = getattr(arm.codec, "rate_metadata", None)
+            if callable(metadata_function):
+                raw_metadata = metadata_function(stream)
+                if not isinstance(raw_metadata, Mapping):
+                    raise TypeError("codec rate_metadata must return a mapping")
+                metadata = raw_metadata
+                header_bytes = metadata.get("codec_header_bytes")
+                payload_bytes = metadata.get("codec_payload_bytes")
+                payload_delta = metadata.get("payload_byte_delta")
+                complete_delta = metadata.get("complete_stream_byte_delta")
+                consistent = (
+                    isinstance(header_bytes, int)
+                    and isinstance(payload_bytes, int)
+                    and header_bytes >= 0
+                    and payload_bytes >= 0
+                    and header_bytes + payload_bytes == actual_bytes
+                    and payload_delta == payload_bytes - arm.payload_budget_bytes
+                    and complete_delta == actual_bytes - arm.target_bytes
+                )
+                accounting_checks.append(consistent)
+                if not consistent:
+                    raise RuntimeError("codec returned inconsistent byte accounting")
             reconstructed = _point_array(arm.codec.decode(stream))
             labels = transfer_point_labels(
                 sample.points,
@@ -890,6 +952,13 @@ def _decode_samples(
                     target_bytes=arm.target_bytes,
                     stream_bytes=actual_bytes,
                     stream_sha256=hashlib.sha256(stream).hexdigest(),
+                    codec_header_bytes=metadata.get("codec_header_bytes"),
+                    codec_payload_bytes=metadata.get("codec_payload_bytes"),
+                    payload_byte_delta=metadata.get("payload_byte_delta"),
+                    complete_stream_byte_delta=metadata.get(
+                        "complete_stream_byte_delta"
+                    ),
+                    codec_rate_point=metadata.get("codec_rate_point"),
                     decoded_points=reconstructed.copy(),
                     decoded_labels=labels,
                 )
@@ -900,6 +969,7 @@ def _decode_samples(
     return decoded, {
         "all_exact_arms_match_target_bytes": all(exact_matches),
         "all_nearest_rate_arms_within_declared_tolerance": all(within_tolerance),
+        "all_declared_codec_byte_accounting_is_consistent": all(accounting_checks),
     }
 
 
@@ -939,6 +1009,11 @@ def _score_decodes(
                     target_bytes=row.target_bytes,
                     stream_bytes=row.stream_bytes,
                     stream_sha256=row.stream_sha256,
+                    codec_header_bytes=row.codec_header_bytes,
+                    codec_payload_bytes=row.codec_payload_bytes,
+                    payload_byte_delta=row.payload_byte_delta,
+                    complete_stream_byte_delta=row.complete_stream_byte_delta,
+                    codec_rate_point=row.codec_rate_point,
                     decoded_point_count=len(row.decoded_points),
                     defective_point_count=int(row.decoded_labels.sum()),
                     cloud_score=cloud_score,

@@ -4,16 +4,21 @@ from __future__ import annotations
 
 import inspect
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+from pointconstellation.codecs import GpccResult, GpccStreamBreakdown
 from pointconstellation.defect_anomaly_benchmark import (
+    BenchmarkCloud,
+    CodecArm,
     DefectAnomalyBenchmarkConfig,
     KNNNormalManifoldScorer,
     KNNScorerConfig,
     PointCloudCodec,
+    _decode_samples,
     assert_matched_bytes,
     binary_auprc,
     binary_auroc,
@@ -21,6 +26,7 @@ from pointconstellation.defect_anomaly_benchmark import (
     load_external_anomaly_manifest,
 )
 from pointconstellation.defects import DEFECT_TYPES, inject_defect
+from pointconstellation.selective_experiment import SelectiveExperimentConfig
 
 
 def _sphere(count: int = 512) -> tuple[np.ndarray, np.ndarray]:
@@ -85,6 +91,9 @@ def test_codec_protocol_excludes_labels_and_diagnostic_streams_match() -> None:
     config = DefectAnomalyBenchmarkConfig.from_json(
         Path("configs/experiment_041_defect_anomaly_smoke.json")
     )
+    config = replace(
+        config, codec_provider=None, diagnostic_subset_codecs=True
+    )
     arms = build_diagnostic_subset_codec_arms(config)
     points, _ = _sphere(256)
 
@@ -117,10 +126,215 @@ def test_smoke_and_full_configs_are_valid_and_use_three_scorer_seeds() -> None:
         Path("configs/experiment_041_defect_anomaly.json")
     )
 
-    assert smoke.diagnostic_subset_codecs
+    assert not smoke.diagnostic_subset_codecs
     assert not full.diagnostic_subset_codecs
+    assert smoke.codec_provider == full.codec_provider == (
+        "pointconstellation.exp040_defect_codecs:build_codec_arms"
+    )
+    assert smoke.experiment_040_decoder_seed == 7
+    assert smoke.selective_score_method == "decoder_residual"
+    assert smoke.selective_preserved_fraction == 0.5
+    assert smoke.defect_types == ("dent",)
     assert len(smoke.scorer_seeds) == len(full.scorer_seeds) == 3
     assert smoke.payload_budgets == full.payload_budgets == (40, 52, 64, 78, 96, 110)
+
+
+def test_real_provider_arms_declare_consistent_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pointconstellation.exp040_defect_codecs import build_codec_arms
+
+    class FakeProviderState:
+        def __init__(self, config, experiment_040, *, device_name):
+            del config, device_name
+            self.experiment_040 = experiment_040
+
+        def search(self, source, *, size, bits):
+            del bits
+            return np.asarray(source[:size], dtype=np.float64)
+
+        def decode(self, coordinates, output_points):
+            repeats = int(np.ceil(output_points / len(coordinates)))
+            return np.tile(coordinates, (repeats, 1))[:output_points]
+
+        def base_decode(self, source, *, size, bits):
+            return self.decode(self.search(source, size=size, bits=bits), len(source))
+
+        def score(self, source, **kwargs):
+            method = kwargs["method"]
+            offset = 1.0 if method == "random" else 0.0
+            return np.arange(len(source), dtype=np.float64) + offset
+
+    class FakeGpccFrontier:
+        def __init__(self, config, experiment_040):
+            del config, experiment_040
+            self.sources = {}
+            self.metadata_rows = {}
+
+        def encode(self, source, *, payload_budget, target_bytes):
+            stream = payload_budget.to_bytes(2, "big") + bytes(target_bytes + 1)
+            self.sources[stream] = np.asarray(source, dtype=np.float32).copy()
+            payload_bytes = payload_budget + 1
+            self.metadata_rows[(stream, payload_budget)] = {
+                "codec_header_bytes": len(stream) - payload_bytes,
+                "codec_payload_bytes": payload_bytes,
+                "payload_byte_delta": 1,
+                "complete_stream_byte_delta": len(stream) - target_bytes,
+                "codec_rate_point": "fake_nearest",
+            }
+            return stream
+
+        def decode(self, stream):
+            return self.sources[stream].copy()
+
+        def metadata(self, stream, *, payload_budget):
+            return self.metadata_rows[(stream, payload_budget)]
+
+    monkeypatch.setattr(
+        "pointconstellation.exp040_defect_codecs._ProviderState", FakeProviderState
+    )
+    monkeypatch.setattr(
+        "pointconstellation.exp040_defect_codecs._GpccFrontier", FakeGpccFrontier
+    )
+    config = DefectAnomalyBenchmarkConfig.from_json(
+        Path("configs/experiment_041_defect_anomaly_smoke.json")
+    )
+    arms = build_codec_arms(config=config, device_name="cpu")
+    points, _ = _sphere(256)
+
+    assert len(arms) == 4 * len(config.payload_budgets)
+    for arm in arms:
+        stream = arm.codec.encode(points)
+        metadata = arm.codec.rate_metadata(stream)
+        assert metadata["codec_header_bytes"] + metadata["codec_payload_bytes"] == len(
+            stream
+        )
+        assert metadata["payload_byte_delta"] == (
+            metadata["codec_payload_bytes"] - arm.payload_budget_bytes
+        )
+        assert metadata["complete_stream_byte_delta"] == len(stream) - arm.target_bytes
+        if arm.name != config.gpcc_arm:
+            assert len(stream) == arm.target_bytes
+        assert arm.codec.decode(stream).shape[1] == 3
+
+
+def test_gpcc_provider_fresh_frontier_matches_payload_and_declares_delta(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pointconstellation.exp040_defect_codecs import _GpccFrontier
+
+    reference = tmp_path / "gpcc_reference.jsonl"
+    reference.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "method": "gpcc_octree",
+                    "rate_point": name,
+                    "encoder_args": [f"--positionQuantizationScale={scale}"],
+                }
+            )
+            for name, scale in (("payload_35", 0.5), ("payload_70", 0.25))
+        )
+        + "\n"
+    )
+    calls = []
+
+    def fake_run_tmc3(executable, source, *, rate_point, work_dir, **kwargs):
+        del executable, kwargs
+        calls.append(rate_point.name)
+        payload_bytes = int(rate_point.name.removeprefix("payload_"))
+        breakdown = GpccStreamBreakdown(
+            sps_bytes=5,
+            gps_bytes=5,
+            slice_header_bytes=10,
+            payload_bytes=payload_bytes,
+            total_bytes=20 + payload_bytes,
+        )
+        stream = bytes([payload_bytes]) * breakdown.total_bytes
+        work_dir.mkdir(parents=True, exist_ok=True)
+        (work_dir / "stream.bin").write_bytes(stream)
+        return GpccResult(
+            reconstruction=np.asarray(source, dtype=np.float32),
+            stream_bytes=len(stream),
+            stream_breakdown=breakdown,
+            encode_seconds=0.01,
+            decode_seconds=0.01,
+            encoder_command=("fake",),
+            decoder_command=("fake",),
+            encoder_stdout="",
+            decoder_stdout="",
+        )
+
+    monkeypatch.setattr(
+        "pointconstellation.exp040_defect_codecs.run_tmc3", fake_run_tmc3
+    )
+    benchmark = DefectAnomalyBenchmarkConfig(output_dir=str(tmp_path / "output"))
+    experiment_040 = SelectiveExperimentConfig(
+        gpcc_reference_path=str(reference), decoder_seeds=(7,)
+    )
+    frontier = _GpccFrontier(benchmark, experiment_040)
+    points, _ = _sphere(64)
+
+    stream_40 = frontier.encode(points, payload_budget=40, target_bytes=52)
+    metadata_40 = frontier.metadata(stream_40, payload_budget=40)
+    stream_60 = frontier.encode(points, payload_budget=60, target_bytes=80)
+
+    assert metadata_40["codec_rate_point"] == "payload_35"
+    assert metadata_40["codec_payload_bytes"] == 35
+    assert metadata_40["payload_byte_delta"] == -5
+    assert metadata_40["complete_stream_byte_delta"] == 3
+    assert len(stream_60) == 90
+    assert calls == ["payload_35", "payload_70"]
+    decoded = frontier.decode(stream_40)
+    assert sorted(map(tuple, decoded.tolist())) == sorted(map(tuple, points.tolist()))
+
+
+def test_codec_execution_never_receives_defect_labels() -> None:
+    points, _ = _sphere(64)
+    labels = np.zeros(len(points), dtype=np.uint8)
+    labels[3:9] = 1
+
+    class CoordinateOnlySpy:
+        def __init__(self):
+            self.encoded = []
+            self.decoded = []
+
+        def encode(self, source):
+            self.encoded.append(np.asarray(source).copy())
+            return b"source-only"
+
+        def decode(self, stream):
+            self.decoded.append(stream)
+            return points.copy()
+
+    codec = CoordinateOnlySpy()
+    sample = BenchmarkCloud(
+        split="validation",
+        cloud_id="fixture:one",
+        category="fixture",
+        defect_type="dent",
+        size_stratum="medium_2_4pct",
+        declared_fraction=0.03,
+        points=points,
+        point_labels=labels,
+        cloud_label=1,
+        removed_count=0,
+    )
+    arm = CodecArm(
+        name="constellation_only",
+        payload_budget_bytes=1,
+        target_bytes=len(b"source-only"),
+        codec=codec,
+    )
+
+    decoded, checks = _decode_samples([sample], [arm])
+
+    assert len(codec.encoded) == len(codec.decoded) == 1
+    assert np.array_equal(codec.encoded[0], points)
+    assert codec.decoded == [b"source-only"]
+    assert not np.array_equal(codec.encoded[0].reshape(-1)[: len(labels)], labels)
+    assert decoded[1].sample.point_labels is labels
+    assert all(checks.values())
 
 
 def test_external_dataset_manifest_hook_validates_without_downloading(

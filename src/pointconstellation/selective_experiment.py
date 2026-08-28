@@ -345,6 +345,7 @@ def _search_coordinates(
     bits: int,
     stability: StabilityExperimentConfig,
     config: SelectiveExperimentConfig,
+    output_points: int | None = None,
 ) -> tuple[Tensor, float]:
     _synchronize(source.device)
     started = time.perf_counter()
@@ -365,7 +366,7 @@ def _search_coordinates(
     scorer = _source_scorer(
         decoder,
         source,
-        num_output_points=stability.num_points,
+        num_output_points=output_points or stability.num_points,
         chunk_size=stability.distance_chunk_size,
     )
     result = _search_adam_start(
@@ -391,6 +392,122 @@ def _numpy_decoder(decoder: nn.Module, device: torch.device) -> Decoder:
         return reconstructed.detach().cpu().numpy().astype(np.float64)
 
     return decode
+
+
+class FrozenExperiment040CodecContext:
+    """Frozen decoder and FPS-start Adam-STE search reused by codec providers.
+
+    Experiment 040's runner owns the torch implementation.  This small context
+    lets downstream, source-only codec providers reuse that implementation
+    without importing torch into their benchmark runners.
+    """
+
+    def __init__(
+        self,
+        config: SelectiveExperimentConfig,
+        *,
+        decoder_seed: int,
+        device_name: str,
+    ) -> None:
+        stability_path = Path(config.stability_config)
+        stability = StabilityExperimentConfig.from_json(stability_path)
+        if decoder_seed not in config.decoder_seeds:
+            raise ValueError("provider decoder seed is absent from Experiment 040")
+        if decoder_seed not in stability.decoder_seeds:
+            raise ValueError("provider decoder seed is absent from Experiment 019")
+        if config.coordinate_bits > stability.coordinate_bits:
+            raise ValueError("provider precision exceeds decoder training precision")
+
+        artifact_dir = Path(config.stability_artifact_dir)
+        metrics_path = artifact_dir / "stability_metrics.json"
+        metrics = json.loads(metrics_path.read_text())
+        artifact_config = dict(metrics["config"])
+        artifact_config.setdefault(
+            "pointcloud_normal_neighbors", stability.pointcloud_normal_neighbors
+        )
+        artifact_config.setdefault(
+            "verify_pointcloud_hashes", stability.verify_pointcloud_hashes
+        )
+        if not stability_config_matches_artifact(artifact_config, stability):
+            raise RuntimeError(
+                "Experiment 019 artifact config differs from checked config"
+            )
+        if not all(metrics["contract_checks"].values()):
+            raise RuntimeError("Experiment 019 artifact has a failed contract")
+
+        device = select_device(device_name)
+        decoder, _, model_metadata = _load_models(
+            stability,
+            _official_config(config, stability),
+            decoder_seed=decoder_seed,
+            refiner_seed=None,
+            device=device,
+        )
+        self.config = config
+        self.stability = stability
+        self.decoder_seed = decoder_seed
+        self.device = device
+        self.decoder = decoder
+        self.model_metadata = model_metadata
+        self._decoder_state_hash = _state_hash(decoder)
+        self._decode_numpy = _numpy_decoder(decoder, device)
+
+    @staticmethod
+    def _canonical_source(
+        source: NDArray[np.float32] | NDArray[np.float64],
+    ) -> NDArray[np.float32]:
+        values = np.asarray(source, dtype=np.float32)
+        if values.ndim != 2 or values.shape[1] != 3 or not len(values):
+            raise ValueError("provider source must have shape (N, 3) with N > 0")
+        if not np.isfinite(values).all():
+            raise ValueError("provider source must contain finite coordinates")
+        if np.any(values < -1.0) or np.any(values > 1.0):
+            raise ValueError("provider source must lie in [-1, 1]")
+        order = np.lexsort((values[:, 2], values[:, 1], values[:, 0]))
+        return np.ascontiguousarray(values[order])
+
+    def assert_frozen(self) -> None:
+        """Assert the sealed decoder state is unchanged."""
+
+        if _state_hash(self.decoder) != self._decoder_state_hash:
+            raise RuntimeError("frozen Experiment 019 decoder changed during encoding")
+
+    def search(
+        self,
+        source: NDArray[np.float32] | NDArray[np.float64],
+        *,
+        constellation_size: int,
+        bits: int,
+    ) -> NDArray[np.float64]:
+        """Run Experiment 040's source-only FPS-start Adam-STE search once."""
+
+        values = self._canonical_source(source)
+        if constellation_size > len(values):
+            raise ValueError("constellation size exceeds source cardinality")
+        digest = hashlib.sha256(values.astype(">f4").tobytes()).hexdigest()
+        tensor = torch.from_numpy(values).unsqueeze(0).to(self.device)
+        coordinates, _ = _search_coordinates(
+            self.decoder,
+            tensor,
+            [{"family": "experiment_041", "model_id": digest, "sample_id": 0}],
+            split="defect_provider",
+            constellation_size=constellation_size,
+            bits=bits,
+            stability=self.stability,
+            config=self.config,
+            output_points=len(values),
+        )
+        self.assert_frozen()
+        return coordinates[0].detach().cpu().numpy().astype(np.float64)
+
+    def decode(
+        self, coordinates: NDArray[np.float64], output_points: int
+    ) -> NDArray[np.float64]:
+        """Decode serialized coordinates with the sealed shared decoder."""
+
+        reconstruction = self._decode_numpy(coordinates, output_points)
+        self.assert_frozen()
+        return reconstruction
 
 
 def _nearest_indices(
