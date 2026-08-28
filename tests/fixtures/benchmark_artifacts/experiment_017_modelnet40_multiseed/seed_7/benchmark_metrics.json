@@ -1,0 +1,73 @@
+{
+  "config": {
+    "experiment": {
+      "num_points": 2048,
+      "seed": 7
+    }
+  },
+  "protocol": {
+    "input_points": 2048,
+    "data_identity": {
+      "dataset": "FixtureNet"
+    }
+  },
+  "per_cloud": [
+    {
+      "split": "validation",
+      "sample_id": 0,
+      "family": "chair",
+      "model_id": "chair_0001",
+      "method": "fps",
+      "constellation_size": 8,
+      "coordinate_bits": 12,
+      "stream_bytes": 50,
+      "actual_stream_bpp": 0.1953125,
+      "chamfer_mse": 0.04,
+      "official_d1_mse": 100.0
+    },
+    {
+      "split": "validation",
+      "sample_id": 0,
+      "family": "chair",
+      "model_id": "chair_0001",
+      "method": "free",
+      "constellation_size": 8,
+      "coordinate_bits": 12,
+      "stream_bytes": 50,
+      "actual_stream_bpp": 0.1953125,
+      "chamfer_mse": 0.03,
+      "official_d1_mse": 81.0
+    }
+  ],
+  "gpcc": {
+    "per_cloud": [
+      {
+        "split": "validation",
+        "sample_id": 0,
+        "family": "chair",
+        "model_id": "chair_0001",
+        "method": "gpcc_octree",
+        "rate_point": "octree_fixture",
+        "stream_bytes": 64,
+        "actual_stream_bpp": 0.25,
+        "chamfer_mse": 0.05,
+        "official_d1_mse": 121.0
+      }
+    ]
+  },
+  "feature_codec": {
+    "per_cloud": [
+      {
+        "split": "validation",
+        "sample_id": 0,
+        "family": "chair",
+        "model_id": "chair_0001",
+        "method": "feature_latent",
+        "stream_bytes": 50,
+        "actual_stream_bpp": 0.1953125,
+        "chamfer_mse": 0.035,
+        "official_d1_mse": 90.0
+      }
+    ]
+  }
+}
