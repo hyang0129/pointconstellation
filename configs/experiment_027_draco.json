@@ -1,0 +1,34 @@
+{
+  "codec": {
+    "encoder_executable": "artifacts/external/draco/build/draco_encoder",
+    "decoder_executable": "artifacts/external/draco/build/draco_decoder",
+    "release": "1.5.7",
+    "release_commit": "8786740086a9f4d83f44aa83badfbea4dce7a1b5",
+    "encoder_sha256": null,
+    "decoder_sha256": null,
+    "compression_level": 10,
+    "timeout_seconds": 120.0
+  },
+  "arms": [
+    {"name": "draco_fps_k8_q8_direct", "input_kind": "fps", "quantization_bits": 8, "reconstruction_route": "direct", "constellation_size": 8},
+    {"name": "draco_fps_k8_q8_frozen_decoder", "input_kind": "fps", "quantization_bits": 8, "reconstruction_route": "frozen_decoder", "constellation_size": 8},
+    {"name": "draco_fps_k8_q10_direct", "input_kind": "fps", "quantization_bits": 10, "reconstruction_route": "direct", "constellation_size": 8},
+    {"name": "draco_fps_k8_q10_frozen_decoder", "input_kind": "fps", "quantization_bits": 10, "reconstruction_route": "frozen_decoder", "constellation_size": 8},
+    {"name": "draco_fps_k8_q12_direct", "input_kind": "fps", "quantization_bits": 12, "reconstruction_route": "direct", "constellation_size": 8},
+    {"name": "draco_fps_k8_q12_frozen_decoder", "input_kind": "fps", "quantization_bits": 12, "reconstruction_route": "frozen_decoder", "constellation_size": 8},
+    {"name": "draco_adam_k8_q8_direct", "input_kind": "adam", "quantization_bits": 8, "reconstruction_route": "direct", "constellation_size": 8},
+    {"name": "draco_adam_k8_q8_frozen_decoder", "input_kind": "adam", "quantization_bits": 8, "reconstruction_route": "frozen_decoder", "constellation_size": 8},
+    {"name": "draco_adam_k8_q10_direct", "input_kind": "adam", "quantization_bits": 10, "reconstruction_route": "direct", "constellation_size": 8},
+    {"name": "draco_adam_k8_q10_frozen_decoder", "input_kind": "adam", "quantization_bits": 10, "reconstruction_route": "frozen_decoder", "constellation_size": 8},
+    {"name": "draco_adam_k8_q12_direct", "input_kind": "adam", "quantization_bits": 12, "reconstruction_route": "direct", "constellation_size": 8},
+    {"name": "draco_adam_k8_q12_frozen_decoder", "input_kind": "adam", "quantization_bits": 12, "reconstruction_route": "frozen_decoder", "constellation_size": 8},
+    {"name": "draco_full_qp3", "input_kind": "full_cloud", "quantization_bits": 3, "reconstruction_route": "direct", "constellation_size": null},
+    {"name": "draco_full_qp4", "input_kind": "full_cloud", "quantization_bits": 4, "reconstruction_route": "direct", "constellation_size": null},
+    {"name": "draco_full_qp5", "input_kind": "full_cloud", "quantization_bits": 5, "reconstruction_route": "direct", "constellation_size": null},
+    {"name": "draco_full_qp6", "input_kind": "full_cloud", "quantization_bits": 6, "reconstruction_route": "direct", "constellation_size": null}
+  ],
+  "pc_error_executable": "artifacts/tools/mpeg-pcc-dmetric/build/Release/pc_error",
+  "metric_position_bits": 12,
+  "metric_timeout_seconds": 120.0,
+  "output_dir": "artifacts/local/experiment_027_draco"
+}

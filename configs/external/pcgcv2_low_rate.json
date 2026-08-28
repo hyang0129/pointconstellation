@@ -1,0 +1,18 @@
+{
+  "workspace_root": "artifacts/external/pcgcv2",
+  "upstream_subpath": "upstream",
+  "environment_python_subpath": "env/bin/python",
+  "environment_manifest_subpath": "environment.json",
+  "adapter_script": "scripts/external/pcgcv2_codec.py",
+  "upstream_url": "https://github.com/NJUVISION/PCGCv2.git",
+  "upstream_commit": "88ff2a18b1b3cac89eef66997cc4e8bcf4fb0420",
+  "checkout_diff_sha256": null,
+  "position_bits": [6, 7, 8],
+  "rate_points": [
+    {"name": "released_r3_sf025", "checkpoint_subpath": "upstream/ckpts/r3_0.10bpp.pth", "checkpoint_sha256": null, "scaling_factor": 0.25, "rho": 1.0},
+    {"name": "released_r3_sf050", "checkpoint_subpath": "upstream/ckpts/r3_0.10bpp.pth", "checkpoint_sha256": null, "scaling_factor": 0.5, "rho": 1.0},
+    {"name": "released_r3_sf100", "checkpoint_subpath": "upstream/ckpts/r3_0.10bpp.pth", "checkpoint_sha256": null, "scaling_factor": 1.0, "rho": 1.0}
+  ],
+  "timeout_seconds": 3600.0,
+  "minimum_unique_reconstruction_fraction": 0.9
+}
