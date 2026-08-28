@@ -15,9 +15,18 @@ from typing import Any
 
 import numpy as np
 
-REGISTRY_SCHEMA_VERSION = 1
+REGISTRY_SCHEMA_VERSION = 2
 DEFAULT_ARTIFACT_ROOT = Path("artifacts/local")
 DEFAULT_REGISTRY_PATH = DEFAULT_ARTIFACT_ROOT / "benchmark_registry.jsonl"
+
+UTILITY_METRICS = (
+    "accuracy",
+    "map",
+    "repeatability",
+    "surface_rmse",
+    "normal_consistency",
+)
+REPRESENTATION_METRICS = ("d1_rmse", *UTILITY_METRICS)
 
 HEADLINE_METHODS = (
     ("fps", "FPS"),
@@ -46,6 +55,7 @@ _IDENTIFIER_FIELDS = {
     "decoder_evaluations",
     "decoder_seed",
     "evaluation_budget",
+    "evaluation_seed",
     "family",
     "feature_bits",
     "input_points",
@@ -57,6 +67,8 @@ _IDENTIFIER_FIELDS = {
     "model_id",
     "model_seed",
     "nominal_payload_bpp",
+    "objective",
+    "optimization_objective",
     "pair_id",
     "payload_bits",
     "rate_bpp",
@@ -66,11 +78,22 @@ _IDENTIFIER_FIELDS = {
     "rate_point_bpp",
     "rate_point_bytes",
     "refiner_seed",
+    "regime",
+    "representation",
+    "representation_family",
+    "representation_type",
+    "record_kind",
     "sample_id",
     "samples",
     "seed",
     "split",
     "stream_bytes",
+    "training_objective",
+    "training_regime",
+    "training_seed",
+    "classifier_seed",
+    "run_seed",
+    "evaluation_regime",
     "value",
 }
 _RATE_BYTE_FIELDS = (
@@ -88,6 +111,11 @@ _RATE_BPP_FIELDS = (
     "actual_bpp",
 )
 _OFFICIAL_METRIC_ALIASES = {
+    "classification_accuracy": "accuracy",
+    "top_1_accuracy": "accuracy",
+    "top1_accuracy": "accuracy",
+    "mean_ap": "map",
+    "mean_average_precision": "map",
     "d1_mse": "official_d1_mse",
     "d1_rmse": "official_d1_rmse",
     "d1_psnr_db": "official_d1_psnr_db",
@@ -100,6 +128,35 @@ _OFFICIAL_METRIC_ALIASES = {
     "d2_hausdorff_psnr_db": "official_d2_hausdorff_psnr_db",
     "official_d1_rmse_grid_units": "official_d1_rmse",
     "official_d2_rmse_grid_units": "official_d2_rmse",
+}
+_REPRESENTATION_FIELDS = (
+    "representation_family",
+    "representation",
+    "representation_type",
+    "message_family",
+)
+_OBJECTIVE_FIELDS = (
+    "objective",
+    "objective_name",
+    "training_objective",
+    "optimization_objective",
+    "utility_objective",
+)
+_REGIME_FIELDS = (
+    "regime",
+    "regime_name",
+    "training_regime",
+    "evaluation_regime",
+    "probe_regime",
+    "decoder_regime",
+)
+_METRIC_CONTAINER_FIELDS = {
+    "distortion_metrics",
+    "geometry_metrics",
+    "metrics",
+    "official_metrics",
+    "utility_metrics",
+    "utility",
 }
 
 
@@ -122,6 +179,9 @@ class _SourceContext:
     input_points: int | None = None
     model_seed: int | None = None
     default_arm: str = "default"
+    representation_family: str | None = None
+    objective: str | None = None
+    regime: str | None = None
 
 
 def file_sha256(path: Path) -> str:
@@ -173,6 +233,26 @@ def _first_integer(*values: Any) -> int | None:
     for value in values:
         if isinstance(value, int) and not isinstance(value, bool):
             return value
+    return None
+
+
+def _dimension(document: dict[str, Any], fields: Iterable[str]) -> str | None:
+    """Return a Track B dimension from common producer nesting conventions."""
+
+    containers = (
+        document,
+        document.get("metadata"),
+        document.get("protocol"),
+        document.get("config"),
+        _nested(document, "config", "experiment"),
+    )
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        for field in fields:
+            value = container.get(field)
+            if isinstance(value, str) and value:
+                return value
     return None
 
 
@@ -239,6 +319,9 @@ def _context_from_document(
         input_points=input_points,
         model_seed=model_seed,
         default_arm=arm,
+        representation_family=_dimension(document, _REPRESENTATION_FIELDS),
+        objective=_dimension(document, _OBJECTIVE_FIELDS),
+        regime=_dimension(document, _REGIME_FIELDS),
     )
 
 
@@ -303,7 +386,7 @@ def _metric_values(row: dict[str, Any]) -> list[tuple[str, float]]:
 
     values: list[tuple[str, float]] = []
     for name, value in row.items():
-        if name in {"metrics", "official_metrics"} and isinstance(value, dict):
+        if name in _METRIC_CONTAINER_FIELDS and isinstance(value, dict):
             for nested_name, nested_value in value.items():
                 if isinstance(nested_value, (int, float)) and not isinstance(
                     nested_value, bool
@@ -371,12 +454,28 @@ def _normalize_observation(
 ) -> list[dict[str, Any]]:
     raw_method = observation.get("method")
     split = observation.get("split")
-    if not isinstance(raw_method, str) or not isinstance(split, str):
+    if not isinstance(raw_method, str) or not raw_method:
+        raw_method = next(
+            (
+                value
+                for field in (*_REPRESENTATION_FIELDS, "arm_label", "arm")
+                if isinstance((value := observation.get(field)), str) and value
+            ),
+            None,
+        )
+    if raw_method is None or not isinstance(split, str):
         return []
     method = canonical_method(raw_method, observation)
     rate_bytes, rate_bpp = _rate(observation, context)
     decoder_seed, refiner_seed = _seed_fields(
         observation, context, raw_method=raw_method
+    )
+    run_seed = _first_integer(
+        observation.get("run_seed"),
+        observation.get("evaluation_seed"),
+        observation.get("classifier_seed"),
+        observation.get("training_seed"),
+        observation.get("seed"),
     )
     arm = observation.get("arm_label", observation.get("arm"))
     if not isinstance(arm, str) or not arm:
@@ -384,6 +483,14 @@ def _normalize_observation(
     dataset = observation.get("dataset")
     if not isinstance(dataset, str) or not dataset:
         dataset = context.dataset
+    representation_family = (
+        _dimension(observation, _REPRESENTATION_FIELDS) or context.representation_family
+    )
+    objective = _dimension(observation, _OBJECTIVE_FIELDS) or context.objective
+    regime = _dimension(observation, _REGIME_FIELDS) or context.regime
+    record_kind = observation.get("record_kind", "per_cloud")
+    if not isinstance(record_kind, str) or not record_kind:
+        record_kind = "per_cloud"
     base = {
         "schema_version": REGISTRY_SCHEMA_VERSION,
         "dataset": dataset,
@@ -398,12 +505,16 @@ def _normalize_observation(
         "actual_stream_bpp": rate_bpp,
         "decoder_seed": decoder_seed,
         "refiner_seed": refiner_seed,
+        "run_seed": run_seed,
         "sample_id": observation.get("sample_id"),
         "family": observation.get("family"),
         "model_id": observation.get("model_id"),
+        "representation_family": representation_family,
+        "objective": objective,
+        "regime": regime,
         "constellation_size": observation.get("constellation_size"),
         "coordinate_bits": observation.get("coordinate_bits"),
-        "record_kind": "per_cloud",
+        "record_kind": record_kind,
         "experiment": context.experiment,
         "source_path": source_path.as_posix(),
         "source_sha256": source_sha256,
@@ -518,10 +629,16 @@ def _import_experiment_020(
 
 
 def _find_context_document(directory: Path) -> tuple[dict[str, Any], Path | None]:
-    for path in sorted(directory.glob("*metrics.json")):
-        value = _read_json(path)
-        if isinstance(value, dict):
-            return value, path
+    for pattern in (
+        "*metrics.json",
+        "*manifest.json",
+        "*summary.json",
+        "*config.json",
+    ):
+        for path in sorted(directory.glob(pattern)):
+            value = _read_json(path)
+            if isinstance(value, dict):
+                return value, path
     return {}, None
 
 
@@ -531,12 +648,26 @@ def _generic_per_cloud(document: Any) -> list[dict[str, Any]]:
     if not isinstance(document, dict):
         return []
     rows = _embedded_per_cloud(document)
-    for key in ("rows", "official_per_cloud", "results"):
+    for key in (
+        "rows",
+        "official_per_cloud",
+        "per_arm",
+        "per_representation",
+        "results",
+        "utility_results",
+    ):
         value = document.get(key)
         if (
             isinstance(value, list)
             and all(isinstance(row, dict) for row in value)
-            and any("method" in row and "split" in row for row in value)
+            and any(
+                "split" in row
+                and any(
+                    field in row
+                    for field in ("method", "arm", "arm_label", *_REPRESENTATION_FIELDS)
+                )
+                for row in value
+            )
         ):
             rows.extend(value)
     return rows
@@ -544,36 +675,47 @@ def _generic_per_cloud(document: Any) -> list[dict[str, Any]]:
 
 def _import_future_experiments(root: Path) -> list[dict[str, Any]]:
     rows = []
-    directories = sorted(
-        path
-        for pattern in ("experiment_021*", "experiment_022*")
-        for path in root.glob(pattern)
-        if path.is_dir()
-    )
+    directories = []
+    for path in root.glob("experiment_[0-9][0-9][0-9]*"):
+        match = re.match(r"experiment_(\d+)", path.name)
+        if path.is_dir() and match is not None and int(match.group(1)) >= 21:
+            directories.append(path)
+    directories.sort()
     for directory in directories:
         document, document_path = _find_context_document(directory)
         context_path = document_path or directory
         context = _context_from_document(document, context_path)
-        jsonl_paths = sorted(directory.rglob("*per_cloud*.jsonl"))
+        jsonl_paths = sorted(directory.rglob("*.jsonl"))
         for path in jsonl_paths:
-            rows.extend(
-                _rows_from_source(_read_jsonl(path), context=context, source_path=path)
+            local_document, local_document_path = _find_context_document(path.parent)
+            local_context = (
+                _context_from_document(
+                    local_document,
+                    local_document_path or path,
+                    fallback_dataset=context.dataset,
+                )
+                if local_document_path is not None
+                else context
             )
-        if not jsonl_paths:
-            for path in sorted(directory.rglob("*metrics.json")):
-                value = document if path == document_path else _read_json(path)
-                observations = _generic_per_cloud(value)
-                if observations:
-                    local_context = _context_from_document(
-                        value if isinstance(value, dict) else document,
-                        path,
-                        fallback_dataset=context.dataset,
+            rows.extend(
+                _rows_from_source(
+                    _read_jsonl(path), context=local_context, source_path=path
+                )
+            )
+        for path in sorted(directory.rglob("*.json")):
+            value = document if path == document_path else _read_json(path)
+            observations = _generic_per_cloud(value)
+            if observations:
+                local_context = _context_from_document(
+                    value if isinstance(value, dict) else document,
+                    path,
+                    fallback_dataset=context.dataset,
+                )
+                rows.extend(
+                    _rows_from_source(
+                        observations, context=local_context, source_path=path
                     )
-                    rows.extend(
-                        _rows_from_source(
-                            observations, context=local_context, source_path=path
-                        )
-                    )
+                )
     return rows
 
 
@@ -592,9 +734,13 @@ def _row_identity(row: dict[str, Any]) -> tuple[Any, ...]:
         "rate_bpp",
         "decoder_seed",
         "refiner_seed",
+        "run_seed",
         "sample_id",
         "family",
         "model_id",
+        "representation_family",
+        "objective",
+        "regime",
         "metric_name",
         "record_kind",
         "experiment",
@@ -610,10 +756,14 @@ def _sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
             "split",
             "method",
             "arm_label",
+            "representation_family",
+            "objective",
+            "regime",
             "rate_bytes",
             "rate_bpp",
             "decoder_seed",
             "refiner_seed",
+            "run_seed",
             "family",
             "model_id",
             "sample_id",
@@ -681,6 +831,9 @@ def load_registry(path: Path = DEFAULT_REGISTRY_PATH) -> list[dict[str, Any]]:
         "rate_bpp",
         "decoder_seed",
         "refiner_seed",
+        "representation_family",
+        "objective",
+        "regime",
         "metric_name",
         "value",
         "source_path",
@@ -846,6 +999,135 @@ def headline_statistics(
             "methods": statistics,
         }
     return result
+
+
+def _rate_utility_split(rows: list[dict[str, Any]], split: str | None) -> str | None:
+    available = sorted({str(row["split"]) for row in rows})
+    if split is not None:
+        if split not in available:
+            raise ValueError(f"split {split!r} is absent from the registry selection")
+        return split
+    for preferred in ("validation", "test", "ood", "category_ood"):
+        if preferred in available:
+            return preferred
+    return available[0] if available else None
+
+
+def rate_utility_statistics(
+    rows: list[dict[str, Any]],
+    *,
+    dataset: str | None = None,
+    split: str | None = None,
+    rate_bytes: float | None = None,
+) -> dict[str, Any]:
+    """Aggregate registry rows into deterministic Track B operating points.
+
+    Utility values are arithmetic means over the selected rows. Official D1 is
+    aggregated in squared-error space before taking the square root. This keeps
+    the plotted distortion faithful whether a producer emits D1 MSE or RMSE.
+    """
+
+    if rate_bytes is not None and rate_bytes < 0.0:
+        raise ValueError("rate_bytes must be nonnegative")
+    metric_names = {
+        *UTILITY_METRICS,
+        "d1_rmse",
+        "official_d1_mse",
+        "official_d1_rmse",
+    }
+    candidates = [
+        row
+        for row in rows
+        if row.get("metric_name") in metric_names
+        and row.get("rate_bytes") is not None
+        and (
+            rate_bytes is None
+            or math.isclose(float(row["rate_bytes"]), rate_bytes, abs_tol=1e-9)
+        )
+    ]
+    selected_dataset = _select_dataset(candidates, dataset)
+    if selected_dataset is not None:
+        candidates = [row for row in candidates if row["dataset"] == selected_dataset]
+    selected_split = _rate_utility_split(candidates, split)
+    if selected_split is not None:
+        candidates = [row for row in candidates if row["split"] == selected_split]
+
+    dimensions = (
+        "dataset",
+        "split",
+        "representation_family",
+        "method",
+        "arm_label",
+        "objective",
+        "regime",
+        "rate_bytes",
+        "rate_bpp",
+    )
+    grouped: dict[tuple[Any, ...], dict[str, list[tuple[str, float]]]] = {}
+    for row in candidates:
+        representation_family = row.get("representation_family") or row["method"]
+        key = tuple(
+            representation_family
+            if field == "representation_family"
+            else row.get(field)
+            for field in dimensions
+        )
+        grouped.setdefault(key, {}).setdefault(str(row["metric_name"]), []).append(
+            (str(row.get("record_kind", "per_cloud")), float(row["value"]))
+        )
+
+    def selected_values(records: list[tuple[str, float]] | None) -> list[float]:
+        if not records:
+            return []
+        aggregate = [
+            value for kind, value in records if kind in {"aggregate", "summary"}
+        ]
+        return aggregate or [value for _, value in records]
+
+    points = []
+    for key, metric_values in grouped.items():
+        point = dict(zip(dimensions, key, strict=True))
+        counts: dict[str, int] = {}
+        for metric in UTILITY_METRICS:
+            values = selected_values(metric_values.get(metric))
+            point[metric] = float(np.mean(values)) if values else None
+            counts[metric] = len(values) if values else 0
+        d1_mse = selected_values(metric_values.get("official_d1_mse"))
+        d1_rmse = selected_values(
+            metric_values.get("official_d1_rmse") or metric_values.get("d1_rmse")
+        )
+        if d1_mse:
+            point["d1_rmse"] = math.sqrt(float(np.mean(d1_mse)))
+            counts["d1_rmse"] = len(d1_mse)
+        elif d1_rmse:
+            point["d1_rmse"] = math.sqrt(
+                float(np.mean(np.square(np.asarray(d1_rmse, dtype=np.float64))))
+            )
+            counts["d1_rmse"] = len(d1_rmse)
+        else:
+            point["d1_rmse"] = None
+            counts["d1_rmse"] = 0
+        point["metric_counts"] = counts
+        points.append(point)
+    points.sort(
+        key=lambda point: tuple(
+            _optional_sort(point.get(field))
+            for field in (
+                "representation_family",
+                "method",
+                "arm_label",
+                "objective",
+                "regime",
+                "rate_bytes",
+            )
+        )
+    )
+    return {
+        "dataset": selected_dataset,
+        "split": selected_split,
+        "rate_bytes": rate_bytes,
+        "points": points,
+    }
 
 
 def main() -> None:

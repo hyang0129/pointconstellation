@@ -1,0 +1,26 @@
+{
+  "dataset": "FixtureNet",
+  "config": {
+    "num_points": 2048
+  },
+  "per_arm": [
+    {
+      "record_kind": "aggregate",
+      "seed": 17,
+      "split": "validation",
+      "arm": "joint_utility",
+      "representation_type": "coordinate_set",
+      "optimization_objective": "joint_utility",
+      "training_regime": "end_to_end",
+      "stream_bytes": 50,
+      "metrics": {
+        "accuracy": 0.85,
+        "mAP": 0.80,
+        "repeatability": 0.90,
+        "surface_rmse": 0.033,
+        "normal_consistency": 0.93,
+        "d1_mse": 90.0
+      }
+    }
+  ]
+}
