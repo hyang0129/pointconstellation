@@ -168,8 +168,85 @@ python scripts/resummarize_entropy_headroom.py \
   --official-rows \
     artifacts/local/experiment_020_official_stability/official_per_cloud.jsonl \
   --split validation \
-  --output /tmp/experiment_019_validation_entropy_headroom.json
+    --output /tmp/experiment_019_validation_entropy_headroom.json
 ```
+
+## Learned entropy stream
+
+The learned mode preserves the mode-0 coordinate contract and 14-byte `PCON`
+header. Its public API value remains `MODE_LEARNED = 2`; the integrated stream
+uses wire ID 5 because IDs 2--4 identify the pre-existing `free`,
+`strict_subset`, and `fps` representation modes. It
+codes the same lexicographically sorted lattice with a 32-bit integer arithmetic
+coder and appends a four-byte CRC-32 integrity check. The decoder also
+re-encodes the decoded lattice and requires the canonical bytes, so truncation,
+trailing bytes, a mismatched shared model, and non-canonical arithmetic streams
+are rejected. The CRC and any padding are counted in `learned_stream_bytes`.
+When normalization is present, its eight serialized bytes are also counted and
+are restored identically by the fixed, Rice, and learned streams.
+The declared paper stream remains mode 0.
+
+Two shared-model candidates are implemented:
+
+- `octree` traverses the `q`-level lattice octree, codes child-occupancy bits
+  with training-seeded and within-stream adaptive integer contexts, and handles
+  duplicate lattice points through exact child-count allocation;
+- `autoregressive` uses a small fixed-point MLP conditioned on previously coded
+  sorted coordinates. It codes each predicted residual with a stored integer
+  discretized-logistic probability table.
+
+Both candidates are fitted from regenerated `split=train` constellations. Their
+integer arrays are shared decoder state, are excluded from per-cloud bytes, and
+are reported separately as both uncompressed parameter bytes and actual
+serialized model bytes. Candidate selection uses validation bytes. The script
+checks every round trip against mode 0 and pads only when necessary to prevent a
+decodable stream from falling below the existing oracle diagnostic bound.
+
+The predeclared complete factorial ran on an EmpireAI H200 (`--device cuda`,
+`complete_factorial: true`, all 18 refiner cells, 9,728 regenerated
+`split=train` constellations for fitting, 3,072 official validation rows;
+181.6 s). Validation-byte selection chose `autoregressive`:
+
+| Candidate | Mean fixed bytes | Mean mode-1 bytes | Mean mode-2 bytes | Fraction of fixed | Serialized shared model |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Octree | 50.000 | 51.945 | 52.364 (min 47, max 54) | 1.047 | 14,332 B |
+| Autoregressive | 50.000 | 51.945 | 52.058 (min 50, max 55) | 1.041 | 13,088 B |
+
+**Gate G-A2 fails.** Neither shared context model beats the fixed-width
+stream; both sit at the sorted-delta mode-1 level, so the learned coder expands
+rather than compresses the 50-byte fixed stream and the 40-byte threshold is not
+approached. The reading is that eight lexicographically sorted 12-bit
+coordinates are close to incompressible for any causal model that must be shared
+across clouds: conditional on the shape prior the constellations are near-uniform
+on the lattice, and the 26.852-byte oracle diagnostic bound above is not
+reachable by a shared model. The declared paper stream therefore stays mode 0,
+and the rate lever established by Experiment 025 is coordinate precision, not
+entropy coding. The selected model hash is
+`3e5c1a19f96ee35d85d519ccc66bf6d2a92d858c4b6c5f199aee02b902377c22`
+(793,536 uncompressed shared bytes); the 13,088-byte NPZ file SHA-256 is
+`5fc9cf21a4fba3ff3a496f26022be947a38e1d0496da14e9d29d52742ac64d87`.
+All 3,072 mode-2 streams were at or above the oracle diagnostic bound. The
+earlier bounded single-cell smoke (256 rows, decoder seed 7, refiner seed 101)
+gave 52.344 / 52.070 bytes and is superseded by the factorial.
+
+It used the same official-row and stability-config hashes listed above. Re-run the
+bounded single-cell check with:
+
+```bash
+python scripts/resummarize_learned_entropy.py \
+  --config configs/experiment_020_official_stability.json \
+  --official-rows \
+    artifacts/local/experiment_020_official_stability/official_per_cloud.jsonl \
+  --device cpu \
+  --inference-batch-size 32 \
+  --max-refiner-cells 1 \
+  --model-output /tmp/experiment_019_learned_entropy_model_smoke.npz \
+  --output /tmp/experiment_019_validation_learned_entropy_smoke.json
+```
+
+Omit `--max-refiner-cells` for the predeclared complete factorial. The output
+then records `complete_factorial: true`; limited runs explicitly record
+`complete_factorial: false` and their cell count.
 
 ## Reproduction
 

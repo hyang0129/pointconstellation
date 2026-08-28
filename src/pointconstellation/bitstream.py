@@ -1,10 +1,11 @@
 """Deterministic fixed-width and entropy-coded constellation streams.
 
-Both stream modes quantize coordinates on the declared ``[-1, 1]`` lattice
+All stream modes quantize coordinates on the declared ``[-1, 1]`` lattice
 and sort them lexicographically.  Mode 0 is the declared fixed-width stream.
 Mode 1 is an optional diagnostic that delta-codes the same unordered lattice
-points with a stream-adaptive Rice code.  Neither mode carries learned features
-or target-only information.
+points with a stream-adaptive Rice code.  The learned mode uses shared integer
+probability-model state and an exact arithmetic coder.  No mode carries learned
+features or target-only information.
 
 Streams may append the mesh normalization needed to return to the source frame.
 The center and isotropic scale are stored as four IEEE 754 binary16 values.  A
@@ -22,14 +23,27 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
+from pointconstellation.bitstream_bits import BitReader as _BitReader
+from pointconstellation.bitstream_bits import BitWriter as _BitWriter
+from pointconstellation.learned_entropy import (
+    LearnedEntropyModel,
+    decode_learned_lattice,
+    default_octree_model,
+    encode_learned_lattice,
+)
+
 MAGIC = b"PCON"
 VERSION = 1
 MODE_FIXED = 0
 MODE_ENTROPY = 1
+MODE_LEARNED = 2
 REPRESENTATION_MODES = ("free", "strict_subset", "fps")
 MODE_IDS = {
     MODE_FIXED: 0,
     MODE_ENTROPY: 1,
+    # Wire IDs 2--4 predate learned coding and identify representation modes.
+    # Keep MODE_LEARNED's public value while allocating a collision-free ID.
+    MODE_LEARNED: 5,
     "free": 2,
     "strict_subset": 3,
     "fps": 4,
@@ -58,85 +72,6 @@ class ConstellationPacket:
     stream_bytes: int
     normalization_center: NDArray[np.float64] | None
     normalization_scale: float | None
-
-
-class _BitWriter:
-    def __init__(self) -> None:
-        self._output = bytearray()
-        self._accumulator = 0
-        self._buffered = 0
-        self.bits_written = 0
-
-    def write(self, value: int, width: int) -> None:
-        if width < 0 or value < 0 or value >= 1 << width:
-            raise ValueError("bit value does not fit its declared width")
-        self.bits_written += width
-        remaining = width
-        while remaining:
-            available = 8 - self._buffered
-            take = min(remaining, available)
-            shift = remaining - take
-            self._accumulator = (self._accumulator << take) | (
-                (value >> shift) & ((1 << take) - 1)
-            )
-            self._buffered += take
-            remaining -= take
-            if self._buffered == 8:
-                self._output.append(self._accumulator)
-                self._accumulator = 0
-                self._buffered = 0
-
-    def write_unary(self, quotient: int) -> None:
-        if quotient < 0:
-            raise ValueError("Rice quotient cannot be negative")
-        while quotient >= 8 and self._buffered == 0:
-            self._output.append(0)
-            self.bits_written += 8
-            quotient -= 8
-        for _ in range(quotient):
-            self.write(0, 1)
-        self.write(1, 1)
-
-    def finish(self) -> bytes:
-        if self._buffered:
-            self._output.append(self._accumulator << (8 - self._buffered))
-            self._accumulator = 0
-            self._buffered = 0
-        return bytes(self._output)
-
-
-class _BitReader:
-    def __init__(self, data: bytes) -> None:
-        self._data = data
-        self.position = 0
-
-    def read(self, width: int) -> int:
-        if width < 0 or self.position + width > 8 * len(self._data):
-            raise ValueError("truncated constellation payload")
-        value = 0
-        for _ in range(width):
-            byte = self._data[self.position // 8]
-            shift = 7 - self.position % 8
-            value = (value << 1) | ((byte >> shift) & 1)
-            self.position += 1
-        return value
-
-    def read_unary(self) -> int:
-        quotient = 0
-        while True:
-            if self.position >= 8 * len(self._data):
-                raise ValueError("truncated constellation Rice code")
-            if self.read(1):
-                return quotient
-            quotient += 1
-
-    def validate_padding(self) -> None:
-        expected_bytes = math.ceil(self.position / 8)
-        if len(self._data) != expected_bytes:
-            raise ValueError("unexpected bytes after constellation payload")
-        while self.position < 8 * len(self._data):
-            if self.read(1):
-                raise ValueError("non-zero constellation padding bits")
 
 
 def expected_payload_bytes(constellation_size: int, bits: int) -> int:
@@ -316,6 +251,7 @@ def encode_constellation(
     output_points: int,
     normalization_center: ArrayLike | None = None,
     normalization_scale: float | None = None,
+    learned_model: LearnedEntropyModel | None = None,
 ) -> bytes:
     """Encode an unordered normalized coordinate set into a canonical stream.
 
@@ -355,15 +291,29 @@ def encode_constellation(
         constellation_size,
         output_points,
     )
-    if mode != MODE_ENTROPY:
-        payload = _pack(lattice.reshape(-1), bits)
-    else:
+    if mode == MODE_ENTROPY:
         payload, _ = _pack_entropy(lattice, bits)
+    elif mode == MODE_LEARNED:
+        model = learned_model or default_octree_model(bits, constellation_size)
+        model.validate_stream(bits, constellation_size)
+        minimum_payload_bytes = max(
+            0, math.ceil(entropy_bound_bytes(coordinates, bits=bits)) - HEADER.size
+        )
+        payload = encode_learned_lattice(
+            lattice,
+            model=model,
+            header=header,
+            minimum_payload_bytes=minimum_payload_bytes,
+        )
+    else:
+        payload = _pack(lattice.reshape(-1), bits)
     return header + payload + normalization_payload
 
 
-def decode_constellation(stream: bytes) -> ConstellationPacket:
-    """Decode and validate a fixed-width or entropy-coded constellation stream."""
+def decode_constellation(
+    stream: bytes, *, learned_model: LearnedEntropyModel | None = None
+) -> ConstellationPacket:
+    """Decode and validate any supported constellation stream."""
 
     if len(stream) < HEADER.size:
         raise ValueError("truncated constellation header")
@@ -389,14 +339,23 @@ def decode_constellation(stream: bytes) -> ConstellationPacket:
     if payload_end < HEADER.size:
         raise ValueError("truncated constellation payload")
     payload = stream[HEADER.size:payload_end]
-    if mode != MODE_ENTROPY:
+    if mode == MODE_ENTROPY:
+        values, payload_bits = _unpack_entropy(payload, size, bits)
+    elif mode == MODE_LEARNED:
+        model = learned_model or default_octree_model(bits, size)
+        model.validate_stream(bits, size)
+        values = decode_learned_lattice(
+            payload,
+            model=model,
+            header=stream[: HEADER.size],
+        )
+        payload_bits = 8 * len(payload)
+    else:
         expected = expected_stream_bytes(size, bits, normalization=has_normalization)
         if len(stream) != expected:
             raise ValueError(f"stream has {len(stream)} bytes; expected {expected}")
         values = _unpack(payload, 3 * size, bits).reshape(size, 3)
         payload_bits = 3 * size * bits
-    else:
-        values, payload_bits = _unpack_entropy(payload, size, bits)
     levels = (1 << bits) - 1
     normalized = values.astype(np.float64) * (2.0 / levels) - 1.0
     center = None
@@ -405,6 +364,18 @@ def decode_constellation(stream: bytes) -> ConstellationPacket:
     if has_normalization:
         center, scale = decode_normalization(stream[payload_end:])
         coordinates = normalized * scale + center
+    if mode == MODE_LEARNED:
+        canonical = encode_constellation(
+            normalized,
+            bits=bits,
+            mode=mode,
+            output_points=output_points,
+            normalization_center=center,
+            normalization_scale=scale,
+            learned_model=model,
+        )
+        if canonical != stream:
+            raise ValueError("non-canonical or corrupt learned constellation payload")
     return ConstellationPacket(
         coordinates=coordinates,
         normalized_coordinates=normalized,

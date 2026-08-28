@@ -1248,6 +1248,16 @@ def run_official_stability(
                     for row in rows
                 )
             ),
+            "learned_stream_rates_present": bool(
+                rows
+                and all(
+                    row.get("learned_stream_bytes", 0) >= HEADER.size + 5
+                    and row.get("learned_bpp")
+                    == 8.0 * row["learned_stream_bytes"] / stability.num_points
+                    and row.get("learned_shared_model_bytes", -1) >= 0
+                    for row in rows
+                )
+            ),
             "header_payload_splits_exact": bool(
                 rows
                 and all(
