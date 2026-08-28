@@ -1,6 +1,6 @@
 # Experiment 040: heuristic selective pass-through
 
-Status: implementation complete; full results not yet run.
+Status: complete; Gate G-C1 fails under the predeclared issue #66 criterion (the runner's weaker slope test passes and is reported separately).
 
 ## Question and predeclared hypothesis
 
@@ -164,6 +164,102 @@ under `artifacts/local/` and are not committed.
 
 ## Results
 
-Placeholder. Do not infer compression or tail-flattening conclusions from the
-implementation smoke. Report the full six-seed paired result, exact rates, and
-negative or score-specific outcomes here after the predeclared run completes.
+The full experiment ran on an EmpireAI H200 (`--device cuda`, 7.4 h): 128
+validation and 32 category-OOD clouds, six frozen Experiment 019 decoders,
+FPS-start Adam-STE search, four irregularity scores x three splits x six payload
+budgets, plus the uniform-constellation, random-preserved and fresh-encode
+G-PCC controls. All seven contract checks pass (source-only selection, exact
+preservation of passed-through lattice points, exact stream round trip,
+stratification covering every target point, official D1/D2 present, frozen
+decoder hashes unchanged, fixed payloads within budget). Bytes below are mean
+complete stream bytes (payload + 12-byte header); the G-PCC arm is the nearest
+available TMC13 rate point and is 15-30 B heavier than the learned arms at
+every budget.
+
+### Validation, 50 % preserved split (official RMSE in 12-bit grid units)
+
+| Budget | Arm | Bytes | D1 | D2 | p95 | p99 | Boundary recall | Thin recall |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| 40 | uniform constellation (control) | 50 | 241.8 | 131.0 | 0.182 | 0.223 | 0.010 | 0.012 |
+| 40 | selective, decoder-residual | 52 | 245.5 | 136.2 | 0.184 | 0.219 | 0.019 | 0.017 |
+| 40 | selective, curvature | 52 | 250.4 | 136.2 | 0.195 | 0.243 | 0.023 | 0.025 |
+| 40 | selective, boundary | 52 | 250.8 | 136.2 | 0.194 | 0.242 | 0.024 | 0.021 |
+| 40 | random preserved (control) | 52 | 249.8 | 136.1 | 0.193 | 0.242 | 0.013 | 0.015 |
+| 40 | G-PCC octree | 72 | 242.4 | 144.6 | 0.157 | 0.172 | 0.015 | 0.015 |
+| 64 | uniform constellation (control) | 77 | 231.7 | 125.6 | 0.170 | 0.205 | 0.011 | 0.013 |
+| 64 | selective, decoder-residual | 79 | 233.7 | 131.7 | 0.171 | 0.200 | 0.024 | 0.022 |
+| 64 | selective, curvature | 79 | 237.8 | 131.7 | 0.181 | 0.223 | 0.031 | 0.034 |
+| 64 | selective, boundary | 79 | 238.4 | 131.7 | 0.180 | 0.222 | 0.034 | 0.028 |
+| 64 | random preserved (control) | 79 | 236.9 | 131.7 | 0.179 | 0.221 | 0.017 | 0.019 |
+| 64 | G-PCC octree | 98 | 167.6 | 101.9 | 0.104 | 0.114 | 0.031 | 0.031 |
+| 110 | uniform constellation (control) | 122 | 222.2 | 118.5 | 0.160 | 0.189 | 0.012 | 0.015 |
+| 110 | selective, decoder-residual | 124 | 221.7 | 126.8 | 0.158 | 0.182 | 0.030 | 0.028 |
+| 110 | selective, curvature | 124 | 225.6 | 126.8 | 0.167 | 0.203 | 0.046 | 0.050 |
+| 110 | selective, boundary | 124 | 226.6 | 126.8 | 0.167 | 0.202 | 0.053 | 0.040 |
+| 110 | random preserved (control) | 124 | 224.0 | 126.7 | 0.166 | 0.201 | 0.022 | 0.025 |
+| 110 | G-PCC octree | 129 | 121.1 | 71.2 | 0.078 | 0.085 | 0.059 | 0.059 |
+
+Paired bootstrap, selective (50 %) versus the uniform constellation at equal
+payload, validation, relative improvement in percent (negative = selective is
+worse): decoder-residual D1 -1.5 / -1.7 / -0.9 / -0.9 / -0.6 / +0.2 and D2
+-4.0 / -6.0 / -4.8 / -6.8 / -8.3 / -7.0 at 40 / 52 / 64 / 78 / 96 / 110 B, with
+p99 tail +1.7 / +1.0 / +2.3 / +2.6 / +3.0 / +3.6; curvature D1 -3.5 / -3.6 /
+-2.6 / -2.7 / -2.4 / -1.5, D2 -4.0 / -6.0 / -4.8 / -6.9 / -8.4 / -7.0, p99
+-9.2 / -10.7 / -9.1 / -9.8 / -9.0 / -7.7. The 25 % and 75 % splits and the OOD
+split show the same ordering (OOD aggregates in `selective_metrics.json`).
+
+### Gate G-C1
+
+Two gate formulations must be distinguished.
+
+1. **The gate predeclared in issue #66** (and in `docs/track-c-selective-preservation.md`):
+   selective pass-through must reduce D1 on the high-irregularity stratum by a
+   CI-backed margin over the uniform-`K` control at equal bytes, and boundary /
+   thin-structure recall must recover to at least 0.8 of raw-input recall; if
+   the uniform control matches, the track stops. **This gate fails.** At every
+   budget the uniform constellation is equal or better on aggregate D1 and
+   better on D2; the random-preserved control matches the selective arms on
+   D1/D2/tails, so the selection score adds nothing to fidelity; and boundary
+   recall reaches at most 0.053 (raw input: 1.0), far below 0.8.
+2. **The gate as implemented in this runner** (`gate_g_c1` in
+   `selective_metrics.json`): curvature-score selective pass-through at the
+   50 % split must have a positive paired-bootstrap reduction of the
+   D1-versus-curvature-quintile *slope* with at most 5 % aggregate D1
+   degradation at four of six validation budgets, and a positive slope
+   reduction at four OOD budgets. This weaker test records `passes: true`
+   (4 / 6 validation budgets, 64-110 B, with 2.4-3.6 % aggregate D1
+   degradation; 5 / 6 OOD). It passes only because the error-versus-curvature
+   curve flattens slightly while total error rises; it was not the predeclared
+   criterion and is reported here for completeness, not as a pass.
+
+**Decision: G-C1 fails; Experiment 042 (learned selection) is not filed.**
+
+### Reading
+
+1. **At 40-110 bytes a raw point costs as much as a constellation point, and a
+   constellation point buys far more surface.** Spending half the budget on
+   passed-through points preserves 4-12 raw points out of 2,048, which cannot
+   move boundary recall or the tail, while removing 4-12 decoder-aware points
+   costs 1-4 % D1 and 4-8 % D2. Selective preservation by individual points is
+   the wrong mechanism in this regime; irregularity would have to be carried
+   as structure the decoder can expand, or the budget has to be an order of
+   magnitude larger.
+2. **The selection score does not matter for fidelity.** Random preserved
+   points reproduce the selective arms' D1/D2/tails to within noise; only the
+   boundary and curvature scores raise boundary/thin recall, and only to a few
+   percent.
+3. **The decoder-residual score is the only one that improves the tail**
+   (p99 +1-4 %), consistent with it targeting the decoder's own worst points;
+   this is a small, real effect and the one lead worth keeping if a
+   higher-rate variant is ever revisited.
+4. **G-PCC dominates from 64 B upward** in this table, more strongly than in
+   Experiment 025, because the G-PCC arm here sits 15-30 B above the learned
+   arms at each nominal budget (nearest available TMC13 rate point); the
+   crossover is consistent with Experiment 025's ~65 B once bytes are matched.
+
+Experiment 041 (defect-injection anomaly AUROC) still tests the premise that
+codecs erase anomalies, independently of whether pass-through can fix it.
+
+Artifacts: `artifacts/local/experiment_040_selective/` (`selective_metrics.json`,
+`selective_per_cloud.jsonl`, `run_manifest.json`) on the cluster
+(`~/LLM_research/pointconstellation-tracks-a`).
