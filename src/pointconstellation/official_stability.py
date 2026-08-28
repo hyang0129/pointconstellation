@@ -34,6 +34,7 @@ from pointconstellation.stability_experiment import (
     _data_protocol,
     _datasets,
     _decoder,
+    _entropy_rate_fields,
     _membership,
     _refiner,
     _serialized_coordinates,
@@ -798,6 +799,7 @@ def _evaluate_method(
         "bitstream_mode": bitstream_mode,
         "selection_seed": selection_seed,
         "selection_trials": selection_trials,
+        **_entropy_rate_fields(packet, num_points=stability.num_points),
         "serialized_round_trip_exact": exact,
         "coordinates_on_exact_lattice": lattice_exact,
         "source_only_decoder_gradient": True,
@@ -1021,6 +1023,17 @@ def run_official_stability(
             ),
             "actual_stream_bytes_present": bool(
                 rows and all(row["stream_bytes"] > 0 for row in rows)
+            ),
+            "entropy_stream_rates_present": bool(
+                rows
+                and all(
+                    row.get("entropy_stream_bytes", 0) >= HEADER.size + 1
+                    and row.get("entropy_bpp")
+                    == 8.0 * row["entropy_stream_bytes"] / stability.num_points
+                    and row.get("entropy_bound_bytes", math.inf)
+                    <= row["entropy_stream_bytes"]
+                    for row in rows
+                )
             ),
             "header_payload_splits_exact": bool(
                 rows

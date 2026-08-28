@@ -10,10 +10,12 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from pointconstellation.bitstream import MODE_FIXED
 from pointconstellation.stability_experiment import (
     StabilityExperimentConfig,
     _data_protocol,
     _datasets,
+    _entropy_rate_fields,
     _feature_reference_comparison,
     _serialized_coordinates,
     _two_way_components,
@@ -30,15 +32,22 @@ def test_serialized_coordinates_return_header_payload_packets() -> None:
     coordinates = torch.zeros((2, 2, 3), dtype=torch.float32)
 
     _, packets, exact, lattice_exact = _serialized_coordinates(
-        coordinates, config=config, mode="free"
+        coordinates, config=config
     )
 
     assert exact and lattice_exact
     assert len(packets) == 2
+    assert all(packet.mode == MODE_FIXED for packet in packets)
     assert all(
         packet.header_bytes + packet.payload_bytes == packet.stream_bytes
         for packet in packets
     )
+    entropy = _entropy_rate_fields(packets[0], num_points=config.num_points)
+    assert entropy["entropy_stream_bytes"] >= packets[0].header_bytes + 1
+    assert entropy["entropy_bpp"] == (
+        8.0 * entropy["entropy_stream_bytes"] / config.num_points
+    )
+    assert entropy["entropy_bound_bytes"] <= entropy["entropy_stream_bytes"]
 
 
 def test_config_rejects_test_calibration_and_incomplete_rate_curriculum() -> None:

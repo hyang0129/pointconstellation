@@ -26,9 +26,13 @@ from torch import Tensor, nn
 from torch.utils.data import DataLoader, Dataset, Subset
 
 from pointconstellation.bitstream import (
+    HEADER,
+    MODE_ENTROPY,
+    MODE_FIXED,
     ConstellationPacket,
     decode_constellation,
     encode_constellation,
+    entropy_bound_bytes,
     expected_stream_bytes,
 )
 from pointconstellation.data import (
@@ -505,7 +509,7 @@ def _calibration_rmse(
                 source, config.constellation_size, config.coordinate_bits
             )
             constellation, _, exact, lattice_exact = _serialized_coordinates(
-                constellation, config=config, mode="fps"
+                constellation, config=config
             )
             if not exact or not lattice_exact:
                 raise RuntimeError("calibration FPS bitstream round trip failed")
@@ -790,7 +794,7 @@ def _serialized_coordinates(
     coordinates: Tensor,
     *,
     config: StabilityExperimentConfig,
-    mode: str,
+    mode: str = MODE_FIXED,
 ) -> tuple[Tensor, list[ConstellationPacket], bool, bool]:
     decoded = []
     packets = []
@@ -827,6 +831,29 @@ def _serialized_coordinates(
         exact,
         lattice_exact,
     )
+
+
+def _entropy_rate_fields(
+    packet: ConstellationPacket, *, num_points: int
+) -> dict[str, float | int]:
+    """Return exact optional-stream rates without changing the declared packet."""
+
+    entropy_stream = encode_constellation(
+        packet.coordinates,
+        bits=packet.bits,
+        mode=MODE_ENTROPY,
+        output_points=packet.output_points,
+    )
+    entropy_packet = decode_constellation(entropy_stream)
+    if not np.array_equal(packet.coordinates, entropy_packet.coordinates):
+        raise RuntimeError("entropy stream changed the fixed-stream lattice")
+    return {
+        "entropy_stream_bytes": len(entropy_stream),
+        "entropy_bpp": 8.0 * len(entropy_stream) / num_points,
+        "entropy_bound_bytes": entropy_bound_bytes(
+            packet.coordinates, bits=packet.bits
+        ),
+    }
 
 
 def _evaluate_pair(
@@ -892,9 +919,8 @@ def _evaluate_pair(
                 probed += probe_count
 
             for method, (coordinates, source_only_probe) in methods.items():
-                mode = "fps" if method == "fps" else "free"
                 decoded, packets, exact, lattice_exact = _serialized_coordinates(
-                    coordinates, config=config, mode=mode
+                    coordinates, config=config
                 )
                 with torch.no_grad():
                     reconstruction = decoder(
@@ -935,6 +961,9 @@ def _evaluate_pair(
                             "actual_stream_bpp": 8.0
                             * packet.stream_bytes
                             / config.num_points,
+                            **_entropy_rate_fields(
+                                packet, num_points=config.num_points
+                            ),
                             "chamfer_mse": float(source_losses[index].item()),
                             "fresh_chamfer_mse": float(fresh_losses[index].item()),
                             "source_only_optimization": source_only_probe,
@@ -1858,6 +1887,13 @@ def run_stability_experiment(
                 == expected_stream_bytes(
                     config.constellation_size, config.coordinate_bits
                 )
+                for row in all_rows
+            ),
+            "all_entropy_stream_rates_present": all(
+                row["entropy_stream_bytes"] >= HEADER.size + 1
+                and row["entropy_bpp"]
+                == 8.0 * row["entropy_stream_bytes"] / config.num_points
+                and row["entropy_bound_bytes"] <= row["entropy_stream_bytes"]
                 for row in all_rows
             ),
             "all_header_payload_splits_exact": all(
