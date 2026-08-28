@@ -130,30 +130,35 @@ serialized model bytes. Candidate selection uses validation bytes. The script
 checks every round trip against mode 0 and pads only when necessary to prevent a
 decodable stream from falling below the existing oracle diagnostic bound.
 
-The complete 18-cell Experiment 019 regeneration exceeded the five-minute local
-CPU smoke budget and was stopped without producing a result. A bounded codec
-and provenance smoke used stabilized decoder seed 7, refiner seed 101, all 512
-training clouds for that cell plus 512 FPS training constellations, and the 128
-matched validation clouds for each method. This is not the complete factorial
-and does not establish G-A2. Over its 256 validation rows, the validation-byte
-selection chose `autoregressive`:
+The predeclared complete factorial ran on an EmpireAI H200 (`--device cuda`,
+`complete_factorial: true`, all 18 refiner cells, 9,728 regenerated
+`split=train` constellations for fitting, 3,072 official validation rows;
+181.6 s). Validation-byte selection chose `autoregressive`:
 
 | Candidate | Mean fixed bytes | Mean mode-1 bytes | Mean mode-2 bytes | Fraction of fixed | Serialized shared model |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Octree | 50.000 | 51.996 | 52.344 | 1.047 | 10,434 B |
-| Autoregressive | 50.000 | 51.996 | 52.070 | 1.041 | 13,091 B |
+| Octree | 50.000 | 51.945 | 52.364 (min 47, max 54) | 1.047 | 14,332 B |
+| Autoregressive | 50.000 | 51.945 | 52.058 (min 50, max 55) | 1.041 | 13,088 B |
 
-The selected candidate averaged 52.070 bytes for both the 128 FPS and 128
-refiner rows (range 50--55 overall), so this bounded smoke expands rather than
-compresses the fixed stream and fails the 40-byte G-A2 threshold. Its shared
-integer arrays occupy 793,536 uncompressed bytes; the selected model hash is
-`7bcdba756045c199421acdfe454c861a899e47beb30361a4065c8fc2cc1540ed`.
-The 13,091-byte NPZ file SHA-256 is
-`bd01f9575d1b0edb89e22c2827e371c7f5b7a5c0b9fb5399566b0ad8ffd28493`.
-All 256 mode-2 streams were at or above the oracle diagnostic bound.
+**Gate G-A2 fails.** Neither shared context model beats the fixed-width
+stream; both sit at the sorted-delta mode-1 level, so the learned coder expands
+rather than compresses the 50-byte fixed stream and the 40-byte threshold is not
+approached. The reading is that eight lexicographically sorted 12-bit
+coordinates are close to incompressible for any causal model that must be shared
+across clouds: conditional on the shape prior the constellations are near-uniform
+on the lattice, and the 26.852-byte oracle diagnostic bound above is not
+reachable by a shared model. The declared paper stream therefore stays mode 0,
+and the rate lever established by Experiment 025 is coordinate precision, not
+entropy coding. The selected model hash is
+`3e5c1a19f96ee35d85d519ccc66bf6d2a92d858c4b6c5f199aee02b902377c22`
+(793,536 uncompressed shared bytes); the 13,088-byte NPZ file SHA-256 is
+`5fc9cf21a4fba3ff3a496f26022be947a38e1d0496da14e9d29d52742ac64d87`.
+All 3,072 mode-2 streams were at or above the oracle diagnostic bound. The
+earlier bounded single-cell smoke (256 rows, decoder seed 7, refiner seed 101)
+gave 52.344 / 52.070 bytes and is superseded by the factorial.
 
-It used the same official-row and stability-config hashes listed above. Re-run
-that bounded check with:
+It used the same official-row and stability-config hashes listed above. Re-run the
+bounded single-cell check with:
 
 ```bash
 python scripts/resummarize_learned_entropy.py \
