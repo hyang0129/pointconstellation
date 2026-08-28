@@ -340,6 +340,10 @@ that result with official D1/D2 and adds a pinned complete-codec harness for
 general-purpose compression performance have not been made: the executed
 released-checkpoint smoke is at least 35x above the 50-byte rate, while the fair
 retrained curve and common-test-condition comparisons remain open. The
+[Experiment 034 placement diagnostic](docs/experiment-034-placement-analysis.md)
+adds reproducible category-consistency, occupancy-entropy, mesh-proxy, and
+headless qualitative analyses for the coordinate messages; its full ModelNet40
+run remains pending. The
 [paper benchmark epic](https://github.com/hyang0129/pointconstellation/issues/3)
 tracks the remaining evidence.
 
