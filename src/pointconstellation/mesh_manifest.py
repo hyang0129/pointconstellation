@@ -5,12 +5,18 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from pointconstellation.data.mesh import file_sha256
+from pointconstellation.data.mesh import file_sha256, load_mesh_manifest
 
 MODELNET40_URL = "https://modelnet.cs.princeton.edu/ModelNet40.zip"
+FINAL_SLICE_INPUT_MANIFESTS = (
+    Path("configs/manifests/modelnet40_pilot.local.json"),
+    Path("configs/manifests/modelnet40_scale.local.json"),
+    Path("configs/manifests/modelnet40_stability.local.json"),
+)
 
 
 def _rank(seed: int, category: str, model_id: str) -> str:
@@ -272,6 +278,163 @@ def create_modelnet40_manifest(
     }
 
 
+def _modelnet40_manifest_categories(
+    manifest: dict[str, Any], path: Path
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    if manifest.get("dataset") != "ModelNet40":
+        raise ValueError(f"input manifest is not ModelNet40: {path}")
+    categories = manifest.get("categories")
+    if not isinstance(categories, dict):
+        raise ValueError(f"input manifest has no category partition: {path}")
+    train = tuple(categories.get("train", ()))
+    heldout = tuple(categories.get("heldout", ()))
+    if not train or not heldout or set(train) & set(heldout):
+        raise ValueError(f"input manifest has an invalid category partition: {path}")
+    if len(set(train)) != len(train) or len(set(heldout)) != len(heldout):
+        raise ValueError(f"input manifest categories must be unique: {path}")
+    return tuple(sorted(train)), tuple(sorted(heldout))
+
+
+def build_final_slice_manifest(
+    root: Path,
+    *,
+    input_manifests: Sequence[Path],
+    validation_cap_per_category: int,
+    minimum_ood_clouds: int = 200,
+    seed: int = 1517,
+) -> dict[str, Any]:
+    """Build an untouched ModelNet40 official-test evaluation manifest.
+
+    Every official-test mesh named by any input manifest is excluded.  The
+    remaining training-category meshes are deterministically capped within
+    each category, while all remaining held-out-category meshes are retained.
+    """
+
+    if not input_manifests:
+        raise ValueError("at least one input manifest is required")
+    if validation_cap_per_category < 1:
+        raise ValueError("validation_cap_per_category must be positive")
+    if minimum_ood_clouds < 1:
+        raise ValueError("minimum_ood_clouds must be positive")
+
+    discovered = discover_modelnet40_meshes(root)
+    test_by_mesh = {
+        record["mesh"]: record
+        for records in discovered["test"].values()
+        for record in records
+    }
+    manifest_records: list[dict[str, str]] = []
+    manifest_identities: list[dict[str, str]] = []
+    expected_categories: tuple[tuple[str, ...], tuple[str, ...]] | None = None
+    seen_paths: set[Path] = set()
+    excluded_paths: set[str] = set()
+    for raw_path in input_manifests:
+        path = Path(raw_path)
+        resolved = path.resolve()
+        if resolved in seen_paths:
+            raise ValueError(f"input manifest is repeated: {path}")
+        seen_paths.add(resolved)
+        manifest = load_mesh_manifest(path)
+        categories = _modelnet40_manifest_categories(manifest, path)
+        if expected_categories is None:
+            expected_categories = categories
+        elif categories != expected_categories:
+            raise ValueError("input manifest category partitions do not match")
+        manifest_identities.append(
+            {"path": path.as_posix(), "sha256": file_sha256(path)}
+        )
+        for records in manifest["splits"].values():
+            for record in records:
+                mesh = str(record["mesh"])
+                discovered_record = test_by_mesh.get(mesh)
+                if discovered_record is None:
+                    continue
+                if record["mesh_sha256"] != discovered_record["mesh_sha256"]:
+                    raise ValueError(f"input manifest mesh hash differs: {mesh}")
+                excluded_paths.add(mesh)
+
+    assert expected_categories is not None
+    train_categories, heldout_categories = expected_categories
+    available_categories = set(discovered["test"])
+    requested_categories = set(train_categories) | set(heldout_categories)
+    missing = requested_categories - available_categories
+    if missing:
+        raise ValueError(f"input manifest categories are absent: {sorted(missing)}")
+
+    final_validation: list[dict[str, str]] = []
+    final_ood: list[dict[str, str]] = []
+    for category in train_categories:
+        available = [
+            record
+            for record in discovered["test"][category]
+            if record["mesh"] not in excluded_paths
+        ]
+        ranked = sorted(
+            available,
+            key=lambda record: _rank(seed, category, record["model_id"]),
+        )
+        if not ranked:
+            raise ValueError(f"no untouched official-test meshes for {category}")
+        final_validation.extend(ranked[:validation_cap_per_category])
+    for category in heldout_categories:
+        available = [
+            record
+            for record in discovered["test"][category]
+            if record["mesh"] not in excluded_paths
+        ]
+        if not available:
+            raise ValueError(f"no untouched official-test meshes for {category}")
+        final_ood.extend(available)
+    if len(final_ood) < minimum_ood_clouds:
+        raise ValueError(
+            f"final_ood has {len(final_ood)} clouds; need at least {minimum_ood_clouds}"
+        )
+
+    for records in (final_validation, final_ood):
+        records.sort(key=lambda record: (record["category"], record["model_id"]))
+    for mesh in sorted(excluded_paths):
+        manifest_records.append(test_by_mesh[mesh])
+    manifest_records.sort(key=lambda record: (record["category"], record["model_id"]))
+
+    source_values = []
+    for raw_path in input_manifests:
+        source = load_mesh_manifest(Path(raw_path)).get("source")
+        if isinstance(source, dict):
+            source_values.append(source)
+    source = source_values[0] if source_values else {"url": MODELNET40_URL}
+    if any(value != source for value in source_values[1:]):
+        raise ValueError("input manifest source identities do not match")
+    return {
+        "version": 1,
+        "dataset": "ModelNet40",
+        "seed": seed,
+        "source": source,
+        "sampling": {
+            "source_target": "independent_area_weighted_mesh_surface_samples",
+            "normalization": "mesh_bbox_center_then_unit_max_vertex_radius",
+            "official_split_policy": (
+                "final_validation and final_ood use only official test meshes "
+                "absent from every recorded input manifest"
+            ),
+        },
+        "selection": {
+            "validation_cap_per_category": validation_cap_per_category,
+            "minimum_ood_clouds": minimum_ood_clouds,
+            "all_remaining_heldout_meshes": True,
+        },
+        "categories": {
+            "train": list(train_categories),
+            "heldout": list(heldout_categories),
+        },
+        "input_manifests": manifest_identities,
+        "excluded_meshes": manifest_records,
+        "splits": {
+            "final_validation": final_validation,
+            "final_ood": final_ood,
+        },
+    }
+
+
 def _categories(value: str) -> tuple[str, ...]:
     categories = tuple(part.strip() for part in value.split(",") if part.strip())
     if not categories:
@@ -283,7 +446,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--dataset",
-        choices=("shapenetcore", "modelnet40"),
+        choices=("shapenetcore", "modelnet40", "modelnet40-final-slice"),
         default="shapenetcore",
     )
     parser.add_argument("--root", type=Path, required=True)
@@ -297,7 +460,31 @@ def main() -> None:
     parser.add_argument("--category-ood-per-category", type=int, default=8)
     parser.add_argument("--seed", type=int, default=1507)
     parser.add_argument("--archive", type=Path)
+    parser.add_argument(
+        "--input-manifest",
+        action="append",
+        type=Path,
+        dest="input_manifests",
+    )
+    parser.add_argument("--validation-cap-per-category", type=int, default=16)
+    parser.add_argument("--minimum-ood-clouds", type=int, default=200)
     args = parser.parse_args()
+
+    if args.dataset == "modelnet40-final-slice":
+        manifest = build_final_slice_manifest(
+            args.root,
+            input_manifests=(
+                tuple(args.input_manifests)
+                if args.input_manifests is not None
+                else FINAL_SLICE_INPUT_MANIFESTS
+            ),
+            validation_cap_per_category=args.validation_cap_per_category,
+            minimum_ood_clouds=args.minimum_ood_clouds,
+            seed=args.seed,
+        )
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(manifest, indent=2) + "\n")
+        return
 
     train_categories = args.train_categories
     heldout_categories = args.heldout_categories
