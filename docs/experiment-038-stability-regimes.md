@@ -1,6 +1,6 @@
 # Experiment 038: stabilized decoder regimes
 
-Status: configurations and runner implemented; full ModelNet40 cells not run in
+Status: complete; all eleven cells ran on EmpireAI with every contract check and gate passing.
 this worktree.
 
 ## Question and protocol
@@ -113,25 +113,56 @@ and end-to-end wall-clock time. For scale reference, Experiment 019
 `k8_n2048` took 1,408.75 seconds on Apple MPS as recorded in
 `docs/experiment-019-stability.md`.
 
-## Results placeholder
+## Results
 
-No full Experiment 038 result is claimed until the corresponding artifact has
-completed its contract and official rows. Fill elapsed times and outcomes from
-each cell's machine-readable result.
+All eleven cells ran on EmpireAI H200s on 2026-08-27/28 (`--device cuda`, two
+cells per GPU concurrently), each with the full six-decoder x three-refiner
+protocol, 3,840 official rows (refiner and FPS-subset methods, validation and
+category-OOD splits), 12-bit coordinates, and mode-0 streams. Every cell
+reports `experiment_019_contract_passed`, `decoder_hashes_unchanged`,
+`exact_stream_round_trip`, `source_only_selection`, and
+`inferential_gate_eligible` true, and both the official-metric gate and the
+selection-baseline gate pass in every cell. The hash-checked N=2048 reuse of
+the Experiment 019 decoders was accepted for all three reuse cells.
 
-| Cell | Decoder action | Stability wall time | Official wall time | Contract | Result |
-|---|---|---:|---:|---|---|
-| `k4_n1024` | train | pending | pending | pending | pending |
-| `k8_n1024` | train | pending | pending | pending | pending |
-| `k16_n1024` | train | pending | pending | pending | pending |
-| `k32_n1024` | train | pending | pending | pending | pending |
-| `k4_n2048` | reuse Experiment 019 | pending | pending | pending | pending |
-| `k16_n2048` | reuse Experiment 019 | pending | pending | pending | pending |
-| `k32_n2048` | reuse Experiment 019 | pending | pending | pending | pending |
-| `k4_n4096` | train | pending | pending | pending | pending |
-| `k8_n4096` | train | pending | pending | pending | pending |
-| `k16_n4096` | train | pending | pending | pending | pending |
-| `k32_n4096` | train | pending | pending | pending | pending |
+| Cell | Decoder action | Stability wall s | Official wall s | Bytes | Refiner val D1 / D2 (dB) | Refiner OOD D1 / D2 (dB) | FPS val D1 / D2 (dB) | Contract | Gates |
+|---|---|---:|---:|---:|---|---|---|---|---|
+| `k4_n1024` | train | 453 | 502 | 32 | 27.31 / 32.89 | 26.78 / 32.06 | 26.45 / 30.66 | pass | pass |
+| `k8_n1024` | train | 442 | 489 | 50 | 27.76 / 33.48 | 27.24 / 32.46 | 26.95 / 31.13 | pass | pass |
+| `k16_n1024` | train | 441 | 487 | 86 | 28.33 / 33.92 | 28.07 / 33.14 | 27.24 / 31.59 | pass | pass |
+| `k32_n1024` | train | 426 | 477 | 158 | 29.04 / 34.61 | 28.65 / 33.57 | 27.77 / 32.20 | pass | pass |
+| `k4_n2048` | reuse Experiment 019 | 430 | 560 | 32 | 28.45 / 33.31 | 27.77 / 31.98 | 27.35 / 30.60 | pass | pass |
+| `k16_n2048` | reuse Experiment 019 | 429 | 564 | 86 | 29.29 / 34.30 | 28.96 / 33.29 | 28.08 / 31.59 | pass | pass |
+| `k32_n2048` | reuse Experiment 019 | 397 | 595 | 158 | 29.69 / 35.01 | 29.26 / 34.12 | 28.22 / 31.93 | pass | pass |
+| `k4_n4096` | train | 1861 | 1590 | 32 | 29.06 / 34.33 | 28.56 / 33.18 | 27.91 / 31.32 | pass | pass |
+| `k8_n4096` | train | 1862 | 1590 | 50 | 29.47 / 34.76 | 28.92 / 33.65 | 28.34 / 31.75 | pass | pass |
+| `k16_n4096` | train | 1855 | 1660 | 86 | 29.77 / 35.10 | 29.34 / 33.97 | 28.55 / 32.24 | pass | pass |
+| `k32_n4096` | train | 1856 | 1675 | 158 | 29.93 / 35.84 | 29.50 / 34.87 | 28.56 / 32.72 | pass | pass |
 
-The existing Experiment 019 `k8_n2048` result remains its own twelfth grid
-cell and is not duplicated in this table.
+D1/D2 values are means of the per-cloud official PSNR rows (`d1_psnr_db`,
+`d2_psnr_db`); paired bootstrap comparisons are in each cell's
+`official/official_metrics.json`. The existing Experiment 019 `k8_n2048`
+result remains its own twelfth grid cell and is not duplicated here.
+
+### Reading
+
+1. **K moves fidelity very little at fixed N.** At N=2048 the refiner's
+   validation D1 rises only from 28.45 dB (K=4, 32 B) to 29.69 dB (K=32,
+   158 B): five times the bytes for 1.2 dB. The same holds at N=1024 (27.31 to
+   29.04 dB) and N=4096 (29.06 to 29.93 dB). This is the cross-regime form of
+   the Experiment 025 finding that quality saturates with K.
+2. **N moves fidelity more than K does.** At K=4, going from N=1024 to 4096
+   adds 1.75 dB D1 at identical bytes; denser sampling of the same surface makes
+   the decoder-aware search easier, which is consistent with the constellation
+   being a surface code rather than a point-sample code.
+3. **The decoder-aware refiner beats the FPS subset in every cell**, by
+   0.9-1.5 dB D1 and 2.2-3.3 dB D2, and the selection-baseline gate passes in
+   all eleven cells; the gap is widest for D2 and at large N.
+4. Wall time: N=1024 and reuse cells take about 15-17 min end to end; N=4096
+   cells about 58 min, dominated equally by decoder training and official
+   metrics.
+
+Artifacts: `artifacts/local/experiment_038_stability_<regime>/` and the
+summary `artifacts/local/experiment_038_summary.json` on the cluster
+(`~/LLM_research/pointconstellation-tracks-b`). Experiment 033 can now run its
+full factorial against these cells.
