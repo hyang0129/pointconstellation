@@ -230,3 +230,52 @@ All checks passed!
 
 The six skips are environment-dependent optional coverage: four Matplotlib
 figure/registry cases, one Draco CLI case, and one HDF5 dataset case (`h5py`).
+
+## Subsequent draft merge
+
+### 14. PR #69 — `origin/agent/track-exp038-regimes`
+
+Merge commit: `abed19f`
+
+Conflicted files:
+
+- `src/pointconstellation/official_stability.py`: retained the integration
+  branch's mesh/final-slice evaluation, normalization and original-frame
+  metrics, tail/surface diagnostics, selection/entropy columns, and exact model
+  and stream accounting while adding Exp 038 single-seed smoke handling,
+  procedural `points`/`normals` aliases, `model_id` fallback, and legacy
+  stability/official-manifest compatibility.
+- `src/pointconstellation/stability_experiment.py`: retained mesh and raw-cloud
+  validation, entropy and learned-stream checks, header/payload accounting, and
+  decoder-model amortization while adding the one-seed non-inferential path and
+  hash-checked decoder reuse. Reused decoders now also verify existing fp32/fp16
+  deployment files or materialize hash-recorded deployment state dictionaries
+  for legacy artifacts so the integrated model-accounting schema remains
+  complete.
+
+Behavioral interactions fixed:
+
+- Known default fields added by Experiments 031 and 038 are normalized together
+  when checking older stability artifacts; unrelated protocol differences still
+  fail closed.
+- Feature-codec references at a different `K`, `N`, precision, or data seed are
+  recorded as `configured_reference_not_rate_matched` rather than treated as a
+  comparable learned-codec result.
+- Stability contract output contains both the integration branch's fixed,
+  entropy, learned, and header/payload rate checks and Exp 038's decoder-reuse
+  integrity check.
+
+Validation:
+
+- Ruff passed.
+- 320 tests passed, 6 skipped for the same optional Matplotlib, Draco, and HDF5
+  dependencies recorded above.
+- `scripts/make_experiment_038_configs.py --check` passed for all eleven
+  generated regime configs.
+- The `k4_n1024` CPU smoke passed with `pc_error`: both decoder arms and both
+  refiner cells completed, all stability and official contract checks passed,
+  eight official rows were produced, and both inferential gates were correctly
+  disabled for the single-seed smoke. Because the tracked `artifacts` symlink
+  resolves outside this sandbox's writable roots, the smoke output directory
+  was temporarily redirected to `/private/tmp` and the checked-in config was
+  restored unchanged afterward.
