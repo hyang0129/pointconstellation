@@ -37,6 +37,8 @@ VERSION = 1
 MODE_FIXED = 0
 MODE_ENTROPY = 1
 MODE_LEARNED = 2
+MODE_SELECTIVE = 3
+MODE_SELECTIVE_ENTROPY = 4
 REPRESENTATION_MODES = ("free", "strict_subset", "fps")
 MODE_IDS = {
     MODE_FIXED: 0,
@@ -44,15 +46,24 @@ MODE_IDS = {
     # Wire IDs 2--4 predate learned coding and identify representation modes.
     # Keep MODE_LEARNED's public value while allocating a collision-free ID.
     MODE_LEARNED: 5,
+    MODE_SELECTIVE: 6,
+    MODE_SELECTIVE_ENTROPY: 7,
     "free": 2,
     "strict_subset": 3,
     "fps": 4,
 }
 ID_MODES = {value: key for key, value in MODE_IDS.items()}
-STREAM_MODES = tuple(MODE_IDS)
+CONSTELLATION_MODES = (
+    MODE_FIXED,
+    MODE_ENTROPY,
+    MODE_LEARNED,
+    *REPRESENTATION_MODES,
+)
 DOMAIN_UNIT_CUBE = 1
 DOMAIN_UNIT_CUBE_WITH_NORMALIZATION = 2
 HEADER = struct.Struct(">4sBBBBHI")
+SELECTIVE_HEADER = struct.Struct(">4sBBBBHHI")
+SELECTIVE_ENTROPY_LENGTH = struct.Struct(">I")
 NORMALIZATION = struct.Struct(">4e")
 
 
@@ -74,6 +85,41 @@ class ConstellationPacket:
     normalization_scale: float | None
 
 
+@dataclass(frozen=True)
+class SelectivePacket:
+    """Decoded constellation and raw pass-through coordinate groups."""
+
+    constellation_coordinates: NDArray[np.float64]
+    preserved_coordinates: NDArray[np.float64]
+    bits: int
+    mode: int
+    output_points: int
+    payload_bits: int
+    header_bytes: int
+    payload_bytes: int
+    stream_bytes: int
+
+    @property
+    def k1(self) -> int:
+        """Return the number of decoder-input constellation points."""
+
+        return len(self.constellation_coordinates)
+
+    @property
+    def k2(self) -> int:
+        """Return the number of raw pass-through points."""
+
+        return len(self.preserved_coordinates)
+
+    @property
+    def coordinates(self) -> NDArray[np.float64]:
+        """Return the two coordinate groups in their count-declared order."""
+
+        return np.concatenate(
+            (self.constellation_coordinates, self.preserved_coordinates), axis=0
+        )
+
+
 def expected_payload_bytes(constellation_size: int, bits: int) -> int:
     """Return the byte-aligned fixed-width payload size without the header."""
 
@@ -82,6 +128,25 @@ def expected_payload_bytes(constellation_size: int, bits: int) -> int:
     if not 2 <= bits <= 24:
         raise ValueError("bits must be between 2 and 24")
     return math.ceil(3 * constellation_size * bits / 8)
+
+
+def expected_selective_payload_bytes(k1: int, k2: int, bits: int) -> int:
+    """Return the fixed-width payload bytes for both selective coordinate sets."""
+
+    if not 0 <= k1 <= 65535 or not 0 <= k2 <= 65535:
+        raise ValueError("selective counts must be between 0 and 65535")
+    if not 2 <= bits <= 24:
+        raise ValueError("bits must be between 2 and 24")
+    return math.ceil(3 * (k1 + k2) * bits / 8)
+
+
+def expected_selective_stream_bytes(k1: int, k2: int, bits: int) -> int:
+    """Return the exact selective fixed stream size, including count metadata."""
+
+    payload_bytes = expected_selective_payload_bytes(k1, k2, bits)
+    if k1 > 0 and k2 == 0:
+        return HEADER.size + payload_bytes
+    return SELECTIVE_HEADER.size + payload_bytes
 
 
 def expected_stream_bytes(
@@ -107,9 +172,32 @@ def _coordinates(points: ArrayLike) -> NDArray[np.float64]:
     return array
 
 
+def _optional_coordinates(points: ArrayLike, *, name: str) -> NDArray[np.float64]:
+    array = np.asarray(points, dtype=np.float64)
+    if array.ndim != 2 or array.shape[1] != 3:
+        raise ValueError(f"{name} must have shape (K, 3)")
+    if not np.isfinite(array).all():
+        raise ValueError(f"{name} must be finite")
+    if np.any(array < -1.0) or np.any(array > 1.0):
+        raise ValueError(f"{name} must lie in the declared [-1, 1] domain")
+    return array
+
+
 def _lattice(coordinates: ArrayLike, bits: int) -> NDArray[np.uint32]:
     points = _coordinates(coordinates)
     expected_stream_bytes(len(points), bits)
+    levels = (1 << bits) - 1
+    lattice = np.rint((points + 1.0) * 0.5 * levels).astype(np.uint32)
+    order = np.lexsort((lattice[:, 2], lattice[:, 1], lattice[:, 0]))
+    return lattice[order]
+
+
+def _optional_lattice(
+    coordinates: ArrayLike, bits: int, *, name: str
+) -> NDArray[np.uint32]:
+    points = _optional_coordinates(coordinates, name=name)
+    if not 2 <= bits <= 24:
+        raise ValueError("bits must be between 2 and 24")
     levels = (1 << bits) - 1
     lattice = np.rint((points + 1.0) * 0.5 * levels).astype(np.uint32)
     order = np.lexsort((lattice[:, 2], lattice[:, 1], lattice[:, 0]))
@@ -273,7 +361,7 @@ def encode_constellation(
             normalization_center, float(normalization_scale)
         )
     expected_stream_bytes(constellation_size, bits, normalization=has_normalization)
-    if mode not in STREAM_MODES:
+    if mode not in CONSTELLATION_MODES:
         raise ValueError(f"unknown constellation stream mode: {mode}")
     if not constellation_size <= output_points <= 0xFFFFFFFF:
         raise ValueError("output_points must fit the stream and be at least K")
@@ -310,13 +398,202 @@ def encode_constellation(
     return header + payload + normalization_payload
 
 
+def encode_selective(
+    constellation_coordinates: ArrayLike,
+    preserved_coordinates: ArrayLike,
+    *,
+    bits: int,
+    output_points: int,
+    entropy: bool = False,
+) -> bytes:
+    """Encode a count-delimited constellation plus raw pass-through set.
+
+    Each group is independently lexicographically sorted.  Counts, rather than
+    a per-point type channel, delimit the two groups.  A zero-length preserved
+    group reduces exactly to the existing mode-0 or mode-1 stream.
+    """
+
+    constellation = _optional_lattice(
+        constellation_coordinates, bits, name="constellation_coordinates"
+    )
+    preserved = _optional_lattice(
+        preserved_coordinates, bits, name="preserved_coordinates"
+    )
+    k1 = len(constellation)
+    k2 = len(preserved)
+    expected_selective_payload_bytes(k1, k2, bits)
+    if not 0 <= output_points <= 0xFFFFFFFF:
+        raise ValueError("output_points must fit the selective stream")
+    if k1 and output_points < k1:
+        raise ValueError("output_points must be at least K1")
+    levels = (1 << bits) - 1
+    if k1 > 0 and k2 == 0:
+        coordinates = constellation.astype(np.float64) * (2.0 / levels) - 1.0
+        return encode_constellation(
+            coordinates,
+            bits=bits,
+            mode=MODE_ENTROPY if entropy else MODE_FIXED,
+            output_points=output_points,
+        )
+
+    mode = MODE_SELECTIVE_ENTROPY if entropy else MODE_SELECTIVE
+    header = SELECTIVE_HEADER.pack(
+        MAGIC,
+        VERSION,
+        MODE_IDS[mode],
+        bits,
+        DOMAIN_UNIT_CUBE,
+        k1,
+        k2,
+        output_points,
+    )
+    if entropy:
+        first_payload = _pack_entropy(constellation, bits)[0] if k1 else b""
+        second_payload = _pack_entropy(preserved, bits)[0] if k2 else b""
+        payload = (
+            SELECTIVE_ENTROPY_LENGTH.pack(len(first_payload))
+            + first_payload
+            + second_payload
+        )
+    else:
+        values = np.concatenate((constellation, preserved), axis=0).reshape(-1)
+        payload = _pack(values, bits)
+    return header + payload
+
+
+def _selective_packet(
+    *,
+    constellation: NDArray[np.uint32],
+    preserved: NDArray[np.uint32],
+    bits: int,
+    mode: int,
+    output_points: int,
+    payload_bits: int,
+    header_bytes: int,
+    payload_bytes: int,
+    stream_bytes: int,
+) -> SelectivePacket:
+    levels = (1 << bits) - 1
+    scale = 2.0 / levels
+    return SelectivePacket(
+        constellation_coordinates=constellation.astype(np.float64) * scale - 1.0,
+        preserved_coordinates=preserved.astype(np.float64) * scale - 1.0,
+        bits=bits,
+        mode=mode,
+        output_points=output_points,
+        payload_bits=payload_bits,
+        header_bytes=header_bytes,
+        payload_bytes=payload_bytes,
+        stream_bytes=stream_bytes,
+    )
+
+
+def _decode_selective_stream(stream: bytes) -> SelectivePacket:
+    if len(stream) < SELECTIVE_HEADER.size:
+        raise ValueError("truncated selective header")
+    magic, version, mode_id, bits, domain, k1, k2, output_points = (
+        SELECTIVE_HEADER.unpack_from(stream)
+    )
+    if magic != MAGIC:
+        raise ValueError("invalid constellation magic")
+    if version != VERSION:
+        raise ValueError(f"unsupported constellation version: {version}")
+    mode = ID_MODES.get(mode_id)
+    if mode not in {MODE_SELECTIVE, MODE_SELECTIVE_ENTROPY}:
+        raise ValueError(f"unknown selective stream mode: {mode_id}")
+    if domain != DOMAIN_UNIT_CUBE:
+        raise ValueError(f"unsupported selective coordinate domain id: {domain}")
+    expected_selective_payload_bytes(k1, k2, bits)
+    if k1 and output_points < k1:
+        raise ValueError("stream output point count is smaller than K1")
+    payload = stream[SELECTIVE_HEADER.size :]
+    if mode == MODE_SELECTIVE:
+        expected = SELECTIVE_HEADER.size + expected_selective_payload_bytes(
+            k1, k2, bits
+        )
+        if len(stream) != expected:
+            raise ValueError(f"stream has {len(stream)} bytes; expected {expected}")
+        values = _unpack(payload, 3 * (k1 + k2), bits).reshape(k1 + k2, 3)
+        constellation = values[:k1]
+        preserved = values[k1:]
+        payload_bits = 3 * (k1 + k2) * bits
+    else:
+        if len(payload) < SELECTIVE_ENTROPY_LENGTH.size:
+            raise ValueError("truncated selective entropy block length")
+        (first_bytes,) = SELECTIVE_ENTROPY_LENGTH.unpack_from(payload)
+        blocks = payload[SELECTIVE_ENTROPY_LENGTH.size :]
+        if first_bytes > len(blocks):
+            raise ValueError("selective entropy block length exceeds payload")
+        first = blocks[:first_bytes]
+        second = blocks[first_bytes:]
+        if bool(first) != bool(k1) or bool(second) != bool(k2):
+            raise ValueError("selective entropy blocks disagree with K1/K2")
+        if k1:
+            constellation, first_bits = _unpack_entropy(first, k1, bits)
+        else:
+            constellation = np.empty((0, 3), dtype=np.uint32)
+            first_bits = 0
+        if k2:
+            preserved, second_bits = _unpack_entropy(second, k2, bits)
+        else:
+            preserved = np.empty((0, 3), dtype=np.uint32)
+            second_bits = 0
+        payload_bits = 8 * SELECTIVE_ENTROPY_LENGTH.size + first_bits + second_bits
+    packet = _selective_packet(
+        constellation=constellation,
+        preserved=preserved,
+        bits=bits,
+        mode=mode,
+        output_points=output_points,
+        payload_bits=payload_bits,
+        header_bytes=SELECTIVE_HEADER.size,
+        payload_bytes=len(payload),
+        stream_bytes=len(stream),
+    )
+    canonical = encode_selective(
+        packet.constellation_coordinates,
+        packet.preserved_coordinates,
+        bits=bits,
+        output_points=output_points,
+        entropy=mode == MODE_SELECTIVE_ENTROPY,
+    )
+    if canonical != stream:
+        raise ValueError("non-canonical or corrupt selective payload")
+    return packet
+
+
+def decode_selective(stream: bytes) -> SelectivePacket:
+    """Decode a selective stream, including its K2=0 mode-0/1 reduction."""
+
+    packet = decode_constellation(stream)
+    if isinstance(packet, SelectivePacket):
+        return packet
+    if packet.mode not in {MODE_FIXED, MODE_ENTROPY}:
+        raise ValueError("a reduced selective stream must use mode 0 or mode 1")
+    empty = np.empty((0, 3), dtype=np.float64)
+    return SelectivePacket(
+        constellation_coordinates=packet.normalized_coordinates,
+        preserved_coordinates=empty,
+        bits=packet.bits,
+        mode=int(packet.mode),
+        output_points=packet.output_points,
+        payload_bits=packet.payload_bits,
+        header_bytes=packet.header_bytes,
+        payload_bytes=packet.payload_bytes,
+        stream_bytes=packet.stream_bytes,
+    )
+
+
 def decode_constellation(
     stream: bytes, *, learned_model: LearnedEntropyModel | None = None
-) -> ConstellationPacket:
+) -> ConstellationPacket | SelectivePacket:
     """Decode and validate any supported constellation stream."""
 
     if len(stream) < HEADER.size:
         raise ValueError("truncated constellation header")
+    mode_id = stream[5]
+    if ID_MODES.get(mode_id) in {MODE_SELECTIVE, MODE_SELECTIVE_ENTROPY}:
+        return _decode_selective_stream(stream)
     magic, version, mode_id, bits, domain, size, output_points = HEADER.unpack_from(
         stream
     )
@@ -338,7 +615,7 @@ def decode_constellation(
     payload_end = len(stream) - normalization_bytes
     if payload_end < HEADER.size:
         raise ValueError("truncated constellation payload")
-    payload = stream[HEADER.size:payload_end]
+    payload = stream[HEADER.size : payload_end]
     if mode == MODE_ENTROPY:
         values, payload_bits = _unpack_entropy(payload, size, bits)
     elif mode == MODE_LEARNED:
