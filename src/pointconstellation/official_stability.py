@@ -14,6 +14,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from pointconstellation.bitstream import HEADER
 from pointconstellation.codecs import run_pc_error
 from pointconstellation.data import (
     MeshSurfaceDataset,
@@ -272,6 +273,13 @@ def _load_rows(path: Path) -> list[dict[str, Any]]:
     keys = [_row_key(row) for row in rows]
     if len(keys) != len(set(keys)):
         raise RuntimeError("official metric artifact contains duplicate rows")
+    for row in rows:
+        row.setdefault("header_bytes", HEADER.size)
+        row.setdefault("payload_bytes", row["stream_bytes"] - row["header_bytes"])
+        row.setdefault(
+            "payload_bpp",
+            row["actual_stream_bpp"] * row["payload_bytes"] / row["stream_bytes"],
+        )
     return rows
 
 
@@ -550,7 +558,7 @@ def _evaluate_method(
             target=source,
             num_output_points=stability.num_points,
         )
-    decoded, stream_bytes, exact, lattice_exact = _serialized_coordinates(
+    decoded, packets, exact, lattice_exact = _serialized_coordinates(
         coordinates,
         config=stability,
         mode="fps" if refiner is None else "free",
@@ -578,8 +586,9 @@ def _evaluate_method(
         )
     if not exact or not lattice_exact:
         raise RuntimeError("official evaluation message failed exact stream checks")
-    if len(stream_bytes) != 1:
+    if len(packets) != 1:
         raise RuntimeError("official evaluation expected a single encoded cloud")
+    packet = packets[0]
     return {
         "split": split,
         "method": method,
@@ -590,8 +599,11 @@ def _evaluate_method(
         "sample_id": int(sample["sample_id"]),
         "constellation_size": stability.constellation_size,
         "coordinate_bits": stability.coordinate_bits,
-        "stream_bytes": stream_bytes[0],
-        "actual_stream_bpp": 8.0 * stream_bytes[0] / stability.num_points,
+        "header_bytes": packet.header_bytes,
+        "payload_bytes": packet.payload_bytes,
+        "payload_bpp": 8.0 * packet.payload_bytes / stability.num_points,
+        "stream_bytes": packet.stream_bytes,
+        "actual_stream_bpp": 8.0 * packet.stream_bytes / stability.num_points,
         "serialized_round_trip_exact": exact,
         "coordinates_on_exact_lattice": lattice_exact,
         "source_only_decoder_gradient": True,
@@ -803,6 +815,13 @@ def run_official_stability(
             ),
             "actual_stream_bytes_present": bool(
                 rows and all(row["stream_bytes"] > 0 for row in rows)
+            ),
+            "header_payload_splits_exact": bool(
+                rows
+                and all(
+                    row["header_bytes"] + row["payload_bytes"] == row["stream_bytes"]
+                    for row in rows
+                )
             ),
             "exact_stream_round_trip": bool(
                 rows and all(row["serialized_round_trip_exact"] for row in rows)

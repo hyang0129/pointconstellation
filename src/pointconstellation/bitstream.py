@@ -32,17 +32,25 @@ class ConstellationPacket:
     mode: str
     output_points: int
     payload_bits: int
+    header_bytes: int
+    payload_bytes: int
     stream_bytes: int
 
 
-def expected_stream_bytes(constellation_size: int, bits: int) -> int:
-    """Return the exact fixed-width stream size, including the header."""
+def expected_payload_bytes(constellation_size: int, bits: int) -> int:
+    """Return the byte-aligned coordinate payload size without the header."""
 
     if not 1 <= constellation_size <= 65535:
         raise ValueError("constellation_size must be between 1 and 65535")
     if not 2 <= bits <= 24:
         raise ValueError("bits must be between 2 and 24")
-    return HEADER.size + math.ceil(3 * constellation_size * bits / 8)
+    return math.ceil(3 * constellation_size * bits / 8)
+
+
+def expected_stream_bytes(constellation_size: int, bits: int) -> int:
+    """Return the exact fixed-width stream size, including the header."""
+
+    return HEADER.size + expected_payload_bytes(constellation_size, bits)
 
 
 def _coordinates(points: ArrayLike) -> NDArray[np.float64]:
@@ -158,5 +166,7 @@ def decode_constellation(stream: bytes) -> ConstellationPacket:
         mode=ID_MODES[mode_id],
         output_points=output_points,
         payload_bits=3 * size * bits,
+        header_bytes=HEADER.size,
+        payload_bytes=len(stream) - HEADER.size,
         stream_bytes=len(stream),
     )

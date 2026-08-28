@@ -22,15 +22,23 @@ class FeaturePacket:
     bits: int
     output_points: int
     payload_bits: int
+    header_bytes: int
+    payload_bytes: int
     stream_bytes: int
 
 
-def expected_feature_stream_bytes(latent_dim: int, bits: int) -> int:
+def expected_feature_payload_bytes(latent_dim: int, bits: int) -> int:
+    """Return the byte-aligned feature payload size without the header."""
+
     if not 1 <= latent_dim <= 65535:
         raise ValueError("latent_dim must be between 1 and 65535")
     if not 2 <= bits <= 16:
         raise ValueError("bits must be between 2 and 16")
-    return HEADER.size + math.ceil(latent_dim * bits / 8)
+    return math.ceil(latent_dim * bits / 8)
+
+
+def expected_feature_stream_bytes(latent_dim: int, bits: int) -> int:
+    return HEADER.size + expected_feature_payload_bytes(latent_dim, bits)
 
 
 def _pack(values: NDArray[np.uint32], bits: int) -> bytes:
@@ -119,5 +127,7 @@ def decode_features(stream: bytes) -> FeaturePacket:
         bits=bits,
         output_points=output_points,
         payload_bits=latent_dim * bits,
+        header_bytes=HEADER.size,
+        payload_bytes=len(stream) - HEADER.size,
         stream_bytes=len(stream),
     )

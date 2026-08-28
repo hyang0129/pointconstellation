@@ -44,6 +44,8 @@ def test_feature_codec_smoke_has_exact_rates_and_independent_models(
             expected_bytes = {2: 20, 4: 26}[row["constellation_size"]]
             assert row["stream_bytes"] == expected_bytes
             assert row["actual_stream_bpp"] == expected_bytes * 8 / 32
+            assert row["header_bytes"] + row["payload_bytes"] == expected_bytes
+            assert row["payload_bpp"] == row["payload_bytes"] * 8 / 32
             assert row["fresh_chamfer_mse"] >= 0
 
 

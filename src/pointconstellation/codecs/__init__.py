@@ -8,8 +8,10 @@ from pointconstellation.codecs.external import (
 )
 from pointconstellation.codecs.gpcc import (
     GpccResult,
+    GpccStreamBreakdown,
     OfficialMetricResult,
     Tmc3RatePoint,
+    parse_gpcc_stream,
     read_ascii_ply,
     run_pc_error,
     run_tmc3,
@@ -20,8 +22,10 @@ __all__ = [
     "ExternalCodecResult",
     "ExternalCodecSpec",
     "GpccResult",
+    "GpccStreamBreakdown",
     "OfficialMetricResult",
     "Tmc3RatePoint",
+    "parse_gpcc_stream",
     "read_ascii_ply",
     "run_external_codec",
     "run_external_codec_batch",

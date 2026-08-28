@@ -22,6 +22,7 @@ from pointconstellation.data import MeshSurfaceDataset, file_sha256, load_mesh_m
 from pointconstellation.feature_bitstream import (
     decode_features,
     encode_features,
+    expected_feature_payload_bytes,
     expected_feature_stream_bytes,
 )
 from pointconstellation.losses import chamfer_squared_chunked
@@ -562,6 +563,9 @@ def _evaluate_seed(
                             "payload_bits": packet.payload_bits,
                             "nominal_payload_bpp": packet.payload_bits
                             / config.num_points,
+                            "header_bytes": packet.header_bytes,
+                            "payload_bytes": packet.payload_bytes,
+                            "payload_bpp": packet.payload_bytes * 8 / config.num_points,
                             "stream_bytes": packet.stream_bytes,
                             "actual_stream_bpp": packet.stream_bytes
                             * 8
@@ -716,6 +720,15 @@ def _reference_comparisons(
                         "actual_stream_bpp": feature_indices[0][keys[0]][
                             "actual_stream_bpp"
                         ],
+                        "payload_bpp": feature_indices[0][keys[0]].get(
+                            "payload_bpp",
+                            expected_feature_payload_bytes(
+                                feature_indices[0][keys[0]]["latent_dim"],
+                                config.feature_bits,
+                            )
+                            * 8
+                            / config.num_points,
+                        ),
                         "feature_latent_dim": feature_indices[0][keys[0]]["latent_dim"],
                         "constellation_method": method,
                         "positive_improvement_means_constellation_is_better": True,
@@ -1078,6 +1091,9 @@ def run_feature_codec_benchmark(
             "data_seed": config.data_seed,
             "input_points": config.num_points,
             "rate_definition": "total serialized stream bits / input points",
+            "payload_rate_definition": (
+                "byte-aligned feature payload bits / input points"
+            ),
             "rate_match": "exact bytes including each format's complete header",
             "rate_points": rate_points,
             "feature_latent_is_not_coordinate_only": True,

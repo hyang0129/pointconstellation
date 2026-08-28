@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import struct
 import tempfile
 import time
+import zlib
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -47,6 +49,76 @@ class RetrainedCodecBenchmarkConfig:
     @classmethod
     def from_json(cls, path: Path) -> RetrainedCodecBenchmarkConfig:
         return cls(**json.loads(path.read_text()))
+
+
+@dataclass(frozen=True)
+class GzipStreamBreakdown:
+    """Exact gzip wrapper and compressed-DEFLATE byte counts."""
+
+    header_bytes: int
+    payload_bytes: int
+    total_bytes: int
+
+    def __post_init__(self) -> None:
+        if min(self.header_bytes, self.payload_bytes) < 0:
+            raise ValueError("gzip byte counts cannot be negative")
+        if self.header_bytes + self.payload_bytes != self.total_bytes:
+            raise ValueError("gzip components do not sum to total_bytes")
+
+
+def _gzip_stream_breakdown(path: Path) -> GzipStreamBreakdown:
+    """Split all gzip members into wrapper and compressed payload bytes."""
+
+    data = path.read_bytes()
+    if not data:
+        raise ValueError("gzip stream is empty")
+    offset = 0
+    header_bytes = 0
+    payload_bytes = 0
+    while offset < len(data):
+        member_start = offset
+        if len(data) - offset < 10 or data[offset : offset + 3] != b"\x1f\x8b\x08":
+            raise ValueError(f"invalid gzip member header at byte {offset}")
+        flags = data[offset + 3]
+        if flags & 0xE0:
+            raise ValueError(f"gzip member has reserved flags at byte {offset}")
+        offset += 10
+        if flags & 0x04:
+            if len(data) - offset < 2:
+                raise ValueError("truncated gzip extra-field length")
+            extra_bytes = int.from_bytes(data[offset : offset + 2], "little")
+            offset += 2 + extra_bytes
+            if offset > len(data):
+                raise ValueError("truncated gzip extra field")
+        for flag, name in ((0x08, "file name"), (0x10, "comment")):
+            if flags & flag:
+                end = data.find(b"\0", offset)
+                if end < 0:
+                    raise ValueError(f"unterminated gzip {name}")
+                offset = end + 1
+        if flags & 0x02:
+            offset += 2
+            if offset > len(data):
+                raise ValueError("truncated gzip header CRC")
+        payload_start = offset
+        inflater = zlib.decompressobj(-zlib.MAX_WBITS)
+        decompressed = inflater.decompress(data[payload_start:])
+        if not inflater.eof:
+            raise ValueError("truncated gzip DEFLATE payload")
+        compressed_bytes = len(data) - payload_start - len(inflater.unused_data)
+        offset = payload_start + compressed_bytes
+        if len(data) - offset < 8:
+            raise ValueError("truncated gzip trailer")
+        crc32, size = struct.unpack_from("<II", data, offset)
+        if (
+            zlib.crc32(decompressed) != crc32
+            or (len(decompressed) & 0xFFFFFFFF) != size
+        ):
+            raise ValueError("gzip trailer does not match decompressed payload")
+        offset += 8
+        header_bytes += payload_start - member_start + 8
+        payload_bytes += compressed_bytes
+    return GzipStreamBreakdown(header_bytes, payload_bytes, len(data))
 
 
 def _checked_array(root: Path, relative: str, expected_sha256: str) -> np.ndarray:
@@ -153,9 +225,12 @@ def run_retrained_codec_benchmark(
     rows = []
     metric_scratch = output_dir / "metric_scratch"
     metric_scratch.mkdir(exist_ok=True)
-    for record, codec_result in zip(records, results, strict=True):
+    for record, codec_result, work_dir in zip(records, results, work_dirs, strict=True):
         source = record["source"]
         normals = record["normals"]
+        stream_breakdown = _gzip_stream_breakdown(work_dir / "stream.bin")
+        if stream_breakdown.total_bytes != codec_result.stream_bytes:
+            raise RuntimeError("external gzip breakdown differs from stream size")
         empty_reconstruction = len(codec_result.reconstruction) == 0
         if empty_reconstruction:
             official_metrics = {
@@ -208,7 +283,10 @@ def run_retrained_codec_benchmark(
                 "codec_input_unique_voxels": unique_voxels,
                 "decoded_points": len(codec_result.reconstruction),
                 "status": ("empty_reconstruction" if empty_reconstruction else "valid"),
+                "header_bytes": stream_breakdown.header_bytes,
                 "stream_bytes": codec_result.stream_bytes,
+                "payload_bytes": stream_breakdown.payload_bytes,
+                "payload_bpp": 8.0 * stream_breakdown.payload_bytes / len(source),
                 "actual_stream_bpp": 8.0 * codec_result.stream_bytes / len(source),
                 "stream_sha256": codec_result.stream_sha256,
                 "reconstruction_sha256": codec_result.reconstruction_sha256,
@@ -251,6 +329,9 @@ def run_retrained_codec_benchmark(
                 "mean_actual_bpp": float(
                     np.mean([row["actual_stream_bpp"] for row in group])
                 ),
+                "mean_payload_bpp": float(
+                    np.mean([row["payload_bpp"] for row in group])
+                ),
                 "aggregate_chamfer_rmse": _rmse_or_none(chamfer_values),
                 "official_d1_rmse_grid_units": _rmse_or_none(d1_values),
                 "official_d2_rmse_grid_units": _rmse_or_none(d2_values),
@@ -269,11 +350,23 @@ def run_retrained_codec_benchmark(
         "rows": rows,
         "summaries": summaries,
         "target_constellation_bytes": 50,
+        "rate_accounting": {
+            "full_stream_bytes_available": True,
+            "payload_bytes_available": True,
+            "payload_note": (
+                "payload_bytes is the exact compressed-DEFLATE portion of all gzip "
+                "members; gzip headers and eight-byte member trailers are excluded."
+            ),
+        },
         "elapsed_seconds": time.perf_counter() - started,
         "contract_checks": {
             "actual_streams_nonempty": all(row["stream_bytes"] > 0 for row in rows),
             "independent_decode_hashes_present": all(
                 len(row["reconstruction_sha256"]) == 64 for row in rows
+            ),
+            "header_payload_splits_exact": all(
+                row["header_bytes"] + row["payload_bytes"] == row["stream_bytes"]
+                for row in rows
             ),
             "test_only_archive": all(
                 row["split"] in {"validation", "ood"} for row in rows
