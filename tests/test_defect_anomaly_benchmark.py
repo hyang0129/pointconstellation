@@ -25,6 +25,7 @@ from pointconstellation.defect_anomaly_benchmark import (
     binary_auroc,
     build_diagnostic_subset_codec_arms,
     load_external_anomaly_manifest,
+    run_defect_anomaly_benchmark,
 )
 from pointconstellation.defects import DEFECT_TYPES, inject_defect
 from pointconstellation.selective_experiment import SelectiveExperimentConfig
@@ -61,6 +62,7 @@ def _install_fake_real_provider_dependencies(
 ) -> type:
     class MaximumEnforcingDecoderContext:
         instances = []
+        search_calls = 0
 
         def __init__(self, config, *, decoder_seed, device_name):
             del decoder_seed, device_name
@@ -71,6 +73,7 @@ def _install_fake_real_provider_dependencies(
 
         def search(self, source, *, constellation_size, bits, output_points):
             del bits
+            self.__class__.search_calls += 1
             if output_points > self.stability.num_points:
                 raise ValueError("num_output_points exceeds the configured maximum")
             self.requested_output_points.append(output_points)
@@ -221,7 +224,7 @@ def test_smoke_and_full_configs_are_valid_and_use_three_scorer_seeds() -> None:
 
 
 def test_real_provider_arms_declare_consistent_bytes(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from pointconstellation.exp040_defect_codecs import build_codec_arms
 
@@ -229,6 +232,7 @@ def test_real_provider_arms_declare_consistent_bytes(
     config = DefectAnomalyBenchmarkConfig.from_json(
         Path("configs/experiment_041_defect_anomaly_smoke.json")
     )
+    config = replace(config, output_dir=str(tmp_path / "output"))
     arms = build_codec_arms(config=config, device_name="cpu")
     points, _ = _sphere(config.num_points)
 
@@ -248,9 +252,47 @@ def test_real_provider_arms_declare_consistent_bytes(
         assert arm.codec.decode(stream).shape[1] == 3
 
 
+def test_adam_ste_search_cache_is_hashed_reused_and_validated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pointconstellation.exp040_defect_codecs import build_codec_arms
+
+    decoder_context = _install_fake_real_provider_dependencies(monkeypatch)
+    config = DefectAnomalyBenchmarkConfig.from_json(
+        Path("configs/experiment_041_defect_anomaly_smoke.json")
+    )
+    config = replace(
+        config,
+        output_dir=str(tmp_path / "output"),
+        payload_budgets=(40,),
+        primary_payload_budget=40,
+    )
+    points, _ = _sphere(config.num_points)
+
+    first = build_codec_arms(config=config, device_name="cpu")[0]
+    first_stream = first.codec.encode(points)
+    assert decoder_context.search_calls == 1
+    cache_manifests = list(
+        (Path(config.output_dir) / "codec_scratch" / "adam_ste").rglob(
+            "cache_manifest.json"
+        )
+    )
+    assert len(cache_manifests) == 1
+
+    second = build_codec_arms(config=config, device_name="cpu")[0]
+    assert second.codec.encode(points) == first_stream
+    assert decoder_context.search_calls == 1
+
+    coordinates = cache_manifests[0].with_name("coordinates.npy")
+    coordinates.write_bytes(b"invalidated cache")
+    third = build_codec_arms(config=config, device_name="cpu")[0]
+    assert third.codec.encode(points) == first_stream
+    assert decoder_context.search_calls == 2
+
+
 @pytest.mark.parametrize("num_points", (2048, 1024))
 def test_every_defect_preserves_regime_through_real_provider_path(
-    monkeypatch: pytest.MonkeyPatch, num_points: int
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, num_points: int
 ) -> None:
     from pointconstellation.exp040_defect_codecs import build_codec_arms
 
@@ -261,6 +303,7 @@ def test_every_defect_preserves_regime_through_real_provider_path(
     config = replace(
         config,
         num_points=num_points,
+        output_dir=str(tmp_path / "output"),
         payload_budgets=(40,),
         primary_payload_budget=40,
     )
@@ -347,7 +390,7 @@ def test_every_defect_preserves_regime_through_real_provider_path(
 
 
 def test_real_provider_rejects_source_outside_declared_regime(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from pointconstellation.exp040_defect_codecs import build_codec_arms
 
@@ -355,7 +398,12 @@ def test_real_provider_rejects_source_outside_declared_regime(
     config = DefectAnomalyBenchmarkConfig.from_json(
         Path("configs/experiment_041_defect_anomaly_smoke.json")
     )
-    config = replace(config, payload_budgets=(40,), primary_payload_budget=40)
+    config = replace(
+        config,
+        output_dir=str(tmp_path / "output"),
+        payload_budgets=(40,),
+        primary_payload_budget=40,
+    )
     arm = build_codec_arms(config=config, device_name="cpu")[0]
     points, _ = _sphere(config.num_points + 1)
 
@@ -428,11 +476,15 @@ def test_gpcc_provider_fresh_frontier_matches_payload_and_declares_delta(
     monkeypatch.setattr(
         "pointconstellation.exp040_defect_codecs.run_tmc3", fake_run_tmc3
     )
+    executable = tmp_path / "tmc3"
+    executable.write_bytes(b"fake tmc3 executable")
     benchmark = DefectAnomalyBenchmarkConfig(
         num_points=64, output_dir=str(tmp_path / "output")
     )
     experiment_040 = SelectiveExperimentConfig(
-        gpcc_reference_path=str(reference), decoder_seeds=(7,)
+        gpcc_reference_path=str(reference),
+        tmc3_executable=str(executable),
+        decoder_seeds=(7,),
     )
     frontier = _GpccFrontier(benchmark, experiment_040)
     points, _ = _sphere(64)
@@ -449,6 +501,96 @@ def test_gpcc_provider_fresh_frontier_matches_payload_and_declares_delta(
     assert calls == ["payload_35", "payload_70"]
     decoded = frontier.decode(stream_40)
     assert sorted(map(tuple, decoded.tolist())) == sorted(map(tuple, points.tolist()))
+
+    resumed_frontier = _GpccFrontier(benchmark, experiment_040)
+    resumed_stream = resumed_frontier.encode(
+        points, payload_budget=40, target_bytes=52
+    )
+    assert resumed_stream == stream_40
+    assert calls == ["payload_35", "payload_70"]
+    assert np.array_equal(resumed_frontier.decode(resumed_stream), decoded)
+
+
+def test_smoke_resume_restores_byte_identical_rows_and_reports_progress(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = DefectAnomalyBenchmarkConfig.from_json(
+        Path("configs/experiment_041_defect_anomaly_smoke.json")
+    )
+    config = replace(
+        config,
+        output_dir=str(tmp_path / "resume_smoke"),
+        codec_provider=None,
+        diagnostic_subset_codecs=True,
+        num_points=64,
+        maximum_clouds_per_split=1,
+        defect_types=("bump",),
+        scorer_seeds=(4101,),
+        scorer_points_per_reference=32,
+        scorer_maximum_reference_clouds=2,
+        scorer_cloud_candidates=2,
+        distance_chunk_size=32,
+        payload_budgets=(40,),
+        primary_payload_budget=40,
+        bootstrap_samples=100,
+    )
+
+    clean_result = run_defect_anomaly_benchmark(config, device_name="cpu")
+    output = Path(config.output_dir)
+    rows_path = output / "defect_per_cloud.jsonl"
+    clean_rows = rows_path.read_bytes()
+    lines = clean_rows.splitlines(keepends=True)
+    assert len(lines) == len(clean_result["per_cloud"])
+    rows_path.write_bytes(b"".join(lines[:-3]))
+    capsys.readouterr()
+
+    resumed_result = run_defect_anomaly_benchmark(config, device_name="cpu")
+    progress_lines = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("{")
+    ]
+
+    assert rows_path.read_bytes() == clean_rows
+    assert resumed_result["per_cloud"] == clean_result["per_cloud"]
+    assert any(
+        row["stage"] == "resume" and row["resume"] for row in progress_lines
+    )
+    assert all(
+        {"stage", "done", "total", "elapsed_seconds"} <= row.keys()
+        for row in progress_lines
+    )
+    manifest = json.loads((output / "run_manifest.json").read_text())
+    assert manifest["defect_seed"] == config.defect_seed
+    assert manifest["config_sha256"] == resumed_result["config_sha256"]
+    assert len(manifest["code_sha256"]) == 64
+    assert manifest["model_hashes"] == {}
+    assert manifest["status"] == "complete"
+    assert set(resumed_result["timing_breakdown"]) == {
+        "defect_injection_seconds",
+        "scorer_fitting_seconds",
+        "per_arm_encode_seconds",
+        "per_arm_decode_seconds",
+        "official_metrics_seconds",
+        "bootstrap_seconds",
+        "other_seconds",
+        "total_seconds",
+    }
+
+    changed = replace(config, defect_seed=config.defect_seed + 1)
+    changed_result = run_defect_anomaly_benchmark(changed, device_name="cpu")
+    mismatch_progress = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("{")
+    ]
+    assert len(rows_path.read_bytes().splitlines()) == len(changed_result["per_cloud"])
+    assert any(
+        row["stage"] == "resume"
+        and not row["resume"]
+        and row["reason"] == "manifest_hash_mismatch"
+        for row in mismatch_progress
+    )
 
 
 def test_codec_execution_never_receives_defect_labels() -> None:

@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+import os
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,13 @@ from pointconstellation.bitstream import (
     encode_constellation,
     expected_payload_bytes,
 )
-from pointconstellation.codecs import GpccResult, Tmc3RatePoint, run_tmc3
+from pointconstellation.codecs import (
+    GpccResult,
+    GpccStreamBreakdown,
+    Tmc3RatePoint,
+    run_tmc3,
+)
+from pointconstellation.data import file_sha256
 from pointconstellation.defect_anomaly_benchmark import (
     CodecArm,
     DefectAnomalyBenchmarkConfig,
@@ -52,6 +59,40 @@ from pointconstellation.selective_experiment import (
 FloatArray = NDArray[np.float32]
 DoubleArray = NDArray[np.float64]
 _UNIFORM_PADDING_BYTES = SELECTIVE_HEADER.size - HEADER.size
+CACHE_SCHEMA_VERSION = 1
+
+
+def _json_sha256(value: Any) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _json_ready(value: Any) -> Any:
+    return json.loads(json.dumps(value))
+
+
+def _source_tree_sha256() -> str:
+    root = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*.py")):
+        digest.update(path.relative_to(root).as_posix().encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _atomic_write_json(path: Path, value: Any) -> None:
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    temporary.write_text(json.dumps(value, indent=2) + "\n")
+    os.replace(temporary, path)
+
+
+def _atomic_save_array(path: Path, value: NDArray[Any]) -> None:
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    with temporary.open("wb") as handle:
+        np.save(handle, value, allow_pickle=False)
+    os.replace(temporary, path)
 
 
 def _source_points(
@@ -140,6 +181,87 @@ class _ProviderState:
         self._searches: dict[tuple[str, int, int], DoubleArray] = {}
         self._base_decodes: dict[tuple[str, int, int], DoubleArray] = {}
         self._geometry: dict[str, Any] = {}
+        self.search_cache_root = (
+            Path(config.output_dir) / "codec_scratch" / "adam_ste"
+        )
+        model_metadata = getattr(self.context, "model_metadata", {})
+        self._search_context = {
+            "schema_version": CACHE_SCHEMA_VERSION,
+            "kind": "experiment_040_fps_adam_ste",
+            "code_sha256": _source_tree_sha256(),
+            "experiment_040_config": asdict(experiment_040),
+            "decoder_seed": config.experiment_040_decoder_seed,
+            "device": device_name,
+            "decoder_model": {
+                name: model_metadata[name]
+                for name in (
+                    "selection_sha256",
+                    "decoder_checkpoint_sha256",
+                    "decoder_state_hash",
+                )
+                if name in model_metadata
+            },
+        }
+
+    def _search_cache_identity(
+        self, *, source_sha256: str, size: int, bits: int
+    ) -> dict[str, Any]:
+        return _json_ready(
+            {
+                **self._search_context,
+                "source_sha256": source_sha256,
+                "arm_parameters": {
+                    "constellation_size": size,
+                    "coordinate_bits": bits,
+                    "output_points": self.output_points,
+                },
+            }
+        )
+
+    def _load_search_cache(
+        self, identity: dict[str, Any], *, size: int
+    ) -> DoubleArray | None:
+        source_sha256 = identity["source_sha256"]
+        cache_dir = (
+            self.search_cache_root / source_sha256 / _json_sha256(identity)
+        )
+        manifest_path = cache_dir / "cache_manifest.json"
+        coordinates_path = cache_dir / "coordinates.npy"
+        if not manifest_path.is_file() or not coordinates_path.is_file():
+            return None
+        try:
+            manifest = json.loads(manifest_path.read_text())
+            if manifest.get("identity") != identity:
+                return None
+            if manifest.get("coordinates_sha256") != file_sha256(coordinates_path):
+                return None
+            coordinates = np.load(coordinates_path, allow_pickle=False).astype(
+                np.float64, copy=False
+            )
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None
+        if coordinates.shape != (size, 3) or not np.isfinite(coordinates).all():
+            return None
+        return coordinates.copy()
+
+    def _write_search_cache(
+        self, identity: dict[str, Any], coordinates: DoubleArray
+    ) -> None:
+        cache_dir = (
+            self.search_cache_root
+            / identity["source_sha256"]
+            / _json_sha256(identity)
+        )
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        coordinates_path = cache_dir / "coordinates.npy"
+        _atomic_save_array(coordinates_path, coordinates.astype(np.float64, copy=False))
+        _atomic_write_json(
+            cache_dir / "cache_manifest.json",
+            {
+                "identity": identity,
+                "coordinates_sha256": file_sha256(coordinates_path),
+            },
+        )
 
     def search(self, source: FloatArray, *, size: int, bits: int) -> DoubleArray:
         values = _canonical_source(
@@ -148,12 +270,19 @@ class _ProviderState:
         digest = _source_digest(values)
         key = (digest, size, bits)
         if key not in self._searches:
-            self._searches[key] = self.context.search(
-                values,
-                constellation_size=size,
-                bits=bits,
-                output_points=self.output_points,
+            identity = self._search_cache_identity(
+                source_sha256=digest, size=size, bits=bits
             )
+            cached = self._load_search_cache(identity, size=size)
+            if cached is None:
+                cached = self.context.search(
+                    values,
+                    constellation_size=size,
+                    bits=bits,
+                    output_points=self.output_points,
+                )
+                self._write_search_cache(identity, cached)
+            self._searches[key] = cached
         return self._searches[key].copy()
 
     def decode(self, coordinates: DoubleArray, output_points: int) -> DoubleArray:
@@ -374,10 +503,114 @@ class _GpccFrontier:
         rows = _gpcc_reference_rows(Path(experiment_040.gpcc_reference_path))
         self.rate_points = _gpcc_rate_points(rows)
         self.executable = Path(experiment_040.tmc3_executable)
+        self.executable_sha256 = file_sha256(self.executable)
+        self.code_sha256 = _source_tree_sha256()
         self.work_root = Path(config.output_dir) / "codec_scratch" / "gpcc"
         self._frontiers: dict[str, tuple[_GpccCell, ...]] = {}
         self._decoded: dict[str, DoubleArray] = {}
         self._metadata: dict[tuple[str, int], dict[str, Any]] = {}
+
+    def _cache_identity(
+        self, *, source_sha256: str, rate_point: Tmc3RatePoint
+    ) -> dict[str, Any]:
+        return _json_ready(
+            {
+                "schema_version": CACHE_SCHEMA_VERSION,
+                "kind": "tmc13_source_frontier_cell",
+                "code_sha256": self.code_sha256,
+                "source_sha256": source_sha256,
+                "arm_parameters": {
+                    "rate_point": asdict(rate_point),
+                    "position_bits": self.experiment_040.position_bits,
+                    "tmc3_executable_sha256": self.executable_sha256,
+                },
+            }
+        )
+
+    def _cache_dir(self, identity: dict[str, Any]) -> Path:
+        return (
+            self.work_root
+            / identity["source_sha256"]
+            / identity["arm_parameters"]["rate_point"]["name"]
+            / _json_sha256(identity)
+        )
+
+    def _load_cell_cache(
+        self, identity: dict[str, Any], rate_point: Tmc3RatePoint
+    ) -> _GpccCell | None:
+        cache_dir = self._cache_dir(identity)
+        manifest_path = cache_dir / "cache_manifest.json"
+        stream_path = cache_dir / "stream.bin"
+        reconstruction_path = cache_dir / "reconstruction.npy"
+        if not (
+            manifest_path.is_file()
+            and stream_path.is_file()
+            and reconstruction_path.is_file()
+        ):
+            return None
+        try:
+            manifest = json.loads(manifest_path.read_text())
+            if manifest.get("identity") != identity:
+                return None
+            if manifest.get("stream_sha256") != file_sha256(stream_path):
+                return None
+            if manifest.get("reconstruction_sha256") != file_sha256(
+                reconstruction_path
+            ):
+                return None
+            stream = stream_path.read_bytes()
+            reconstruction = np.load(
+                reconstruction_path, allow_pickle=False
+            ).astype(np.float32, copy=False)
+            breakdown = GpccStreamBreakdown(**manifest["stream_breakdown"])
+            result = GpccResult(
+                reconstruction=reconstruction.copy(),
+                stream_bytes=len(stream),
+                stream_breakdown=breakdown,
+                encode_seconds=float(manifest["encode_seconds"]),
+                decode_seconds=float(manifest["decode_seconds"]),
+                encoder_command=tuple(manifest["encoder_command"]),
+                decoder_command=tuple(manifest["decoder_command"]),
+                encoder_stdout="",
+                decoder_stdout="",
+            )
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if (
+            reconstruction.ndim != 2
+            or reconstruction.shape[1:] != (3,)
+            or not len(reconstruction)
+            or not np.isfinite(reconstruction).all()
+            or breakdown.total_bytes != len(stream)
+        ):
+            return None
+        return _GpccCell(rate_point, result, stream)
+
+    def _write_cell_cache(
+        self, identity: dict[str, Any], cell: _GpccCell
+    ) -> None:
+        cache_dir = self._cache_dir(identity)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        reconstruction_path = cache_dir / "reconstruction.npy"
+        _atomic_save_array(reconstruction_path, cell.result.reconstruction)
+        stream_path = cache_dir / "stream.bin"
+        if not stream_path.is_file() or stream_path.read_bytes() != cell.stream:
+            temporary = stream_path.with_name(f".stream.bin.tmp-{os.getpid()}")
+            temporary.write_bytes(cell.stream)
+            os.replace(temporary, stream_path)
+        _atomic_write_json(
+            cache_dir / "cache_manifest.json",
+            {
+                "identity": identity,
+                "stream_sha256": file_sha256(stream_path),
+                "reconstruction_sha256": file_sha256(reconstruction_path),
+                "stream_breakdown": asdict(cell.result.stream_breakdown),
+                "encode_seconds": cell.result.encode_seconds,
+                "decode_seconds": cell.result.decode_seconds,
+                "encoder_command": list(cell.result.encoder_command),
+                "decoder_command": list(cell.result.decoder_command),
+            },
+        )
 
     def _frontier(self, source: FloatArray) -> tuple[_GpccCell, ...]:
         values = _canonical_source(
@@ -387,20 +620,31 @@ class _GpccFrontier:
         if digest not in self._frontiers:
             cells = []
             for rate_point in self.rate_points:
-                work_dir = self.work_root / digest / rate_point.name
-                result = run_tmc3(
-                    self.executable,
-                    values,
-                    rate_point=rate_point,
-                    work_dir=work_dir,
-                    position_bits=self.experiment_040.position_bits,
-                    timeout_seconds=self.experiment_040.timeout_seconds,
+                identity = self._cache_identity(
+                    source_sha256=digest, rate_point=rate_point
                 )
-                stream = (work_dir / "stream.bin").read_bytes()
-                if result.stream_breakdown is None:
-                    raise RuntimeError("TMC13 result lacks byte-exact accounting")
-                if len(stream) != result.stream_breakdown.total_bytes:
-                    raise RuntimeError("TMC13 stream differs from parsed byte total")
+                cell = self._load_cell_cache(identity, rate_point)
+                if cell is None:
+                    work_dir = self._cache_dir(identity)
+                    result = run_tmc3(
+                        self.executable,
+                        values,
+                        rate_point=rate_point,
+                        work_dir=work_dir,
+                        position_bits=self.experiment_040.position_bits,
+                        timeout_seconds=self.experiment_040.timeout_seconds,
+                    )
+                    stream = (work_dir / "stream.bin").read_bytes()
+                    if result.stream_breakdown is None:
+                        raise RuntimeError("TMC13 result lacks byte-exact accounting")
+                    if len(stream) != result.stream_breakdown.total_bytes:
+                        raise RuntimeError(
+                            "TMC13 stream differs from parsed byte total"
+                        )
+                    cell = _GpccCell(rate_point, result, stream)
+                    self._write_cell_cache(identity, cell)
+                result = cell.result
+                stream = cell.stream
                 stream_digest = hashlib.sha256(stream).hexdigest()
                 reconstruction = result.reconstruction.astype(np.float64)
                 previous = self._decoded.get(stream_digest)
@@ -409,7 +653,7 @@ class _GpccFrontier:
                 ):
                     raise RuntimeError("one TMC13 stream mapped to two reconstructions")
                 self._decoded[stream_digest] = reconstruction
-                cells.append(_GpccCell(rate_point, result, stream))
+                cells.append(cell)
             self._frontiers[digest] = tuple(cells)
         return self._frontiers[digest]
 

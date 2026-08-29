@@ -227,6 +227,46 @@ weight. A missing point metric is reported as unavailable rather than imputed.
 manifest hash, scorer seeds, codec roles, actual rates, summaries, gate inputs,
 contract checks, and artifact hashes.
 
+## Resume, cache, and progress protocol
+
+The runner writes `run_manifest.json` before data loading or codec work. Its run
+identity hashes the resolved Experiment 041 configuration, Python source tree,
+device, dataset manifest, Experiment 040 and stability configurations, G-PCC
+reference grid and executable, sealed decoder checkpoint and selection, and it
+records the defect seed explicitly. Existing scored rows are resumed only when
+that complete identity matches. A missing, unreadable, or mismatched manifest
+starts a clean per-cloud result file and emits the reason; rows from different
+configurations, code, models, dependencies, or devices are never combined.
+
+`defect_per_cloud.jsonl` is append-only during evaluation. Each scorer-seed row
+is flushed and synced immediately after one split/cloud/condition/arm/rate
+decode has been scored. A restart validates that existing rows form the
+canonical completed prefix, fits the raw-only scorers before any remaining
+codec call, skips complete units, and appends only missing rows. A partial final
+line from abrupt termination is discarded. The final JSONL therefore has the
+same bytes as an uninterrupted run.
+
+The expensive provider intermediates live below `codec_scratch/`. Adam-STE
+coordinates are keyed by canonical source-cloud SHA-256 plus search parameters,
+decoder identity, Experiment 040 configuration, and code hash. Every cached
+array has a checked content hash. Each G-PCC frontier cell is likewise keyed by
+source hash, TMC13 rate-point arguments, position precision, executable hash,
+and code hash; its stream and reconstruction hashes are checked before reuse.
+Missing, partial, mismatched, or corrupted entries are recomputed and replaced.
+Cache entries are not treated as per-cloud messages and do not alter rate
+accounting or decoded coordinates.
+
+During execution, stdout receives compact JSON progress lines containing
+`stage`, `done`, `total`, and `elapsed_seconds`, with the current condition and
+arm during evaluation. The pre-existing final human-facing summary remains the
+last output. `defect_anomaly_metrics.json` also reports wall-clock time for
+defect injection, scorer fitting, encode and decode aggregated by arm, anomaly
+scorer/metric computation (`official_metrics_seconds`), hierarchical bootstrap,
+and unattributed orchestration. G-PCC's internally paired TMC13 encode/decode
+subprocesses occur behind its `encode(source)` frontier call and are therefore
+charged to the G-PCC encode arm; the benchmark-visible `decode(stream)` lookup
+is reported separately.
+
 ## Predeclared gate G-C2
 
 The primary operating point is the 64-byte Experiment 040 coordinate-payload

@@ -13,6 +13,7 @@ import hashlib
 import importlib
 import json
 import math
+import os
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
@@ -45,6 +46,52 @@ EXPERIMENT_040_SCORE_METHODS = (
     "decoder_residual",
     "boundary",
 )
+RUN_MANIFEST_SCHEMA_VERSION = 2
+
+
+def _canonical_json(value: Any) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _json_sha256(value: Any) -> str:
+    return hashlib.sha256(_canonical_json(value)).hexdigest()
+
+
+def _atomic_write_json(path: Path, value: Any) -> None:
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    temporary.write_text(json.dumps(value, indent=2) + "\n")
+    os.replace(temporary, path)
+
+
+def _source_tree_sha256() -> str:
+    root = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*.py")):
+        digest.update(path.relative_to(root).as_posix().encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+class _ProgressReporter:
+    def __init__(self, started: float) -> None:
+        self.started = started
+
+    def emit(self, stage: str, done: int, total: int, **details: Any) -> None:
+        print(
+            json.dumps(
+                {
+                    "stage": stage,
+                    "done": done,
+                    "total": total,
+                    "elapsed_seconds": time.perf_counter() - self.started,
+                    **details,
+                },
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
 
 
 @runtime_checkable
@@ -269,6 +316,120 @@ class DefectAnomalyBenchmarkConfig:
         return cls(**values)
 
 
+def _run_identity(
+    config: DefectAnomalyBenchmarkConfig,
+    *,
+    device_name: str,
+    codec_override: bool,
+) -> dict[str, Any]:
+    config_values = asdict(config)
+    dependency_hashes: dict[str, str] = {
+        "dataset_manifest_sha256": file_sha256(Path(config.dataset_manifest)),
+    }
+    model_hashes: dict[str, str] = {}
+    if (
+        not codec_override
+        and not config.diagnostic_subset_codecs
+        and config.codec_provider
+        == "pointconstellation.exp040_defect_codecs:build_codec_arms"
+    ):
+        experiment_040_path = Path(config.experiment_040_config)
+        experiment_040 = json.loads(experiment_040_path.read_text())
+        stability_path = Path(experiment_040["stability_config"])
+        artifact_dir = Path(experiment_040["stability_artifact_dir"])
+        decoder_dir = artifact_dir / (
+            f"decoders/seed_{config.experiment_040_decoder_seed}"
+        )
+        dependency_hashes.update(
+            {
+                "experiment_040_config_sha256": file_sha256(experiment_040_path),
+                "stability_config_sha256": file_sha256(stability_path),
+                "gpcc_reference_sha256": file_sha256(
+                    Path(experiment_040["gpcc_reference_path"])
+                ),
+                "tmc3_executable_sha256": file_sha256(
+                    Path(experiment_040["tmc3_executable"])
+                ),
+            }
+        )
+        model_hashes.update(
+            {
+                "decoder_checkpoint_sha256": file_sha256(
+                    decoder_dir / "stabilized.pt"
+                ),
+                "decoder_selection_sha256": file_sha256(
+                    decoder_dir / "selection.json"
+                ),
+            }
+        )
+    identity = {
+        "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
+        "config_sha256": _json_sha256(config_values),
+        "code_sha256": _source_tree_sha256(),
+        "model_hashes": model_hashes,
+        "dependency_hashes": dependency_hashes,
+        "defect_seed": config.defect_seed,
+        "device": device_name,
+        "codec_override": codec_override,
+    }
+    identity["identity_sha256"] = _json_sha256(identity)
+    return identity
+
+
+def _prepare_run_manifest(
+    config: DefectAnomalyBenchmarkConfig,
+    *,
+    device_name: str,
+    codec_override: bool,
+    output_dir: Path,
+    progress: _ProgressReporter,
+) -> tuple[dict[str, Any], bool]:
+    identity = _run_identity(
+        config, device_name=device_name, codec_override=codec_override
+    )
+    manifest_path = output_dir / "run_manifest.json"
+    resume = False
+    reason = "manifest_missing"
+    if manifest_path.is_file():
+        try:
+            existing = json.loads(manifest_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            reason = "manifest_unreadable"
+        else:
+            if existing.get("identity") == identity:
+                resume = True
+                reason = "identical_hashes"
+            else:
+                reason = "manifest_hash_mismatch"
+    if not resume:
+        for name in ("defect_per_cloud.jsonl", "defect_anomaly_metrics.json"):
+            path = output_dir / name
+            if path.exists():
+                path.unlink()
+    manifest = {
+        "experiment": 41,
+        "status": "running",
+        "config": asdict(config),
+        "config_sha256": identity["config_sha256"],
+        "code_sha256": identity["code_sha256"],
+        "model_hashes": identity["model_hashes"],
+        "dependency_hashes": identity["dependency_hashes"],
+        "defect_seed": config.defect_seed,
+        "codec_provider": config.codec_provider,
+        "diagnostic_subset_codecs": config.diagnostic_subset_codecs,
+        "identity": identity,
+    }
+    _atomic_write_json(manifest_path, manifest)
+    progress.emit(
+        "resume",
+        1 if resume else 0,
+        1,
+        resume=resume,
+        reason=reason,
+    )
+    return manifest, resume
+
+
 @dataclass(frozen=True)
 class BenchmarkCloud:
     """One raw control or defect condition before codec evaluation."""
@@ -333,6 +494,64 @@ class ScoredCloud:
     cloud_score: float
     point_auroc: float | None
     point_auprc: float | None
+
+
+ScoredRowKey = tuple[int, str, str, str, str, int | None]
+EvaluationUnitKey = tuple[str, str, str, str, int | None]
+
+
+def _scored_row_key(row: ScoredCloud) -> ScoredRowKey:
+    return (
+        row.scorer_seed,
+        row.split,
+        row.cloud_id,
+        row.defect_type,
+        row.arm,
+        row.payload_budget_bytes,
+    )
+
+
+def _evaluation_unit_key(row: ScoredCloud) -> EvaluationUnitKey:
+    return (
+        row.split,
+        row.cloud_id,
+        row.defect_type,
+        row.arm,
+        row.payload_budget_bytes,
+    )
+
+
+def _load_incremental_rows(path: Path) -> list[ScoredCloud]:
+    if not path.is_file():
+        return []
+    payload = path.read_bytes()
+    if payload and not payload.endswith(b"\n"):
+        boundary = payload.rfind(b"\n") + 1
+        payload = payload[:boundary]
+        path.write_bytes(payload)
+    rows = []
+    identities: set[ScoredRowKey] = set()
+    for line_number, line in enumerate(payload.splitlines(), start=1):
+        if not line:
+            continue
+        try:
+            row = ScoredCloud(**json.loads(line))
+        except (TypeError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f"invalid incremental row at {path}:{line_number}"
+            ) from error
+        identity = _scored_row_key(row)
+        if identity in identities:
+            raise ValueError(f"duplicate incremental row identity: {identity}")
+        identities.add(identity)
+        rows.append(row)
+    return rows
+
+
+def _append_incremental_row(handle: Any, row: ScoredCloud) -> None:
+    handle.write(json.dumps(asdict(row)) + "\n")
+    handle.flush()
+    os.fsync(handle.fileno())
 
 
 def _point_array(points: ArrayLike) -> FloatArray:
@@ -778,6 +997,9 @@ def _manifest_dataset(
 
 def _load_raw_clouds(
     config: DefectAnomalyBenchmarkConfig,
+    *,
+    progress: _ProgressReporter | None = None,
+    timing: dict[str, Any] | None = None,
 ) -> tuple[list[FloatArray], list[BenchmarkCloud], dict[str, Any]]:
     manifest_path = Path(config.dataset_manifest)
     manifest_hash = file_sha256(manifest_path)
@@ -795,6 +1017,14 @@ def _load_raw_clouds(
         for index in range(training_count)
     ]
 
+    evaluation_datasets = []
+    for split in config.evaluation_splits:
+        dataset = _manifest_dataset(config, split)
+        count = len(dataset)
+        if config.maximum_clouds_per_split is not None:
+            count = min(count, config.maximum_clouds_per_split)
+        evaluation_datasets.append((split, dataset, count))
+
     samples = []
     memberships: dict[str, list[str]] = {config.training_split: []}
     for index in range(training_count):
@@ -802,16 +1032,20 @@ def _load_raw_clouds(
         memberships[config.training_split].append(
             f"{record['category']}:{record['model_id']}"
         )
-    for split in config.evaluation_splits:
-        dataset = _manifest_dataset(config, split)
-        count = len(dataset)
-        if config.maximum_clouds_per_split is not None:
-            count = min(count, config.maximum_clouds_per_split)
+    injection_total = sum(
+        count * (1 + len(config.defect_types))
+        for _, _, count in evaluation_datasets
+    )
+    injection_done = 0
+    if progress is not None:
+        progress.emit("defect_injection", injection_done, injection_total)
+    for split, dataset, count in evaluation_datasets:
         memberships[split] = []
         for index in range(count):
             raw = dataset.sample(index)
             cloud_id = f"{raw.category}:{raw.model_id}"
             memberships[split].append(cloud_id)
+            injection_started = time.perf_counter()
             control = inject_defect_for_cloud(
                 raw.source_points,
                 "none",
@@ -820,6 +1054,10 @@ def _load_raw_clouds(
                 normals=raw.source_normals,
                 config=config.injection,
             )
+            if timing is not None:
+                timing["defect_injection_seconds"] += (
+                    time.perf_counter() - injection_started
+                )
             samples.append(
                 BenchmarkCloud(
                     split=split,
@@ -835,7 +1073,18 @@ def _load_raw_clouds(
                     removed_count=0,
                 )
             )
+            injection_done += 1
+            if progress is not None:
+                progress.emit(
+                    "defect_injection",
+                    injection_done,
+                    injection_total,
+                    split=split,
+                    cloud_id=cloud_id,
+                    defect_type="none",
+                )
             for defect_type in config.defect_types:
+                injection_started = time.perf_counter()
                 defect = inject_defect_for_cloud(
                     raw.source_points,
                     defect_type,
@@ -844,6 +1093,10 @@ def _load_raw_clouds(
                     normals=raw.source_normals,
                     config=config.injection,
                 )
+                if timing is not None:
+                    timing["defect_injection_seconds"] += (
+                        time.perf_counter() - injection_started
+                    )
                 samples.append(
                     BenchmarkCloud(
                         split=split,
@@ -859,6 +1112,16 @@ def _load_raw_clouds(
                         removed_count=defect.removed_count,
                     )
                 )
+                injection_done += 1
+                if progress is not None:
+                    progress.emit(
+                        "defect_injection",
+                        injection_done,
+                        injection_total,
+                        split=split,
+                        cloud_id=cloud_id,
+                        defect_type=defect_type,
+                    )
     flat = [value for rows in memberships.values() for value in rows]
     defect_samples = [sample for sample in samples if sample.cloud_label == 1]
     return (
@@ -1076,6 +1339,413 @@ def _score_decodes(
                 )
             )
     return rows
+
+
+def _score_decode(
+    row: DecodedCloud,
+    *,
+    scorer_seed: int,
+    scorer: KNNNormalManifoldScorer,
+    config: DefectAnomalyBenchmarkConfig,
+) -> ScoredCloud:
+    scores = scorer.score_points(row.decoded_points)
+    tail_count = max(1, int(math.ceil(config.scorer.tail_fraction * len(scores))))
+    cloud_score = float(
+        np.partition(scores, len(scores) - tail_count)[-tail_count:].mean()
+    )
+    has_both_labels = 0 < int(row.decoded_labels.sum()) < len(row.decoded_labels)
+    return ScoredCloud(
+        scorer_seed=scorer_seed,
+        split=row.sample.split,
+        cloud_id=row.sample.cloud_id,
+        category=row.sample.category,
+        defect_type=row.sample.defect_type,
+        size_stratum=row.sample.size_stratum,
+        declared_fraction=row.sample.declared_fraction,
+        domain_scale_factor=row.sample.domain_scale_factor,
+        cloud_label=row.sample.cloud_label,
+        arm=row.arm,
+        payload_budget_bytes=row.payload_budget_bytes,
+        target_bytes=row.target_bytes,
+        stream_bytes=row.stream_bytes,
+        stream_sha256=row.stream_sha256,
+        codec_header_bytes=row.codec_header_bytes,
+        codec_payload_bytes=row.codec_payload_bytes,
+        payload_byte_delta=row.payload_byte_delta,
+        complete_stream_byte_delta=row.complete_stream_byte_delta,
+        codec_rate_point=row.codec_rate_point,
+        decoded_point_count=len(row.decoded_points),
+        defective_point_count=int(row.decoded_labels.sum()),
+        cloud_score=cloud_score,
+        point_auroc=(
+            binary_auroc(row.decoded_labels, scores) if has_both_labels else None
+        ),
+        point_auprc=(
+            binary_auprc(row.decoded_labels, scores) if has_both_labels else None
+        ),
+    )
+
+
+def _raw_decode(sample: BenchmarkCloud) -> DecodedCloud:
+    return DecodedCloud(
+        sample=sample,
+        arm="raw",
+        payload_budget_bytes=None,
+        target_bytes=None,
+        stream_bytes=None,
+        stream_sha256=None,
+        codec_header_bytes=None,
+        codec_payload_bytes=None,
+        payload_byte_delta=None,
+        complete_stream_byte_delta=None,
+        codec_rate_point=None,
+        decoded_points=sample.points.copy(),
+        decoded_labels=sample.point_labels.copy(),
+    )
+
+
+def _coded_decode(
+    sample: BenchmarkCloud,
+    arm: CodecArm,
+    *,
+    expected_point_count: int,
+    timing: dict[str, Any],
+) -> DecodedCloud:
+    if len(sample.points) != expected_point_count:
+        raise ValueError(
+            "benchmark source cardinality differs from the declared regime: "
+            f"expected N={expected_point_count}, observed N={len(sample.points)} "
+            f"for {sample.cloud_id}/{sample.defect_type}"
+        )
+    if sample.point_labels.shape != (expected_point_count,):
+        raise ValueError("benchmark source labels do not align with declared regime")
+    codec_source = sample.points.copy()
+    if not np.array_equal(codec_source, sample.points):
+        raise RuntimeError("codec input differs from raw benchmark coordinates")
+    encode_started = time.perf_counter()
+    stream = arm.codec.encode(codec_source)
+    timing["per_arm_encode_seconds"][arm.name] += (
+        time.perf_counter() - encode_started
+    )
+    if not isinstance(stream, bytes) or not stream:
+        raise TypeError("codec encode must return nonempty bytes")
+    actual_bytes = len(stream)
+    error = abs(actual_bytes - arm.target_bytes)
+    if arm.exact_bytes and error:
+        raise AssertionError(
+            f"exact codec arm {arm.name} differs from target bytes: "
+            f"{actual_bytes} != {arm.target_bytes}"
+        )
+    if not arm.exact_bytes and error > arm.maximum_rate_error_bytes:
+        raise AssertionError(
+            f"codec arm {arm.name} exceeds its declared rate tolerance"
+        )
+    metadata: Mapping[str, Any] = {}
+    metadata_function = getattr(arm.codec, "rate_metadata", None)
+    if callable(metadata_function):
+        raw_metadata = metadata_function(stream)
+        if not isinstance(raw_metadata, Mapping):
+            raise TypeError("codec rate_metadata must return a mapping")
+        metadata = raw_metadata
+        header_bytes = metadata.get("codec_header_bytes")
+        payload_bytes = metadata.get("codec_payload_bytes")
+        consistent = (
+            isinstance(header_bytes, int)
+            and isinstance(payload_bytes, int)
+            and header_bytes >= 0
+            and payload_bytes >= 0
+            and header_bytes + payload_bytes == actual_bytes
+            and metadata.get("payload_byte_delta")
+            == payload_bytes - arm.payload_budget_bytes
+            and metadata.get("complete_stream_byte_delta")
+            == actual_bytes - arm.target_bytes
+        )
+        if not consistent:
+            raise RuntimeError("codec returned inconsistent byte accounting")
+    decode_started = time.perf_counter()
+    reconstructed = _point_array(arm.codec.decode(stream))
+    labels = transfer_point_labels(
+        sample.points,
+        sample.point_labels,
+        reconstructed,
+    )
+    timing["per_arm_decode_seconds"][arm.name] += (
+        time.perf_counter() - decode_started
+    )
+    return DecodedCloud(
+        sample=sample,
+        arm=arm.name,
+        payload_budget_bytes=arm.payload_budget_bytes,
+        target_bytes=arm.target_bytes,
+        stream_bytes=actual_bytes,
+        stream_sha256=hashlib.sha256(stream).hexdigest(),
+        codec_header_bytes=metadata.get("codec_header_bytes"),
+        codec_payload_bytes=metadata.get("codec_payload_bytes"),
+        payload_byte_delta=metadata.get("payload_byte_delta"),
+        complete_stream_byte_delta=metadata.get("complete_stream_byte_delta"),
+        codec_rate_point=metadata.get("codec_rate_point"),
+        decoded_points=reconstructed.copy(),
+        decoded_labels=labels,
+    )
+
+
+def _evaluation_units(
+    samples: Sequence[BenchmarkCloud], arms: Sequence[CodecArm]
+) -> list[tuple[BenchmarkCloud, CodecArm | None]]:
+    return [
+        (sample, arm)
+        for sample in samples
+        for arm in (None, *arms)
+    ]
+
+
+def _unit_identity(
+    sample: BenchmarkCloud, arm: CodecArm | None
+) -> EvaluationUnitKey:
+    return (
+        sample.split,
+        sample.cloud_id,
+        sample.defect_type,
+        "raw" if arm is None else arm.name,
+        None if arm is None else arm.payload_budget_bytes,
+    )
+
+
+def _validate_incremental_rows(
+    rows: Sequence[ScoredCloud],
+    *,
+    units: Sequence[tuple[BenchmarkCloud, CodecArm | None]],
+    config: DefectAnomalyBenchmarkConfig,
+) -> None:
+    sample_by_identity = {
+        (sample.split, sample.cloud_id, sample.defect_type): sample
+        for sample, _ in units
+    }
+    expected = [
+        (seed, *_unit_identity(sample, arm))
+        for sample, arm in units
+        for seed in config.scorer_seeds
+    ]
+    observed = [_scored_row_key(row) for row in rows]
+    if observed != expected[: len(observed)]:
+        raise ValueError("incremental rows are not a canonical completed prefix")
+    for row in rows:
+        sample = sample_by_identity[(row.split, row.cloud_id, row.defect_type)]
+        if (
+            row.category != sample.category
+            or row.size_stratum != sample.size_stratum
+            or row.declared_fraction != sample.declared_fraction
+            or row.domain_scale_factor != sample.domain_scale_factor
+            or row.cloud_label != sample.cloud_label
+        ):
+            raise ValueError("incremental row metadata differs from benchmark source")
+
+
+def _rate_checks_from_rows(
+    rows: Sequence[ScoredCloud],
+    *,
+    samples: Sequence[BenchmarkCloud],
+    arms: Sequence[CodecArm],
+    scorer_seed: int,
+) -> dict[str, bool]:
+    representatives = [row for row in rows if row.scorer_seed == scorer_seed]
+    arm_by_identity = {
+        (arm.name, arm.payload_budget_bytes): arm for arm in arms
+    }
+    exact_matches = []
+    within_tolerance = []
+    accounting_checks = []
+    for row in representatives:
+        if row.arm == "raw":
+            continue
+        arm = arm_by_identity[(row.arm, row.payload_budget_bytes)]
+        error = abs(int(row.stream_bytes) - arm.target_bytes)
+        exact_matches.append(not arm.exact_bytes or error == 0)
+        within_tolerance.append(
+            arm.exact_bytes or error <= arm.maximum_rate_error_bytes
+        )
+        accounting = (
+            row.codec_header_bytes,
+            row.codec_payload_bytes,
+            row.payload_byte_delta,
+            row.complete_stream_byte_delta,
+        )
+        if all(value is None for value in accounting):
+            continue
+        accounting_checks.append(
+            isinstance(row.codec_header_bytes, int)
+            and isinstance(row.codec_payload_bytes, int)
+            and row.codec_header_bytes >= 0
+            and row.codec_payload_bytes >= 0
+            and row.codec_header_bytes + row.codec_payload_bytes == row.stream_bytes
+            and row.payload_byte_delta
+            == row.codec_payload_bytes - int(row.payload_budget_bytes)
+            and row.complete_stream_byte_delta == row.stream_bytes - row.target_bytes
+        )
+    for sample in samples:
+        sample_rows = [
+            row
+            for row in representatives
+            if row.split == sample.split
+            and row.cloud_id == sample.cloud_id
+            and row.defect_type == sample.defect_type
+        ]
+        exact_streams: dict[int, dict[str, int]] = {}
+        for row in sample_rows:
+            if row.arm == "raw":
+                continue
+            arm = arm_by_identity[(row.arm, row.payload_budget_bytes)]
+            if arm.exact_bytes:
+                exact_streams.setdefault(arm.target_bytes, {})[row.arm] = int(
+                    row.stream_bytes
+                )
+        for target_bytes, streams in exact_streams.items():
+            if len(streams) >= 2:
+                assert_matched_bytes(streams, target_bytes=target_bytes)
+    return {
+        "all_exact_arms_match_target_bytes": all(exact_matches),
+        "all_nearest_rate_arms_within_declared_tolerance": all(within_tolerance),
+        "all_declared_codec_byte_accounting_is_consistent": all(accounting_checks),
+        "all_codec_inputs_equal_raw_input_coordinates": True,
+    }
+
+
+def _evaluate_incrementally(
+    normal_training: Sequence[FloatArray],
+    samples: Sequence[BenchmarkCloud],
+    arms: Sequence[CodecArm],
+    config: DefectAnomalyBenchmarkConfig,
+    *,
+    output_dir: Path,
+    resume: bool,
+    progress: _ProgressReporter,
+    timing: dict[str, Any],
+) -> tuple[list[ScoredCloud], dict[str, bool]]:
+    path = output_dir / "defect_per_cloud.jsonl"
+    loaded = _load_incremental_rows(path) if resume else []
+    units = _evaluation_units(samples, arms)
+    try:
+        _validate_incremental_rows(loaded, units=units, config=config)
+    except ValueError as error:
+        loaded = []
+        path.write_bytes(b"")
+        progress.emit(
+            "resume_rows",
+            0,
+            len(units),
+            resume=False,
+            reason="invalid_incremental_rows_clean_start",
+            detail=str(error),
+        )
+    rows_by_key = {_scored_row_key(row): row for row in loaded}
+    expected_keys = [
+        (seed, *_unit_identity(sample, arm))
+        for sample, arm in units
+        for seed in config.scorer_seeds
+    ]
+    completed_units = len(loaded) // len(config.scorer_seeds)
+    progress.emit(
+        "evaluation",
+        completed_units,
+        len(units),
+        resumed_scored_rows=len(loaded),
+    )
+
+    pending = len(loaded) < len(expected_keys)
+    scorers: dict[int, KNNNormalManifoldScorer] = {}
+    progress.emit("scorer_fitting", 0, len(config.scorer_seeds), skipped=not pending)
+    if pending:
+        for index, scorer_seed in enumerate(config.scorer_seeds, start=1):
+            fit_started = time.perf_counter()
+            scorers[scorer_seed] = KNNNormalManifoldScorer(
+                config.scorer, seed=scorer_seed
+            ).fit(normal_training)
+            timing["scorer_fitting_seconds"] += time.perf_counter() - fit_started
+            progress.emit(
+                "scorer_fitting",
+                index,
+                len(config.scorer_seeds),
+                scorer_seed=scorer_seed,
+            )
+    else:
+        progress.emit(
+            "scorer_fitting",
+            len(config.scorer_seeds),
+            len(config.scorer_seeds),
+            skipped=True,
+        )
+
+    with path.open("a") as handle:
+        for unit_index, (sample, arm) in enumerate(units, start=1):
+            unit = _unit_identity(sample, arm)
+            unit_keys = [(seed, *unit) for seed in config.scorer_seeds]
+            if all(key in rows_by_key for key in unit_keys):
+                continue
+            progress.emit(
+                "evaluation",
+                unit_index - 1,
+                len(units),
+                status="started",
+                split=sample.split,
+                cloud_id=sample.cloud_id,
+                defect_type=sample.defect_type,
+                arm="raw" if arm is None else arm.name,
+                payload_budget_bytes=(
+                    None if arm is None else arm.payload_budget_bytes
+                ),
+            )
+            decode_started = time.perf_counter()
+            if arm is None:
+                decoded = _raw_decode(sample)
+                timing["per_arm_decode_seconds"]["raw"] += (
+                    time.perf_counter() - decode_started
+                )
+            else:
+                decoded = _coded_decode(
+                    sample,
+                    arm,
+                    expected_point_count=config.num_points,
+                    timing=timing,
+                )
+            for scorer_seed, key in zip(
+                config.scorer_seeds, unit_keys, strict=True
+            ):
+                if key in rows_by_key:
+                    continue
+                metric_started = time.perf_counter()
+                row = _score_decode(
+                    decoded,
+                    scorer_seed=scorer_seed,
+                    scorer=scorers[scorer_seed],
+                    config=config,
+                )
+                timing["official_metrics_seconds"] += (
+                    time.perf_counter() - metric_started
+                )
+                _append_incremental_row(handle, row)
+                rows_by_key[key] = row
+            completed_units = unit_index
+            progress.emit(
+                "evaluation",
+                completed_units,
+                len(units),
+                split=sample.split,
+                cloud_id=sample.cloud_id,
+                defect_type=sample.defect_type,
+                arm="raw" if arm is None else arm.name,
+                payload_budget_bytes=(
+                    None if arm is None else arm.payload_budget_bytes
+                ),
+            )
+    if set(rows_by_key) != set(expected_keys):
+        raise RuntimeError("incremental evaluation did not produce every expected row")
+    scored = [rows_by_key[key] for key in expected_keys]
+    return scored, _rate_checks_from_rows(
+        scored,
+        samples=samples,
+        arms=arms,
+        scorer_seed=config.scorer_seeds[0],
+    )
 
 
 def _filtered_rows(
@@ -1435,22 +2105,57 @@ def run_defect_anomaly_benchmark(
     if device_name not in {"cpu", "mps", "cuda"}:
         raise ValueError("device_name must be cpu, mps, or cuda")
     started = time.perf_counter()
+    progress = _ProgressReporter(started)
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    run_manifest, resume = _prepare_run_manifest(
+        config,
+        device_name=device_name,
+        codec_override=codec_arms is not None,
+        output_dir=output_dir,
+        progress=progress,
+    )
     if config.external_manifest is not None:
         load_external_anomaly_manifest(Path(config.external_manifest))
 
-    normal_training, samples, data_protocol = _load_raw_clouds(config)
+    timing: dict[str, Any] = {
+        "defect_injection_seconds": 0.0,
+        "scorer_fitting_seconds": 0.0,
+        "per_arm_encode_seconds": {},
+        "per_arm_decode_seconds": {"raw": 0.0},
+        "official_metrics_seconds": 0.0,
+        "bootstrap_seconds": 0.0,
+    }
+    normal_training, samples, data_protocol = _load_raw_clouds(
+        config, progress=progress, timing=timing
+    )
     arms = (
         tuple(codec_arms) if codec_arms is not None else _provider(config, device_name)
     )
     _validate_codec_arms(arms, config)
-    decoded, rate_checks = _decode_samples(
-        samples, arms, expected_point_count=config.num_points
+    timing["per_arm_encode_seconds"] = {
+        name: 0.0 for name in sorted({arm.name for arm in arms})
+    }
+    timing["per_arm_decode_seconds"].update(
+        {name: 0.0 for name in sorted({arm.name for arm in arms})}
     )
-    scored = _score_decodes(normal_training, decoded, config)
+    scored, rate_checks = _evaluate_incrementally(
+        normal_training,
+        samples,
+        arms,
+        config,
+        output_dir=output_dir,
+        resume=resume,
+        progress=progress,
+        timing=timing,
+    )
+    progress.emit("bootstrap", 0, 2)
+    bootstrap_started = time.perf_counter()
     summaries = summarize_anomaly_rows(scored, config)
+    progress.emit("bootstrap", 1, 2, component="summaries")
     gate = compute_gate_g_c2(scored, config)
+    timing["bootstrap_seconds"] += time.perf_counter() - bootstrap_started
+    progress.emit("bootstrap", 2, 2, component="gate_g_c2")
     contract_checks = {
         "scorer_fit_uses_raw_normal_training_clouds_only": True,
         "codec_encode_receives_coordinates_only": True,
@@ -1488,16 +2193,22 @@ def run_defect_anomaly_benchmark(
         raise RuntimeError("Experiment 041 scientific contract failed")
 
     per_cloud_rows = [asdict(row) for row in scored]
-    with (output_dir / "defect_per_cloud.jsonl").open("w") as handle:
-        for row in per_cloud_rows:
-            handle.write(json.dumps(row) + "\n")
+    elapsed_seconds = time.perf_counter() - started
+    accounted_seconds = (
+        timing["defect_injection_seconds"]
+        + timing["scorer_fitting_seconds"]
+        + sum(timing["per_arm_encode_seconds"].values())
+        + sum(timing["per_arm_decode_seconds"].values())
+        + timing["official_metrics_seconds"]
+        + timing["bootstrap_seconds"]
+    )
+    timing["other_seconds"] = max(0.0, elapsed_seconds - accounted_seconds)
+    timing["total_seconds"] = elapsed_seconds
     result = {
         "experiment": 41,
         "status": "smoke_only" if config.diagnostic_subset_codecs else "complete",
         "config": asdict(config),
-        "config_sha256": hashlib.sha256(
-            json.dumps(asdict(config), sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest(),
+        "config_sha256": run_manifest["config_sha256"],
         "device": device_name,
         "data_protocol": data_protocol,
         "scorer": {
@@ -1526,27 +2237,25 @@ def run_defect_anomaly_benchmark(
         "summaries": summaries,
         "gate_g_c2": gate,
         "per_cloud": per_cloud_rows,
-        "elapsed_seconds": time.perf_counter() - started,
+        "timing_breakdown": timing,
+        "elapsed_seconds": elapsed_seconds,
     }
-    (output_dir / "defect_anomaly_metrics.json").write_text(
-        json.dumps(result, indent=2) + "\n"
+    metrics_path = output_dir / "defect_anomaly_metrics.json"
+    _atomic_write_json(metrics_path, result)
+    run_manifest.update(
+        {
+            "status": "complete",
+            "dataset_manifest_sha256": data_protocol["manifest_sha256"],
+            "scored_rows": len(per_cloud_rows),
+            "per_cloud_sha256": file_sha256(
+                output_dir / "defect_per_cloud.jsonl"
+            ),
+            "metrics_sha256": file_sha256(metrics_path),
+            "timing_breakdown": timing,
+        }
     )
-    (output_dir / "run_manifest.json").write_text(
-        json.dumps(
-            {
-                "config": asdict(config),
-                "config_sha256": result["config_sha256"],
-                "dataset_manifest_sha256": data_protocol["manifest_sha256"],
-                "codec_provider": config.codec_provider,
-                "diagnostic_subset_codecs": config.diagnostic_subset_codecs,
-                "metrics_sha256": file_sha256(
-                    output_dir / "defect_anomaly_metrics.json"
-                ),
-            },
-            indent=2,
-        )
-        + "\n"
-    )
+    _atomic_write_json(output_dir / "run_manifest.json", run_manifest)
+    progress.emit("complete", 1, 1, scored_rows=len(per_cloud_rows))
     return result
 
 
