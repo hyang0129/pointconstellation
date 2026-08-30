@@ -1,12 +1,6 @@
 # Experiment 041: defect-injection anomaly benchmark
 
 Status: complete; Gate G-C2 fails (selective pass-through does not recover cloud-level anomaly AUROC; the learned codec's decodes are at chance while G-PCC preserves the signal; the non-learned detector is under-powered).
-results are pending selection of the Experiment 040 score/split cell and the
-predeclared full run. The first full cluster attempt is invalid: defect
-injection could leave the codecs' declared domain and stopped before producing
-a complete result. The second full cluster attempt is also invalid: its first
-thin-spur condition exceeded the sealed decoder's fixed cardinality regime and
-again stopped before producing a complete result.
 
 ## Question and hypothesis
 

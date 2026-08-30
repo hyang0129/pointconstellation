@@ -1,232 +1,161 @@
-# Draft PR integration summary
-
-This worktree integrates the 13 requested remaining Epic 17 branches into
-`agent/tracks-integration`, in the requested order. No branches were pushed and
-no training jobs were run.
-
-## Merge ledger
-
-### 1. PR #31 — `origin/agent/epic17-selection-baselines`
-
-Merge commit: `e9b216d`
-
-Conflicted file:
-
-- `src/pointconstellation/official_stability.py`: retained the selection-method
-  dispatch, representation and selection metadata, and every selection result
-  field while also retaining the pre-existing exact packet accounting and
-  external-manifest evaluation. The experiment label fallback remains valid for
-  both old and new configurations.
-
-Validation: Ruff passed; 216 tests passed, 4 skipped.
-
-### 2. PR #34 — `origin/agent/epic17-entropy-stream`
-
-Merge commit: `f8a0fe1`
-
-Conflicted file:
-
-- `src/pointconstellation/official_stability.py`: combined membership metadata,
-  selection-mode rows, and entropy-rate fields instead of choosing either row
-  schema.
-
-Behavioral interaction fixed: the entropy branch initially treated stream modes
-as integers only, while PR #31 had string representation modes. The integrated
-bitstream supports fixed, Rice-entropy, `free`, `strict_subset`, and `fps` modes,
-keeps canonical re-encoding, and restores the representation-mode tests.
-
-Validation: Ruff passed; 234 tests passed, 4 skipped.
-
-### 3. PR #35 — `origin/agent/epic17-headroom-bound`
-
-Merge commit: `9fa1bf7`
-
-No conflicts. The headroom-bound experiment merged without a behavioral
-interaction.
-
-Validation: Ruff passed; 237 tests passed, 4 skipped.
-
-### 4. PR #52 — `origin/agent/epic17-placement-analysis`
-
-Merge commit: `56a7c75`
-
-No conflicts. The placement-analysis implementation, documentation, and tests
-merged cleanly.
-
-Validation: Ruff passed; 243 tests passed, 4 skipped.
-
-### 5. PR #54 — `origin/agent/epic17-constellation-stability`
-
-Merge commit: `fc5ccff`
-
-No conflicts. The constellation-stability analysis and tests merged cleanly.
-
-Validation: Ruff passed; 247 tests passed, 4 skipped.
-
-### 6. PR #55 — `origin/agent/epic17-objective-sweep`
-
-Merge commit: `65de428`
-
-No conflicts. The objective-sweep experiment, configs, documentation, and tests
-merged cleanly.
-
-Validation: Ruff passed; 258 tests passed, 4 skipped.
-
-### 7. PR #57 — `origin/agent/epic17-rate-sweep-adam`
-
-Merge commit: `52fc1d1`
-
-Conflicted files:
-
-- `src/pointconstellation/bitstream.py`: retained the entropy bit reader/writer
-  and exact payload validation used by both rate paths.
-- `src/pointconstellation/codecs/gpcc.py`: combined exact fixture/amortization
-  accounting with the synthetic TMC13 TLV parser, leaving one canonical parser.
-- `tests/test_bitstream.py`: kept all payload-length, padding, entropy, and
-  round-trip coverage.
-- `tests/test_gpcc.py`: kept both exact stream-breakdown fixtures and synthetic
-  TLV parsing tests.
-
-Validation: Ruff passed; 261 tests passed, 4 skipped.
-
-### 8. PR #58 — `origin/agent/epic17-normalization-amortized`
-
-Merge commit: `f509ede`
-
-Conflicted files:
-
-- `src/pointconstellation/bitstream.py`: made the binary16 center/scale suffix
-  compose with fixed, representation, and Rice-entropy streams; decoding exposes
-  normalized and restored original-frame coordinates and counts all 8 metadata
-  bytes.
-- `src/pointconstellation/feature_codec_benchmark.py`: retained decoder-file
-  accounting and selection records while adding normalization-aware actual
-  stream totals.
-- `src/pointconstellation/official_stability.py`: combined selection and entropy
-  columns with normalization and original-frame metrics.
-- `src/pointconstellation/published_codec_benchmark.py`: retained diversity
-  reporting and added model-amortization reporting.
-- `src/pointconstellation/stability_experiment.py`: retained selection/entropy
-  behavior and ensured the decoder consumes normalized coordinates while
-  original-frame metrics use the serialized transform.
-- `tests/test_bitstream.py`, `tests/test_official_stability.py`, and
-  `tests/test_published_codec_benchmark.py`: kept both branches' tests and added
-  an entropy-plus-normalization round trip.
-
-Behavioral interaction fixed: legacy feature artifacts keep their original
-`stream_bytes` field, while normalization-inclusive `total_stream_bytes` is used
-for the actual-rate contract. Entropy bounds and streams include normalization
-metadata when present.
-
-Validation: Ruff passed; 271 tests passed, 4 skipped.
-
-### 9. PR #60 — `origin/agent/epic17-bd-rate-figure`
-
-Merge commit: `cc793e1`
-
-Conflicted files:
-
-- `README.md`: retained both sets of figure/table commands and explanatory
-  sections.
-- `src/pointconstellation/benchmark_registry.py`: combined objective, regime,
-  run-seed, normalization, rate-component, model-seed, pair-ID, and RD-eligibility
-  dimensions. Experiment discovery remains open-ended rather than reverting to
-  a short hard-coded directory list.
-
-Validation: Ruff passed; 276 tests passed, 5 skipped.
-
-### 10. PR #61 — `origin/agent/epic17-external-datasets`
-
-Merge commit: `a4416fe`
-
-Conflicted files:
-
-- `pyproject.toml`: retained the union of optional dependencies: the existing
-  `figures` extra with `matplotlib` and the new `datasets` extra with `h5py`.
-- `src/pointconstellation/data/__init__.py`: exported all pre-existing dataset
-  APIs plus the external point-cloud APIs.
-- `src/pointconstellation/mesh_manifest.py`: retained the ModelNet40 final-slice
-  builder and added Thingi10K and ScanObjectNN manifest modes and helpers. The
-  final-slice CLI still uses seed 1517 when no seed is specified.
-- `tests/test_mesh_data.py`: kept final-slice, Thingi10K, and ScanObjectNN tests.
-
-Validation: Ruff passed; 282 tests passed, 6 skipped.
-
-### 11. PR #62 — `origin/agent/epic17-downstream-classification`
-
-Merge commit: `4de2ccd`
-
-No textual conflicts.
-
-Behavioral interaction fixed: downstream tests construct synthetic
-`GpccResult` values without a parsed exact breakdown, while the integrated G-PCC
-codec normally provides one. `stream_breakdown` is therefore optional for
-synthetic/legacy results and is validated whenever present; real `run_tmc3`
-results continue to populate it.
-
-Validation: Ruff passed; 286 tests passed, 6 skipped.
-
-### 12. PR #63 — `origin/agent/epic17-geometry-gate`
-
-Merge commit: `bb97342`
-
-Conflicted files:
-
-- `src/pointconstellation/data/__init__.py`: retained both procedural/mesh and
-  raw-point-cloud dataset exports.
-- `src/pointconstellation/official_stability.py`: combined selection, entropy,
-  normalization, model-amortization, tail, mesh-surface, and canonical-stream
-  fields. Canonical hashes are regenerated from normalized coordinates plus the
-  serialized transform, so they cover the actual transmitted stream.
-- `src/pointconstellation/stability_experiment.py`: retained exact packet/rate
-  rows and added tail and continuous-surface metrics.
-
-Validation: Ruff passed; 294 tests passed, 6 skipped.
-
-### 13. PR #64 — `origin/agent/epic17-learned-entropy`
-
-Merge commit: `b0f8237`
-
-Conflicted files:
-
-- `src/pointconstellation/bitstream.py`: retained fixed, Rice, string
-  representation, and normalization support and added the learned arithmetic
-  stream, shared model input, canonical re-encoding, CRC validation, and exact
-  rate accounting.
-- `src/pointconstellation/stability_experiment.py`: retained the
-  normalization-inclusive Rice bound and added learned-stream bytes, bpp, model
-  identity, and shared-model cost.
-
-Behavioral interactions fixed:
-
-- PR #64 assigned learned mode the same wire ID already used by the `free`
-  representation. The public `MODE_LEARNED = 2` API is preserved, while learned
-  packets use collision-free wire ID 5; wire IDs 2--4 remain the representation
-  modes.
-- Learned streams now encode normalized lattice coordinates, append and count
-  the binary16 normalization suffix, reconstruct original-frame coordinates,
-  and include normalization in the oracle bound. The learned-entropy resummary
-  utility follows the same rule for external datasets.
-- Added regression tests for learned/representation wire-ID separation and
-  learned-stream normalization round trips.
-
-Validation: Ruff passed; 315 tests passed, 6 skipped. The new resummary script
-also passes Ruff.
-
-## Final verification
-
-All 13 requested remote-tracking branch tips are ancestors of `HEAD`, and the
-first-parent merge history matches the requested order.
-
-Required commands on the completed integrated source tree:
+# Experiment 041 post-decode acceleration
+
+## Outcome
+
+Experiment 041 now runs label transfer and the k-NN normal-manifold search with
+chunked PyTorch `cdist`/`topk` kernels on the requested benchmark device, scores
+decoded clouds in batches, and evaluates rank metrics and hierarchical
+bootstraps on vectorized dense arrays. The scientific protocol, scorer
+parameters, serialized rates, `ScoredCloud` schema, row ordering, and resume
+identity remain unchanged.
+
+The requested real CPU smoke fell from 61.024312 seconds before the change to
+11.906599 seconds after the final numerically stable implementation, a 5.13x
+end-to-end speedup even though codec encode work is unchanged. Its 900
+`defect_per_cloud.jsonl` rows contain 13,548 numeric values. The maximum
+absolute pre/post difference was `1.1102230246251565e-16`; all nonnumeric fields
+were identical. The summaries, G-C2 gate, and contract checks also matched the
+pre-change result to `1e-9`.
+
+## Full-parameter synthetic profile
+
+The profile used the full configuration values without reading or writing
+`data/` or `artifacts/`:
+
+- 128 independently generated normal references, each initially 2,048 points;
+- the real seeded fit subsampling of 512 points per reference;
+- 2,048-point decoded/query clouds;
+- three scorer seeds, three candidate references, `k=3`, and distance chunks
+  of 512 points;
+- tied score fixtures for AUROC/AUPRC;
+- 160 cloud identities, six control/defect conditions, and 10,000 bootstrap
+  draws for report-scale projections.
+
+The pre-change profile on the available Apple CPU host measured:
+
+| Stage | Measured | Full-run extrapolation |
+|---|---:|---:|
+| Fit all three scorers | 0.030751 s | 0.030751 s |
+| Scorer inference | 0.019946 s/scored row | 2,154.13 s at 108k rows |
+| Nearest-target label transfer | 0.221481 s/decode | 7,973.32 s at 36k decodes |
+| Point AUROC + AUPRC | 0.002192 s/scored row | 236.69 s at 108k rows |
+| Cloud AUROC + AUPRC on 960 rows | 0.001023 s/pair | report-dependent |
+| Nine stratification filters over 108k rows | 0.059270 s | negligible |
+| One cloud-AUROC bootstrap, 100 draws/960 rows | 1.099215 s | 109.92 s at 10k draws |
+
+The nested legacy bootstrap rescanned Python row objects for every sampled
+seed, cloud, draw, summary, and metric. A single 10,000-draw metric therefore
+projected to about 110 seconds, while the complete report requests hundreds of
+such metrics. This is consistent with the observed 21-hour CPU tail. Label
+transfer was the other hidden dominant cost: it performed a Python `lexsort`
+for every decoded query point and was charged to codec decode timing.
+
+The final optimized full-parameter profile measured:
+
+| Stage | Measured | Conservative extrapolation |
+|---|---:|---:|
+| Fit and device-materialize all three scorers | 0.042977 s | 0.042977 s |
+| Batched scorer inference | 0.011329 s/scored row | 1,223.59 s at 108k rows |
+| Device label transfer | 0.007194 s/decode | 258.98 s at 36k decodes |
+| Vectorized point AUROC + AUPRC | 0.000401 s/scored row | 43.33 s at 108k rows |
+| Vectorized cloud AUROC + AUPRC on 960 rows | 0.000219 s/pair | report-dependent |
+| Nine stratification filters over 108k rows | 0.063169 s | negligible |
+| One vectorized cloud-AUROC bootstrap, 10k draws/960 rows | 1.140354 s | measured directly |
+| Complete one-arm/rate, two-split, 18-summary report | 29.470280 s | 736.76 s for 25 arm/rate cells |
+
+The resulting conservative post-decode projection is about 2,272 seconds, or
+37.9 minutes, for the requested 108k scored-row workload (108k scoring/metric
+rows, 36k label transfers, the complete 25-cell report, gate, and
+stratification). The literal topology in the supplied config is 160 clouds x 6
+conditions x (24 coded arm/rate cells + raw) x 3 scorer seeds = 72,000 scored
+rows; that topology projects to about 29.4 minutes on this CPU profile. Both are
+well under one hour before applying CUDA acceleration. This host has no CUDA
+device, so no RTX timing is claimed; an RTX run will use the configured CUDA
+device for the distance/top-k work.
+
+## Implementation
+
+- Each scorer seed samples exactly the same reference clouds and points as
+  before, then materializes those references on the benchmark device once.
+- Descriptor-based candidate selection remains stable float64 NumPy code.
+- One chunked `torch.cdist` matrix now supplies forward and reverse k-NN
+  neighbor selection. Queries/candidates are batched by cardinality and
+  `torch.topk` maintains reverse neighbors across chunks.
+- Only the selected neighbors are re-evaluated with the legacy float64
+  arithmetic. This inexpensive refinement preserves exact CPU point scores on
+  random fixtures while retaining device acceleration for the quadratic
+  search.
+- Label transfer canonicalizes references once, then uses chunked device
+  `cdist` and `argmin`; its canonical tie rule is unchanged.
+- AUROC uses vectorized average ranks for exact ties. AUPRC uses vectorized
+  grouped thresholds and cumulative positive counts. Degenerate-label behavior
+  remains unchanged.
+- Bootstrap rows are packed once into seed x cloud x condition arrays. The
+  legacy alternating seed/cloud random draw sequence is retained, but each
+  chunk of draws is evaluated together rather than rescanning Python objects.
+- Decoded units are accumulated into batches of 8 on CPU or 16 on an
+  accelerator. Rows are still appended in the canonical unit-then-scorer order.
+- The `scoring` progress stage reports scored rows, total rows, the active
+  unit, and the persisted `defect_per_cloud.jsonl` path. Each completed batch
+  is flushed and synced after writing its individual scored-row lines. A
+  restart loads those rows, validates the canonical prefix, and skips their
+  scorer computation; a crash can lose at most the active 8/16-unit batch.
+- Timing now separates `label_transfer_seconds`,
+  `scorer_inference_seconds`, and `point_metrics_seconds`; the existing
+  `official_metrics_seconds` remains the aggregate scorer/metric time.
+
+The old NumPy distance, rank-loop, and label-transfer algorithms are retained
+only as test references where needed. The benchmark path no longer calls them.
+
+## Equivalence and resume coverage
+
+`test_optimized_scorer_transfer_and_metrics_match_reference_to_float64`
+compares the optimized scorer, canonical label transfer, AUROC, and AUPRC with
+the old algorithms on random inputs, duplicate/equidistant points, exact score
+ties, all-negative labels, and all-positive labels. Scorer outputs are checked
+at absolute tolerance `1e-9`; the sampled CPU fixtures are bit-identical.
+
+The incremental-resume test now also verifies that scoring progress exposes the
+persisted row path, begins with the exact resumed scored-row count, reaches its
+total, and reconstructs the byte-identical canonical JSONL after a partial
+restart. A complete real-smoke resume reported 900/900 persisted scoring rows,
+performed no decode or scoring work, finished in 1.049 seconds, and retained
+the identical JSONL SHA-256
+`6c6c96817950bf4482b0b6bd9a288a0b9b43c697cf3c450ab5a8abb0a8853ccb`.
+
+## Verification
+
+Required lint:
 
 ```text
 /Users/hong/code/pointconstellation/.venv-train/bin/python -m ruff check src tests
 All checks passed!
-
-/Users/hong/code/pointconstellation/.venv-train/bin/python -m pytest -q -x
-315 passed, 6 skipped
 ```
 
-The six skips are environment-dependent optional coverage: four Matplotlib
-figure/registry cases, one Draco CLI case, and one HDF5 dataset case (`h5py`).
+Required full test suite:
+
+```text
+PYTHONPATH=src /Users/hong/code/pointconstellation/.venv-train/bin/python -m pytest -q
+353 passed, 6 skipped
+```
+
+The six skips are the existing optional-environment cases for Matplotlib,
+Draco, and `h5py`.
+
+Required real smoke:
+
+```text
+PYTHONPATH=src /Users/hong/code/pointconstellation/.venv-train/bin/python \
+  -m pointconstellation.defect_anomaly_benchmark \
+  --config configs/experiment_041_defect_anomaly_smoke.json \
+  --device cpu \
+  --output-dir /tmp/exp041-fast-smoke
+```
+
+The clean final run completed all 300 evaluation units and 900 scorer rows in
+11.906599 seconds with every contract check true. Its rows, summaries, and gate
+were compared programmatically with the pre-change clean smoke at
+`/tmp/exp041-fast-smoke-prechange` and matched to `1e-9` as described above.
+
+No contents of `data/` or `artifacts/` were modified. No commit or push was
+made.
