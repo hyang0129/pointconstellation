@@ -1,6 +1,6 @@
 # Experiment 041: defect-injection anomaly benchmark
 
-Status: implementation and real-codec CPU smoke complete. Full benchmark
+Status: complete; Gate G-C2 fails (selective pass-through does not recover cloud-level anomaly AUROC; the learned codec's decodes are at chance while G-PCC preserves the signal; the non-learned detector is under-powered).
 results are pending selection of the Experiment 040 score/split cell and the
 predeclared full run. The first full cluster attempt is invalid: defect
 injection could leave the codecs' declared domain and stopped before producing
@@ -317,6 +317,92 @@ and the pinned G-PCC executable. Neither command launches training.
 
 ## Results
 
-Placeholder. The real-codec smoke is a plumbing result only. Do not infer an
-anomaly-preservation or compression conclusion until the full run evaluates the
-predeclared selected cell, all three scorer seeds, and both ModelNet40 splits.
+The full benchmark ran on homen-linux (RTX 5070 Ti, `--device cuda`, 75 min
+with the vectorized scorer; the first cluster attempt was killed by an
+allocation time limit and a second attempt spent 21 h in the pre-vectorization
+bootstrap). 128 validation and 32 category-OOD clouds, one undefected control
+plus five defect conditions per cloud, six payload budgets, the four codec arms
+plus raw input, three scorer seeds, 72,000 scored rows. All thirteen contract
+checks pass (scorer fitted on undefected raw training clouds only; encoders
+receive coordinates only; every injected cloud inside the codec domain and at
+the declared cardinality; exact arms at target bytes; all codec inputs equal
+the raw-arm input). Selective arm: decoder-residual score, 50 % preserved
+split (the Experiment 040 default; Experiment 040 found no score that beats
+the random control on fidelity).
+
+### Overall anomaly detection, validation (mean over three scorer seeds)
+
+| Arm | Bytes | Cloud AUROC | Cloud AUPRC | Point AUROC | Point AUPRC |
+|---|---:|---:|---:|---:|---:|
+| raw input (upper bound) | - | 0.576 | 0.865 | 0.658 | 0.198 |
+| constellation-only | 79 | 0.501 | 0.836 | 0.606 | 0.159 |
+| selective pass-through | 79 | 0.505 | 0.840 | 0.657 | 0.170 |
+| random-K2 preserved (control) | 79 | 0.494 | 0.835 | 0.645 | 0.158 |
+| G-PCC octree (nearest rate point) | 79 | 0.602 | 0.872 | 0.598 | 0.238 |
+
+Across the 40-110 B ladder the ordering does not change: constellation-only
+cloud AUROC stays at 0.49-0.51, selective at 0.50-0.52, random-K2 at
+0.49-0.52, G-PCC at 0.58-0.60. Category-OOD at 64 B: raw 0.567 / 0.608,
+constellation-only 0.494 / 0.622, selective 0.500 / 0.646, random-K2
+0.497 / 0.637, G-PCC 0.585 / 0.582 (cloud / point AUROC).
+
+Per defect type at 64 B (cloud / point AUROC): raw dent 0.57 / 0.65, bump
+0.56 / 0.66, hole 0.50 / 0.53, thin spur 0.70 / 0.75, surface noise
+0.54 / 0.69; constellation-only 0.49-0.52 cloud AUROC for every type
+(thin spur 0.52 / 0.69); selective 0.49-0.53 (thin spur 0.50 / 0.73); G-PCC
+dent 0.60, bump 0.60, thin spur 0.70, surface noise 0.60, hole 0.51. By
+defect size (cloud AUROC, raw -> constellation-only -> G-PCC): small 1-2 %
+0.54 -> 0.51 -> 0.57, medium 2-4 % 0.57 -> 0.49 -> 0.60, large 4-5 %
+0.63 -> 0.49 -> 0.64.
+
+### Gate G-C2
+
+Predeclared rule: selective pass-through must beat both the constellation-only
+and the random-K2 baselines on cloud and point AUROC with paired hierarchical
+bootstrap lower bounds above zero at the primary cell (validation, 64 B).
+
+| Comparison | Metric | Difference | 95 % CI | Positive |
+|---|---|---:|---|---|
+| selective - constellation-only | cloud AUROC | +0.004 | [-0.022, +0.032] | no |
+| selective - constellation-only | point AUROC | +0.051 | [+0.031, +0.072] | yes |
+| selective - random-K2 | cloud AUROC | +0.011 | [-0.006, +0.028] | no |
+| selective - random-K2 | point AUROC | +0.012 | [+0.006, +0.017] | yes |
+
+**G-C2 fails.** Selective pass-through does not recover cloud-level anomaly
+detection, and its point-level gain is reproduced by random preserved points
+(the +0.012 residual over random is real but an order of magnitude below the
+raw-versus-decode gap in the other direction). The epic's stop rule (Track C
+design note) also asked whether the premise itself holds: it does, weakly.
+Constellation-only decodes sit 7.5 cloud-AUROC points below raw (0.501 vs
+0.576) and at chance for every defect type and size, so the learned codec does
+erase whatever anomaly signal the detector can see, and G-PCC (which keeps
+points) does not. But the detector's ceiling on raw input is itself only
+0.576 cloud AUROC, so the benchmark as built cannot resolve differences among
+the learned arms; it is under-powered, not decisive.
+
+### Reading
+
+1. **The learned codec erases the anomaly signal; G-PCC preserves it.** At
+   every budget and for every defect type, constellation decodes are at chance
+   for cloud-level detection while G-PCC decodes match or exceed raw. This is
+   the structured-loss premise of Track C, observed directly, and it is the
+   most useful number this experiment produced.
+2. **Pass-through of a handful of raw points does not restore it.** Preserving
+   4-12 points of 2,048 lifts point AUROC because those points are themselves
+   irregular and get flagged, which random points reproduce; it does not make
+   the decoded *cloud* look anomalous. Combined with Experiment 040 this closes
+   selective point pass-through as the mechanism at 40-110 B.
+3. **The detector is the limiting factor.** A k-NN distance-to-normal-manifold
+   scorer reaches only 0.50-0.70 cloud AUROC on raw defected clouds (holes are
+   undetectable by construction: removing points leaves no off-manifold
+   points). The learned scorer (PointNet++/DGCNN per-point, stage 2 of #67)
+   and larger or real defects (MVTec 3D-AD / Real3D-AD, manifest hook present)
+   are required before "codecs erase anomalies" can be quantified precisely
+   enough to compare mechanisms; reading 1 is robust to this because it
+   compares each arm against the same detector.
+
+Timing (this run): encode 1,587 s constellation-only + 1,301 s selective +
+282 s G-PCC + 19 s random-K2; scorer inference 177 s; label transfer 28 s;
+point metrics 15 s. Artifacts:
+`artifacts/local/experiment_041_defect_anomaly/` on homen-linux
+(`defect_anomaly_metrics.json`, `defect_per_cloud.jsonl`, `run_manifest.json`).
