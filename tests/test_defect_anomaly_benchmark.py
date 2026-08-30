@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 from pointconstellation.codecs import GpccResult, GpccStreamBreakdown
 from pointconstellation.defect_anomaly_benchmark import (
@@ -20,6 +21,7 @@ from pointconstellation.defect_anomaly_benchmark import (
     KNNScorerConfig,
     PointCloudCodec,
     _decode_samples,
+    _transfer_point_labels_device,
     assert_matched_bytes,
     binary_auprc,
     binary_auroc,
@@ -38,6 +40,116 @@ def _sphere(count: int = 512) -> tuple[np.ndarray, np.ndarray]:
     radius = np.sqrt(1.0 - z * z)
     normals = np.column_stack((radius * np.cos(angle), radius * np.sin(angle), z))
     return (0.7 * normals).astype(np.float32), normals.astype(np.float32)
+
+
+def _reference_nearest_squared(
+    query: np.ndarray,
+    reference: np.ndarray,
+    *,
+    chunk_size: int,
+    neighbors: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    distances = np.empty(len(query), dtype=np.float64)
+    indices = np.empty(len(query), dtype=np.int64)
+    reference_norms = np.einsum("ij,ij->i", reference, reference)
+    for start in range(0, len(query), chunk_size):
+        stop = min(start + chunk_size, len(query))
+        rows = query[start:stop]
+        squared = (
+            np.einsum("ij,ij->i", rows, rows)[:, None]
+            + reference_norms[None]
+            - 2.0 * rows @ reference.T
+        )
+        np.maximum(squared, 0.0, out=squared)
+        selected = np.argmin(squared, axis=1)
+        nearest = np.partition(squared, neighbors - 1, axis=1)[:, :neighbors]
+        distances[start:stop] = nearest.mean(axis=1)
+        indices[start:stop] = selected
+    return distances, indices
+
+
+def _reference_score_points(
+    scorer: KNNNormalManifoldScorer, points: np.ndarray
+) -> np.ndarray:
+    query = np.asarray(points, dtype=np.float32)
+    query64 = query.astype(np.float64, copy=False)
+    candidate_scores = []
+    for candidate in scorer._candidate_indices(query):
+        reference = scorer._references[int(candidate)].astype(
+            np.float64, copy=False
+        )
+        forward, _ = _reference_nearest_squared(
+            query64,
+            reference,
+            chunk_size=scorer.config.distance_chunk_size,
+            neighbors=min(scorer.config.neighbors, len(reference)),
+        )
+        reverse, assigned = _reference_nearest_squared(
+            reference,
+            query64,
+            chunk_size=scorer.config.distance_chunk_size,
+            neighbors=min(scorer.config.neighbors, len(query64)),
+        )
+        attributed = np.zeros(len(query), dtype=np.float64)
+        np.maximum.at(attributed, assigned, reverse)
+        candidate_scores.append(np.sqrt(np.maximum(forward, attributed)))
+    return np.min(np.stack(candidate_scores), axis=0)
+
+
+def _reference_binary_auroc(labels: np.ndarray, scores: np.ndarray) -> float:
+    positives = int(labels.sum())
+    negatives = len(labels) - positives
+    if positives == 0 or negatives == 0:
+        return float("nan")
+    order = np.argsort(scores, kind="stable")
+    ranks = np.empty(len(scores), dtype=np.float64)
+    start = 0
+    while start < len(order):
+        stop = start + 1
+        while stop < len(order) and scores[order[stop]] == scores[order[start]]:
+            stop += 1
+        ranks[order[start:stop]] = 0.5 * (start + 1 + stop)
+        start = stop
+    rank_sum = float(ranks[labels == 1].sum())
+    return (rank_sum - positives * (positives + 1) / 2.0) / (
+        positives * negatives
+    )
+
+
+def _reference_binary_auprc(labels: np.ndarray, scores: np.ndarray) -> float:
+    positives = int(labels.sum())
+    if positives == 0:
+        return float("nan")
+    order = np.argsort(-scores, kind="stable")
+    true_positives = 0
+    predicted = 0
+    weighted_precision = 0.0
+    start = 0
+    while start < len(order):
+        stop = start + 1
+        while stop < len(order) and scores[order[stop]] == scores[order[start]]:
+            stop += 1
+        group_positives = int(labels[order[start:stop]].sum())
+        true_positives += group_positives
+        predicted += stop - start
+        weighted_precision += group_positives * true_positives / predicted
+        start = stop
+    return weighted_precision / positives
+
+
+def _reference_transfer_labels(
+    reference: np.ndarray, labels: np.ndarray, query: np.ndarray
+) -> np.ndarray:
+    reference64 = reference.astype(np.float64)
+    query64 = query.astype(np.float64)
+    canonical = np.lexsort(
+        (reference64[:, 2], reference64[:, 1], reference64[:, 0])
+    )
+    canonical_ranks = np.empty(len(reference), dtype=np.int64)
+    canonical_ranks[canonical] = np.arange(len(reference))
+    squared = np.sum((query64[:, None] - reference64[None]) ** 2, axis=2)
+    nearest = [np.lexsort((canonical_ranks, row))[0] for row in squared]
+    return labels[np.asarray(nearest)]
 
 
 def _near_boundary_planes(count: int) -> tuple[np.ndarray, np.ndarray]:
@@ -154,6 +266,76 @@ def test_binary_metrics_handle_ties_deterministically() -> None:
     assert binary_auroc(labels, scores) == 1.0
     assert binary_auprc(labels, scores) == 1.0
     assert np.isnan(binary_auroc([0, 0], [0.0, 1.0]))
+
+
+def test_optimized_scorer_transfer_and_metrics_match_reference_to_float64() -> None:
+    rng = np.random.default_rng(411_041)
+    references = [
+        rng.normal(size=(97, 3)).astype(np.float32) for _ in range(7)
+    ]
+    # Duplicates exercise exact distance ties in top-k and reverse attribution.
+    references[2][5] = references[2][1]
+    queries = [rng.normal(size=(83, 3)).astype(np.float32) for _ in range(4)]
+    queries[1][8] = queries[1][3]
+    scorer = KNNNormalManifoldScorer(
+        KNNScorerConfig(
+            neighbors=3,
+            points_per_reference=61,
+            maximum_reference_clouds=7,
+            cloud_candidates=3,
+            distance_chunk_size=17,
+        ),
+        seed=41,
+        device_name="cpu",
+    ).fit(references)
+
+    optimized_scores = scorer.score_points_batch(queries)
+    for query, optimized in zip(queries, optimized_scores, strict=True):
+        reference = _reference_score_points(scorer, query)
+        np.testing.assert_allclose(optimized, reference, rtol=0.0, atol=1e-9)
+
+    metric_cases = [
+        (
+            rng.integers(0, 2, size=257, dtype=np.uint8),
+            np.round(rng.normal(size=257), decimals=1),
+        ),
+        (np.zeros(19, dtype=np.uint8), np.ones(19)),
+        (np.ones(19, dtype=np.uint8), np.ones(19)),
+        (np.asarray([0, 1, 0, 1], dtype=np.uint8), np.zeros(4)),
+    ]
+    for labels, scores in metric_cases:
+        optimized_auroc = binary_auroc(labels, scores)
+        optimized_auprc = binary_auprc(labels, scores)
+        reference_auroc = _reference_binary_auroc(labels, scores)
+        reference_auprc = _reference_binary_auprc(labels, scores)
+        if np.isnan(reference_auroc):
+            assert np.isnan(optimized_auroc)
+        else:
+            assert optimized_auroc == pytest.approx(reference_auroc, abs=1e-9)
+        if np.isnan(reference_auprc):
+            assert np.isnan(optimized_auprc)
+        else:
+            assert optimized_auprc == pytest.approx(reference_auprc, abs=1e-9)
+
+    tie_reference = np.asarray(
+        [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=np.float32,
+    )
+    tie_labels = np.asarray([0, 1, 0], dtype=np.uint8)
+    tie_query = np.asarray(
+        [[0.0, 0.0, 0.0], [0.9, 0.0, 0.0]], dtype=np.float32
+    )
+    optimized_labels = _transfer_point_labels_device(
+        tie_reference,
+        tie_labels,
+        tie_query,
+        device=torch.device("cpu"),
+        chunk_size=1,
+    )
+    assert np.array_equal(
+        optimized_labels,
+        _reference_transfer_labels(tie_reference, tie_labels, tie_query),
+    )
 
 
 def test_matched_bytes_assertion_uses_actual_serialized_lengths() -> None:
@@ -556,6 +738,13 @@ def test_smoke_resume_restores_byte_identical_rows_and_reports_progress(
     assert any(
         row["stage"] == "resume" and row["resume"] for row in progress_lines
     )
+    scoring_progress = [
+        row for row in progress_lines if row["stage"] == "scoring"
+    ]
+    assert scoring_progress
+    assert scoring_progress[0]["resumed_scored_rows"] == len(lines) - 3
+    assert scoring_progress[-1]["done"] == scoring_progress[-1]["total"]
+    assert scoring_progress[-1]["persisted_path"] == str(rows_path)
     assert all(
         {"stage", "done", "total", "elapsed_seconds"} <= row.keys()
         for row in progress_lines
@@ -569,6 +758,9 @@ def test_smoke_resume_restores_byte_identical_rows_and_reports_progress(
     assert set(resumed_result["timing_breakdown"]) == {
         "defect_injection_seconds",
         "scorer_fitting_seconds",
+        "label_transfer_seconds",
+        "scorer_inference_seconds",
+        "point_metrics_seconds",
         "per_arm_encode_seconds",
         "per_arm_decode_seconds",
         "official_metrics_seconds",

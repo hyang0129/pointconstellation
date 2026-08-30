@@ -492,23 +492,23 @@ def transfer_point_labels(
     if chunk_size < 1:
         raise ValueError("chunk_size must be positive")
     transferred = np.empty(len(query), dtype=np.uint8)
-    reference_norms = np.einsum("ij,ij->i", reference, reference)
     canonical = np.lexsort((reference[:, 2], reference[:, 1], reference[:, 0]))
-    canonical_ranks = np.empty(len(reference), dtype=np.int64)
-    canonical_ranks[canonical] = np.arange(len(reference))
+    ordered_reference = reference[canonical]
+    ordered_labels = labels[canonical]
+    reference_norms = np.einsum(
+        "ij,ij->i", ordered_reference, ordered_reference
+    )
     for start in range(0, len(query), chunk_size):
         stop = min(start + chunk_size, len(query))
         values = query[start:stop]
         squared = (
             np.einsum("ij,ij->i", values, values)[:, None]
             + reference_norms[None]
-            - 2.0 * values @ reference.T
+            - 2.0 * values @ ordered_reference.T
         )
-        # argmin is stable for the canonical reference order; lexsort makes the
-        # tie behavior explicit for noncanonical caller inputs.
-        for offset, row in enumerate(squared):
-            nearest = np.lexsort((canonical_ranks, row))[0]
-            transferred[start + offset] = labels[nearest]
+        # NumPy argmin returns the first minimum, so canonical reference order
+        # preserves the explicit legacy tie break without a loop over points.
+        transferred[start:stop] = ordered_labels[np.argmin(squared, axis=1)]
     return transferred
 
 

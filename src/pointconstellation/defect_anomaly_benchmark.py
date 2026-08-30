@@ -21,7 +21,9 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
+import torch
 from numpy.typing import ArrayLike, NDArray
+from torch import Tensor
 
 from pointconstellation.bitstream import (
     MODE_FIXED,
@@ -35,7 +37,6 @@ from pointconstellation.defects import (
     DefectInjectionConfig,
     inject_defect_for_cloud,
     size_stratum,
-    transfer_point_labels,
 )
 
 FloatArray = NDArray[np.float32]
@@ -47,6 +48,9 @@ EXPERIMENT_040_SCORE_METHODS = (
     "boundary",
 )
 RUN_MANIFEST_SCHEMA_VERSION = 2
+CPU_SCORING_BATCH_SIZE = 8
+ACCELERATOR_SCORING_BATCH_SIZE = 16
+BOOTSTRAP_BATCH_SIZE = 256
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -548,10 +552,13 @@ def _load_incremental_rows(path: Path) -> list[ScoredCloud]:
     return rows
 
 
-def _append_incremental_row(handle: Any, row: ScoredCloud) -> None:
+def _append_incremental_row(
+    handle: Any, row: ScoredCloud, *, sync: bool = True
+) -> None:
     handle.write(json.dumps(asdict(row)) + "\n")
-    handle.flush()
-    os.fsync(handle.fileno())
+    if sync:
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _point_array(points: ArrayLike) -> FloatArray:
@@ -580,35 +587,176 @@ def _cloud_descriptor(points: FloatArray) -> NDArray[np.float64]:
     )
 
 
-def _nearest_squared(
-    query: NDArray[np.float64],
-    reference: NDArray[np.float64],
+def _distance_dtype(device: torch.device) -> torch.dtype:
+    # MPS has no float64 kernels. CUDA and CPU retain the legacy float64
+    # distance arithmetic so persisted scientific results remain equivalent.
+    return torch.float32 if device.type == "mps" else torch.float64
+
+
+def _bidirectional_candidate_neighbors(
+    queries: Tensor,
+    references: Tensor,
     *,
+    neighbors: int,
     chunk_size: int,
-    neighbors: int = 1,
-) -> tuple[NDArray[np.float64], NDArray[np.int64]]:
-    if not 1 <= neighbors <= len(reference):
-        raise ValueError("neighbors must be in [1, number of reference points]")
-    distances = np.empty(len(query), dtype=np.float64)
-    indices = np.empty(len(query), dtype=np.int64)
-    reference_norms = np.einsum("ij,ij->i", reference, reference)
-    for start in range(0, len(query), chunk_size):
-        stop = min(start + chunk_size, len(query))
-        rows = query[start:stop]
-        squared = (
-            np.einsum("ij,ij->i", rows, rows)[:, None]
-            + reference_norms[None]
-            - 2.0 * rows @ reference.T
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Find aligned forward/reverse neighbors in one chunked distance sweep."""
+
+    if queries.ndim != 3 or references.ndim != 3:
+        raise ValueError("batched point tensors must have shape (B, N, 3)")
+    if queries.shape[0] != references.shape[0] or queries.shape[2] != 3:
+        raise ValueError("query/reference batches must align and contain xyz points")
+    query_count = queries.shape[1]
+    reference_count = references.shape[1]
+    forward_neighbors = min(neighbors, reference_count)
+    reverse_neighbors = min(neighbors, query_count)
+    batch = queries.shape[0]
+    forward_indices = torch.empty(
+        (batch, query_count, forward_neighbors),
+        dtype=torch.long,
+        device=queries.device,
+    )
+    reverse_topk = torch.full(
+        (batch, reference_count, reverse_neighbors),
+        torch.inf,
+        dtype=queries.dtype,
+        device=queries.device,
+    )
+    reverse_indices = torch.zeros(
+        (batch, reference_count, reverse_neighbors),
+        dtype=torch.long,
+        device=queries.device,
+    )
+    reverse_minimum = torch.full(
+        (batch, reference_count),
+        torch.inf,
+        dtype=queries.dtype,
+        device=queries.device,
+    )
+    reverse_assignment = torch.zeros(
+        (batch, reference_count), dtype=torch.long, device=queries.device
+    )
+    for start in range(0, query_count, chunk_size):
+        stop = min(start + chunk_size, query_count)
+        # The squared matrix serves both directions. The legacy implementation
+        # formed this same matrix twice for every candidate cloud.
+        squared = torch.cdist(
+            queries[:, start:stop],
+            references,
+            p=2.0,
+            compute_mode="use_mm_for_euclid_dist",
+        ).square_()
+        forward_indices[:, start:stop] = torch.topk(
+            squared,
+            forward_neighbors,
+            dim=2,
+            largest=False,
+            sorted=False,
+        ).indices
+
+        transposed = squared.transpose(1, 2)
+        local_reverse = torch.topk(
+            transposed,
+            min(reverse_neighbors, stop - start),
+            dim=2,
+            largest=False,
+            sorted=False,
         )
-        np.maximum(squared, 0.0, out=squared)
-        selected = np.argmin(squared, axis=1)
-        if neighbors == 1:
-            distances[start:stop] = squared[np.arange(len(rows)), selected]
-        else:
-            nearest = np.partition(squared, neighbors - 1, axis=1)[:, :neighbors]
-            distances[start:stop] = nearest.mean(axis=1)
-        indices[start:stop] = selected
-    return distances, indices
+        combined_values = torch.cat((reverse_topk, local_reverse.values), dim=2)
+        combined_indices = torch.cat(
+            (reverse_indices, local_reverse.indices + start), dim=2
+        )
+        selected = torch.topk(
+            combined_values,
+            reverse_neighbors,
+            dim=2,
+            largest=False,
+            sorted=False,
+        )
+        reverse_topk = selected.values
+        reverse_indices = torch.gather(combined_indices, 2, selected.indices)
+        local_minimum, local_assignment = transposed.min(dim=2)
+        improved = local_minimum < reverse_minimum
+        reverse_minimum = torch.where(improved, local_minimum, reverse_minimum)
+        reverse_assignment = torch.where(
+            improved, local_assignment + start, reverse_assignment
+        )
+
+    return forward_indices, reverse_indices, reverse_assignment
+
+
+def _exact_candidate_scores(
+    query: FloatArray,
+    reference: FloatArray,
+    forward_indices: NDArray[np.int64],
+    reverse_indices: NDArray[np.int64],
+    reverse_assignment: NDArray[np.int64],
+) -> NDArray[np.float64]:
+    """Re-evaluate only selected neighbors with the legacy float64 arithmetic."""
+
+    query64 = query.astype(np.float64, copy=False)
+    reference64 = reference.astype(np.float64, copy=False)
+    query_norms = np.einsum("ij,ij->i", query64, query64)
+    reference_norms = np.einsum("ij,ij->i", reference64, reference64)
+    forward_points = reference64[forward_indices]
+    forward = (
+        query_norms[:, None]
+        + reference_norms[forward_indices]
+        - 2.0 * np.sum(query64[:, None] * forward_points, axis=2)
+    )
+    np.maximum(forward, 0.0, out=forward)
+    forward = forward.mean(axis=1)
+
+    reverse_points = query64[reverse_indices]
+    reverse = (
+        reference_norms[:, None]
+        + query_norms[reverse_indices]
+        - 2.0 * np.sum(reference64[:, None] * reverse_points, axis=2)
+    )
+    np.maximum(reverse, 0.0, out=reverse)
+    attributed = np.zeros(len(query64), dtype=np.float64)
+    np.maximum.at(attributed, reverse_assignment, reverse.mean(axis=1))
+    return np.sqrt(np.maximum(forward, attributed))
+
+
+def _transfer_point_labels_device(
+    reference_points: ArrayLike,
+    reference_labels: ArrayLike,
+    query_points: ArrayLike,
+    *,
+    device: torch.device,
+    chunk_size: int,
+) -> NDArray[np.uint8]:
+    """Transfer labels with chunked device distances and canonical tie breaks."""
+
+    reference = _point_array(reference_points)
+    query = _point_array(query_points)
+    labels = np.asarray(reference_labels, dtype=np.uint8)
+    if labels.shape != (len(reference),) or np.any((labels != 0) & (labels != 1)):
+        raise ValueError("reference labels must be binary and align with points")
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be positive")
+    canonical = np.lexsort((reference[:, 2], reference[:, 1], reference[:, 0]))
+    ordered_reference = reference[canonical]
+    ordered_labels = labels[canonical]
+    dtype = _distance_dtype(device)
+    reference_tensor = torch.as_tensor(
+        ordered_reference, dtype=dtype, device=device
+    ).unsqueeze(0)
+    query_tensor = torch.as_tensor(query, dtype=dtype, device=device).unsqueeze(0)
+    nearest_parts = []
+    with torch.inference_mode():
+        for start in range(0, len(query), chunk_size):
+            stop = min(start + chunk_size, len(query))
+            distances = torch.cdist(
+                query_tensor[:, start:stop],
+                reference_tensor,
+                p=2.0,
+                compute_mode="use_mm_for_euclid_dist",
+            )
+            nearest_parts.append(distances.argmin(dim=2).squeeze(0).cpu())
+    nearest = torch.cat(nearest_parts).numpy()
+    return ordered_labels[nearest]
 
 
 class KNNNormalManifoldScorer:
@@ -620,12 +768,22 @@ class KNNNormalManifoldScorer:
     makes missing geometry such as a hole observable on a returned point set.
     """
 
-    def __init__(self, config: KNNScorerConfig | None = None, *, seed: int = 0) -> None:
+    def __init__(
+        self,
+        config: KNNScorerConfig | None = None,
+        *,
+        seed: int = 0,
+        device_name: str = "cpu",
+    ) -> None:
         if seed < 0:
             raise ValueError("scorer seed must be nonnegative")
+        if device_name not in {"cpu", "mps", "cuda"}:
+            raise ValueError("scorer device must be cpu, mps, or cuda")
         self.config = config or KNNScorerConfig()
         self.seed = seed
+        self.device = torch.device(device_name)
         self._references: tuple[FloatArray, ...] = ()
+        self._reference_tensors: tuple[Tensor, ...] = ()
         self._descriptors: NDArray[np.float64] | None = None
 
     @property
@@ -662,6 +820,11 @@ class KNNNormalManifoldScorer:
             references.append(points.copy())
         self._references = tuple(references)
         self._descriptors = np.stack([_cloud_descriptor(row) for row in references])
+        dtype = _distance_dtype(self.device)
+        self._reference_tensors = tuple(
+            torch.as_tensor(row, dtype=dtype, device=self.device)
+            for row in references
+        )
         return self
 
     def _candidate_indices(self, points: FloatArray) -> NDArray[np.int64]:
@@ -672,34 +835,83 @@ class KNNNormalManifoldScorer:
         count = min(self.config.cloud_candidates, len(distances))
         return np.argsort(distances, kind="stable")[:count].astype(np.int64)
 
+    def score_points_batch(
+        self, point_clouds: Sequence[ArrayLike]
+    ) -> list[NDArray[np.float64]]:
+        """Return point scores for a device-batched sequence of decoded clouds."""
+
+        if not point_clouds:
+            return []
+        queries = [_point_array(points) for points in point_clouds]
+        candidates = [self._candidate_indices(query) for query in queries]
+        outputs = [np.full(len(query), np.inf, dtype=np.float64) for query in queries]
+        tasks_by_shape: dict[tuple[int, int], list[tuple[int, int]]] = {}
+        for query_index, candidate_rows in enumerate(candidates):
+            for candidate in candidate_rows:
+                reference_index = int(candidate)
+                shape = (
+                    len(queries[query_index]),
+                    len(self._references[reference_index]),
+                )
+                tasks_by_shape.setdefault(shape, []).append(
+                    (query_index, reference_index)
+                )
+
+        row_batch_size = (
+            CPU_SCORING_BATCH_SIZE
+            if self.device.type == "cpu"
+            else ACCELERATOR_SCORING_BATCH_SIZE
+        )
+        candidate_batch_size = row_batch_size * self.config.cloud_candidates
+        dtype = _distance_dtype(self.device)
+        with torch.inference_mode():
+            for tasks in tasks_by_shape.values():
+                for start in range(0, len(tasks), candidate_batch_size):
+                    batch_tasks = tasks[start : start + candidate_batch_size]
+                    query_tensor = torch.stack(
+                        [
+                            torch.as_tensor(
+                                queries[query_index], dtype=dtype, device=self.device
+                            )
+                            for query_index, _ in batch_tasks
+                        ]
+                    )
+                    reference_tensor = torch.stack(
+                        [
+                            self._reference_tensors[reference_index]
+                            for _, reference_index in batch_tasks
+                        ]
+                    )
+                    neighbor_tensors = _bidirectional_candidate_neighbors(
+                        query_tensor,
+                        reference_tensor,
+                        neighbors=self.config.neighbors,
+                        chunk_size=self.config.distance_chunk_size,
+                    )
+                    neighbor_arrays = tuple(
+                        tensor.cpu().numpy() for tensor in neighbor_tensors
+                    )
+                    for task_index, task in enumerate(batch_tasks):
+                        query_index, reference_index = task
+                        scores = _exact_candidate_scores(
+                            queries[query_index],
+                            self._references[reference_index],
+                            neighbor_arrays[0][task_index],
+                            neighbor_arrays[1][task_index],
+                            neighbor_arrays[2][task_index],
+                        )
+                        np.minimum(
+                            outputs[query_index], scores, out=outputs[query_index]
+                        )
+        for scores in outputs:
+            if not np.isfinite(scores).all():
+                raise RuntimeError("normal-manifold scorer produced a non-finite score")
+        return outputs
+
     def score_points(self, points: ArrayLike) -> NDArray[np.float64]:
         """Return per-point distance to the selected finite normal manifolds."""
 
-        query = _point_array(points)
-        query64 = query.astype(np.float64, copy=False)
-        candidates = self._candidate_indices(query)
-        candidate_scores = []
-        for candidate in candidates:
-            reference = self._references[int(candidate)].astype(np.float64, copy=False)
-            forward, _ = _nearest_squared(
-                query64,
-                reference,
-                chunk_size=self.config.distance_chunk_size,
-                neighbors=min(self.config.neighbors, len(reference)),
-            )
-            reverse, assigned = _nearest_squared(
-                reference,
-                query64,
-                chunk_size=self.config.distance_chunk_size,
-                neighbors=min(self.config.neighbors, len(query64)),
-            )
-            attributed = np.zeros(len(query), dtype=np.float64)
-            np.maximum.at(attributed, assigned, reverse)
-            candidate_scores.append(np.sqrt(np.maximum(forward, attributed)))
-        scores = np.min(np.stack(candidate_scores), axis=0)
-        if not np.isfinite(scores).all():
-            raise RuntimeError("normal-manifold scorer produced a non-finite score")
-        return scores
+        return self.score_points_batch([points])[0]
 
     def score_cloud(self, points: ArrayLike) -> float:
         scores = self.score_points(points)
@@ -707,59 +919,125 @@ class KNNNormalManifoldScorer:
         return float(np.partition(scores, len(scores) - count)[-count:].mean())
 
 
-def binary_auroc(labels: ArrayLike, scores: ArrayLike) -> float:
-    """Compute tie-correct binary AUROC without a third-party dependency."""
+def _binary_metrics_matrix(
+    labels: NDArray[np.uint8],
+    scores: NDArray[np.float64],
+    valid: NDArray[np.bool_],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Vectorized tie-correct AUROC and grouped-threshold average precision."""
 
-    target = np.asarray(labels, dtype=np.uint8).reshape(-1)
-    values = np.asarray(scores, dtype=np.float64).reshape(-1)
-    if len(target) != len(values) or not len(target):
+    if labels.ndim != 2 or scores.shape != labels.shape or valid.shape != labels.shape:
+        raise ValueError("batched labels, scores, and masks must have equal 2-D shapes")
+    if labels.shape[1] == 0:
+        raise ValueError("binary metric rows must be nonempty")
+    if np.any(((labels != 0) & (labels != 1)) & valid):
+        raise ValueError("binary metrics require binary labels")
+    if not np.isfinite(scores[valid]).all():
+        raise ValueError("binary metrics require finite scores")
+    row_indices = np.arange(len(labels))[:, None]
+    positions = np.arange(labels.shape[1])[None, :]
+
+    ascending_values = np.where(valid, scores, np.inf)
+    ascending_order = np.argsort(ascending_values, axis=1, kind="stable")
+    sorted_values = ascending_values[row_indices, ascending_order]
+    sorted_labels = labels[row_indices, ascending_order]
+    sorted_valid = valid[row_indices, ascending_order]
+    group_start = sorted_valid.copy()
+    group_start[:, 1:] &= (~sorted_valid[:, :-1]) | (
+        sorted_values[:, 1:] != sorted_values[:, :-1]
+    )
+    group_end = sorted_valid.copy()
+    group_end[:, :-1] &= (~sorted_valid[:, 1:]) | (
+        sorted_values[:, :-1] != sorted_values[:, 1:]
+    )
+    start_positions = np.maximum.accumulate(
+        np.where(group_start, positions, 0), axis=1
+    )
+    end_positions = np.minimum.accumulate(
+        np.where(group_end, positions, labels.shape[1] - 1)[:, ::-1], axis=1
+    )[:, ::-1]
+    average_ranks = 0.5 * (start_positions + end_positions + 2.0)
+    positives = np.sum(labels * valid, axis=1, dtype=np.int64)
+    counts = valid.sum(axis=1, dtype=np.int64)
+    negatives = counts - positives
+    positive_ranks = np.sum(
+        average_ranks * sorted_labels * sorted_valid, axis=1, dtype=np.float64
+    )
+    auroc = np.full(len(labels), np.nan, dtype=np.float64)
+    eligible_auroc = (positives > 0) & (negatives > 0)
+    auroc[eligible_auroc] = (
+        positive_ranks[eligible_auroc]
+        - positives[eligible_auroc] * (positives[eligible_auroc] + 1) / 2.0
+    ) / (positives[eligible_auroc] * negatives[eligible_auroc])
+
+    descending_values = np.where(valid, scores, -np.inf)
+    descending_order = np.argsort(-descending_values, axis=1, kind="stable")
+    sorted_values = descending_values[row_indices, descending_order]
+    sorted_labels = labels[row_indices, descending_order]
+    sorted_valid = valid[row_indices, descending_order]
+    group_start = sorted_valid.copy()
+    group_start[:, 1:] &= (~sorted_valid[:, :-1]) | (
+        sorted_values[:, 1:] != sorted_values[:, :-1]
+    )
+    group_end = sorted_valid.copy()
+    group_end[:, :-1] &= (~sorted_valid[:, 1:]) | (
+        sorted_values[:, :-1] != sorted_values[:, 1:]
+    )
+    start_positions = np.maximum.accumulate(
+        np.where(group_start, positions, 0), axis=1
+    )
+    cumulative_positives = np.cumsum(sorted_labels * sorted_valid, axis=1)
+    before_indices = np.maximum(start_positions - 1, 0)
+    before_group = np.take_along_axis(
+        cumulative_positives, before_indices, axis=1
+    )
+    before_group[start_positions == 0] = 0
+    group_positives = cumulative_positives - before_group
+    precision = cumulative_positives / (positions + 1)
+    weighted_precision = np.sum(
+        np.where(group_end, group_positives * precision, 0.0),
+        axis=1,
+        dtype=np.float64,
+    )
+    auprc = np.full(len(labels), np.nan, dtype=np.float64)
+    eligible_auprc = positives > 0
+    auprc[eligible_auprc] = (
+        weighted_precision[eligible_auprc] / positives[eligible_auprc]
+    )
+    return auroc, auprc
+
+
+def _binary_metrics_batch(
+    labels: Sequence[ArrayLike], scores: Sequence[ArrayLike]
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    if len(labels) != len(scores) or not labels:
         raise ValueError("labels and scores must be nonempty and aligned")
-    if np.any((target != 0) & (target != 1)) or not np.isfinite(values).all():
-        raise ValueError("AUROC requires binary labels and finite scores")
-    positives = int(target.sum())
-    negatives = len(target) - positives
-    if positives == 0 or negatives == 0:
-        return float("nan")
-    order = np.argsort(values, kind="stable")
-    ranks = np.empty(len(values), dtype=np.float64)
-    start = 0
-    while start < len(order):
-        stop = start + 1
-        while stop < len(order) and values[order[stop]] == values[order[start]]:
-            stop += 1
-        ranks[order[start:stop]] = 0.5 * (start + 1 + stop)
-        start = stop
-    rank_sum = float(ranks[target == 1].sum())
-    return (rank_sum - positives * (positives + 1) / 2.0) / (positives * negatives)
+    targets = [np.asarray(row, dtype=np.uint8).reshape(-1) for row in labels]
+    values = [np.asarray(row, dtype=np.float64).reshape(-1) for row in scores]
+    pairs = zip(targets, values, strict=True)
+    if any(len(target) != len(value) or not len(target) for target, value in pairs):
+        raise ValueError("labels and scores must be nonempty and aligned")
+    maximum = max(map(len, targets))
+    target_matrix = np.zeros((len(targets), maximum), dtype=np.uint8)
+    score_matrix = np.zeros((len(targets), maximum), dtype=np.float64)
+    valid = np.zeros((len(targets), maximum), dtype=bool)
+    for index, (target, value) in enumerate(zip(targets, values, strict=True)):
+        target_matrix[index, : len(target)] = target
+        score_matrix[index, : len(value)] = value
+        valid[index, : len(target)] = True
+    return _binary_metrics_matrix(target_matrix, score_matrix, valid)
+
+
+def binary_auroc(labels: ArrayLike, scores: ArrayLike) -> float:
+    """Compute vectorized tie-correct binary AUROC."""
+
+    return float(_binary_metrics_batch([labels], [scores])[0][0])
 
 
 def binary_auprc(labels: ArrayLike, scores: ArrayLike) -> float:
-    """Compute grouped-threshold binary average precision."""
+    """Compute vectorized grouped-threshold binary average precision."""
 
-    target = np.asarray(labels, dtype=np.uint8).reshape(-1)
-    values = np.asarray(scores, dtype=np.float64).reshape(-1)
-    if len(target) != len(values) or not len(target):
-        raise ValueError("labels and scores must be nonempty and aligned")
-    if np.any((target != 0) & (target != 1)) or not np.isfinite(values).all():
-        raise ValueError("AUPRC requires binary labels and finite scores")
-    positives = int(target.sum())
-    if positives == 0:
-        return float("nan")
-    order = np.argsort(-values, kind="stable")
-    true_positives = 0
-    predicted = 0
-    weighted_precision = 0.0
-    start = 0
-    while start < len(order):
-        stop = start + 1
-        while stop < len(order) and values[order[stop]] == values[order[start]]:
-            stop += 1
-        group_positives = int(target[order[start:stop]].sum())
-        true_positives += group_positives
-        predicted += stop - start
-        weighted_precision += group_positives * true_positives / predicted
-        start = stop
-    return weighted_precision / positives
+    return float(_binary_metrics_batch([labels], [scores])[1][0])
 
 
 def assert_matched_bytes(
@@ -1246,10 +1524,12 @@ def _decode_samples(
                 if not consistent:
                     raise RuntimeError("codec returned inconsistent byte accounting")
             reconstructed = _point_array(arm.codec.decode(stream))
-            labels = transfer_point_labels(
+            labels = _transfer_point_labels_device(
                 sample.points,
                 sample.point_labels,
                 reconstructed,
+                device=torch.device("cpu"),
+                chunk_size=512,
             )
             decoded.append(
                 DecodedCloud(
@@ -1285,75 +1565,33 @@ def _score_decodes(
     normal_training: Sequence[FloatArray],
     decoded: Sequence[DecodedCloud],
     config: DefectAnomalyBenchmarkConfig,
+    *,
+    device_name: str = "cpu",
 ) -> list[ScoredCloud]:
     rows = []
     for scorer_seed in config.scorer_seeds:
-        scorer = KNNNormalManifoldScorer(config.scorer, seed=scorer_seed).fit(
-            normal_training
+        scorer = KNNNormalManifoldScorer(
+            config.scorer, seed=scorer_seed, device_name=device_name
+        ).fit(normal_training)
+        rows.extend(
+            _score_decode_batch(
+                decoded,
+                scorer_seed=scorer_seed,
+                scorer=scorer,
+                config=config,
+            )
         )
-        for row in decoded:
-            scores = scorer.score_points(row.decoded_points)
-            tail_count = max(
-                1, int(math.ceil(config.scorer.tail_fraction * len(scores)))
-            )
-            cloud_score = float(
-                np.partition(scores, len(scores) - tail_count)[-tail_count:].mean()
-            )
-            has_both_labels = (
-                0 < int(row.decoded_labels.sum()) < len(row.decoded_labels)
-            )
-            rows.append(
-                ScoredCloud(
-                    scorer_seed=scorer_seed,
-                    split=row.sample.split,
-                    cloud_id=row.sample.cloud_id,
-                    category=row.sample.category,
-                    defect_type=row.sample.defect_type,
-                    size_stratum=row.sample.size_stratum,
-                    declared_fraction=row.sample.declared_fraction,
-                    domain_scale_factor=row.sample.domain_scale_factor,
-                    cloud_label=row.sample.cloud_label,
-                    arm=row.arm,
-                    payload_budget_bytes=row.payload_budget_bytes,
-                    target_bytes=row.target_bytes,
-                    stream_bytes=row.stream_bytes,
-                    stream_sha256=row.stream_sha256,
-                    codec_header_bytes=row.codec_header_bytes,
-                    codec_payload_bytes=row.codec_payload_bytes,
-                    payload_byte_delta=row.payload_byte_delta,
-                    complete_stream_byte_delta=row.complete_stream_byte_delta,
-                    codec_rate_point=row.codec_rate_point,
-                    decoded_point_count=len(row.decoded_points),
-                    defective_point_count=int(row.decoded_labels.sum()),
-                    cloud_score=cloud_score,
-                    point_auroc=(
-                        binary_auroc(row.decoded_labels, scores)
-                        if has_both_labels
-                        else None
-                    ),
-                    point_auprc=(
-                        binary_auprc(row.decoded_labels, scores)
-                        if has_both_labels
-                        else None
-                    ),
-                )
-            )
     return rows
 
 
-def _score_decode(
+def _scored_cloud(
     row: DecodedCloud,
     *,
     scorer_seed: int,
-    scorer: KNNNormalManifoldScorer,
-    config: DefectAnomalyBenchmarkConfig,
+    cloud_score: float,
+    point_auroc: float | None,
+    point_auprc: float | None,
 ) -> ScoredCloud:
-    scores = scorer.score_points(row.decoded_points)
-    tail_count = max(1, int(math.ceil(config.scorer.tail_fraction * len(scores))))
-    cloud_score = float(
-        np.partition(scores, len(scores) - tail_count)[-tail_count:].mean()
-    )
-    has_both_labels = 0 < int(row.decoded_labels.sum()) < len(row.decoded_labels)
     return ScoredCloud(
         scorer_seed=scorer_seed,
         split=row.sample.split,
@@ -1377,13 +1615,69 @@ def _score_decode(
         decoded_point_count=len(row.decoded_points),
         defective_point_count=int(row.decoded_labels.sum()),
         cloud_score=cloud_score,
-        point_auroc=(
-            binary_auroc(row.decoded_labels, scores) if has_both_labels else None
-        ),
-        point_auprc=(
-            binary_auprc(row.decoded_labels, scores) if has_both_labels else None
-        ),
+        point_auroc=point_auroc,
+        point_auprc=point_auprc,
     )
+
+
+def _score_decode_batch(
+    decoded: Sequence[DecodedCloud],
+    *,
+    scorer_seed: int,
+    scorer: KNNNormalManifoldScorer,
+    config: DefectAnomalyBenchmarkConfig,
+    timing: dict[str, Any] | None = None,
+) -> list[ScoredCloud]:
+    if not decoded:
+        return []
+    scorer_started = time.perf_counter()
+    point_scores = scorer.score_points_batch(
+        [row.decoded_points for row in decoded]
+    )
+    if timing is not None:
+        timing["scorer_inference_seconds"] += time.perf_counter() - scorer_started
+
+    metric_started = time.perf_counter()
+    aurocs, auprcs = _binary_metrics_batch(
+        [row.decoded_labels for row in decoded], point_scores
+    )
+    rows = []
+    for row, scores, auroc, auprc in zip(
+        decoded, point_scores, aurocs, auprcs, strict=True
+    ):
+        tail_count = max(
+            1, int(math.ceil(config.scorer.tail_fraction * len(scores)))
+        )
+        cloud_score = float(
+            np.partition(scores, len(scores) - tail_count)[-tail_count:].mean()
+        )
+        has_both_labels = 0 < int(row.decoded_labels.sum()) < len(
+            row.decoded_labels
+        )
+        rows.append(
+            _scored_cloud(
+                row,
+                scorer_seed=scorer_seed,
+                cloud_score=cloud_score,
+                point_auroc=float(auroc) if has_both_labels else None,
+                point_auprc=float(auprc) if has_both_labels else None,
+            )
+        )
+    if timing is not None:
+        timing["point_metrics_seconds"] += time.perf_counter() - metric_started
+    return rows
+
+
+def _score_decode(
+    row: DecodedCloud,
+    *,
+    scorer_seed: int,
+    scorer: KNNNormalManifoldScorer,
+    config: DefectAnomalyBenchmarkConfig,
+) -> ScoredCloud:
+    return _score_decode_batch(
+        [row], scorer_seed=scorer_seed, scorer=scorer, config=config
+    )[0]
 
 
 def _raw_decode(sample: BenchmarkCloud) -> DecodedCloud:
@@ -1409,6 +1703,7 @@ def _coded_decode(
     arm: CodecArm,
     *,
     expected_point_count: int,
+    device: torch.device,
     timing: dict[str, Any],
 ) -> DecodedCloud:
     if len(sample.points) != expected_point_count:
@@ -1464,14 +1759,18 @@ def _coded_decode(
             raise RuntimeError("codec returned inconsistent byte accounting")
     decode_started = time.perf_counter()
     reconstructed = _point_array(arm.codec.decode(stream))
-    labels = transfer_point_labels(
-        sample.points,
-        sample.point_labels,
-        reconstructed,
-    )
     timing["per_arm_decode_seconds"][arm.name] += (
         time.perf_counter() - decode_started
     )
+    transfer_started = time.perf_counter()
+    labels = _transfer_point_labels_device(
+        sample.points,
+        sample.point_labels,
+        reconstructed,
+        device=device,
+        chunk_size=512,
+    )
+    timing["label_transfer_seconds"] += time.perf_counter() - transfer_started
     return DecodedCloud(
         sample=sample,
         arm=arm.name,
@@ -1616,6 +1915,7 @@ def _evaluate_incrementally(
     arms: Sequence[CodecArm],
     config: DefectAnomalyBenchmarkConfig,
     *,
+    device_name: str,
     output_dir: Path,
     resume: bool,
     progress: _ProgressReporter,
@@ -1658,7 +1958,7 @@ def _evaluate_incrementally(
         for index, scorer_seed in enumerate(config.scorer_seeds, start=1):
             fit_started = time.perf_counter()
             scorers[scorer_seed] = KNNNormalManifoldScorer(
-                config.scorer, seed=scorer_seed
+                config.scorer, seed=scorer_seed, device_name=device_name
             ).fit(normal_training)
             timing["scorer_fitting_seconds"] += time.perf_counter() - fit_started
             progress.emit(
@@ -1675,7 +1975,97 @@ def _evaluate_incrementally(
             skipped=True,
         )
 
+    progress.emit(
+        "scoring",
+        len(loaded),
+        len(expected_keys),
+        resumed_scored_rows=len(loaded),
+        persisted_path=str(path),
+    )
+    scoring_batch_size = (
+        CPU_SCORING_BATCH_SIZE
+        if device_name == "cpu"
+        else ACCELERATOR_SCORING_BATCH_SIZE
+    )
+    decoded_batch: list[
+        tuple[
+            int,
+            BenchmarkCloud,
+            CodecArm | None,
+            DecodedCloud,
+            list[ScoredRowKey],
+        ]
+    ] = []
+
     with path.open("a") as handle:
+        def flush_scoring_batch() -> None:
+            if not decoded_batch:
+                return
+            produced: dict[ScoredRowKey, ScoredCloud] = {}
+            metric_started = time.perf_counter()
+            for scorer_seed in config.scorer_seeds:
+                seed_decoded = []
+                seed_keys = []
+                for _, _, _, decoded, unit_keys in decoded_batch:
+                    key = unit_keys[config.scorer_seeds.index(scorer_seed)]
+                    if key not in rows_by_key:
+                        seed_decoded.append(decoded)
+                        seed_keys.append(key)
+                seed_rows = _score_decode_batch(
+                    seed_decoded,
+                    scorer_seed=scorer_seed,
+                    scorer=scorers[scorer_seed],
+                    config=config,
+                    timing=timing,
+                )
+                produced.update(zip(seed_keys, seed_rows, strict=True))
+            timing["official_metrics_seconds"] += (
+                time.perf_counter() - metric_started
+            )
+
+            for _, _, _, _, unit_keys in decoded_batch:
+                for key in unit_keys:
+                    if key in rows_by_key:
+                        continue
+                    row = produced[key]
+                    _append_incremental_row(handle, row, sync=False)
+                    rows_by_key[key] = row
+            # Commit one canonical scored-row batch before reporting it done.
+            # A crash can lose at most the active batch; every earlier scoring
+            # progress count is durable and resumes without scorer work.
+            handle.flush()
+            os.fsync(handle.fileno())
+            for unit_index, sample, arm, _, _ in decoded_batch:
+                progress.emit(
+                    "evaluation",
+                    unit_index,
+                    len(units),
+                    split=sample.split,
+                    cloud_id=sample.cloud_id,
+                    defect_type=sample.defect_type,
+                    arm="raw" if arm is None else arm.name,
+                    payload_budget_bytes=(
+                        None if arm is None else arm.payload_budget_bytes
+                    ),
+                )
+            last_index, last_sample, last_arm, _, _ = decoded_batch[-1]
+            progress.emit(
+                "scoring",
+                len(rows_by_key),
+                len(expected_keys),
+                batch_units=len(decoded_batch),
+                through_evaluation_unit=last_index,
+                split=last_sample.split,
+                cloud_id=last_sample.cloud_id,
+                defect_type=last_sample.defect_type,
+                arm="raw" if last_arm is None else last_arm.name,
+                payload_budget_bytes=(
+                    None if last_arm is None else last_arm.payload_budget_bytes
+                ),
+                persisted_path=str(path),
+            )
+            decoded_batch.clear()
+
         for unit_index, (sample, arm) in enumerate(units, start=1):
             unit = _unit_identity(sample, arm)
             unit_keys = [(seed, *unit) for seed in config.scorer_seeds]
@@ -1705,38 +2095,15 @@ def _evaluate_incrementally(
                     sample,
                     arm,
                     expected_point_count=config.num_points,
+                    device=torch.device(device_name),
                     timing=timing,
                 )
-            for scorer_seed, key in zip(
-                config.scorer_seeds, unit_keys, strict=True
-            ):
-                if key in rows_by_key:
-                    continue
-                metric_started = time.perf_counter()
-                row = _score_decode(
-                    decoded,
-                    scorer_seed=scorer_seed,
-                    scorer=scorers[scorer_seed],
-                    config=config,
-                )
-                timing["official_metrics_seconds"] += (
-                    time.perf_counter() - metric_started
-                )
-                _append_incremental_row(handle, row)
-                rows_by_key[key] = row
-            completed_units = unit_index
-            progress.emit(
-                "evaluation",
-                completed_units,
-                len(units),
-                split=sample.split,
-                cloud_id=sample.cloud_id,
-                defect_type=sample.defect_type,
-                arm="raw" if arm is None else arm.name,
-                payload_budget_bytes=(
-                    None if arm is None else arm.payload_budget_bytes
-                ),
+            decoded_batch.append(
+                (unit_index, sample, arm, decoded, unit_keys)
             )
+            if len(decoded_batch) >= scoring_batch_size:
+                flush_scoring_batch()
+        flush_scoring_batch()
     if set(rows_by_key) != set(expected_keys):
         raise RuntimeError("incremental evaluation did not produce every expected row")
     scored = [rows_by_key[key] for key in expected_keys]
@@ -1806,6 +2173,145 @@ def _point_estimate(rows: Sequence[ScoredCloud], metric: str) -> float:
     return float(np.mean(per_seed)) if per_seed else float("nan")
 
 
+@dataclass(frozen=True)
+class _BootstrapTable:
+    seeds: tuple[int, ...]
+    clouds: tuple[str, ...]
+    cloud_labels: NDArray[np.uint8]
+    cloud_scores: NDArray[np.float64]
+    point_aurocs: NDArray[np.float64]
+    point_auprcs: NDArray[np.float64]
+    valid: NDArray[np.bool_]
+
+
+def _bootstrap_table(rows: Sequence[ScoredCloud]) -> _BootstrapTable:
+    seeds = tuple(sorted({row.scorer_seed for row in rows}))
+    clouds = tuple(sorted({row.cloud_id for row in rows}))
+    if not seeds or not clouds:
+        raise ValueError("bootstrap requires scorer seeds and clouds")
+    buckets: dict[tuple[int, str], list[ScoredCloud]] = {}
+    for row in rows:
+        buckets.setdefault((row.scorer_seed, row.cloud_id), []).append(row)
+    maximum_conditions = max(map(len, buckets.values()))
+    shape = (len(seeds), len(clouds), maximum_conditions)
+    cloud_labels = np.zeros(shape, dtype=np.uint8)
+    cloud_scores = np.zeros(shape, dtype=np.float64)
+    point_aurocs = np.full(shape, np.nan, dtype=np.float64)
+    point_auprcs = np.full(shape, np.nan, dtype=np.float64)
+    valid = np.zeros(shape, dtype=bool)
+    for seed_index, scorer_seed in enumerate(seeds):
+        for cloud_index, cloud_id in enumerate(clouds):
+            bucket = buckets.get((scorer_seed, cloud_id), ())
+            for condition_index, row in enumerate(bucket):
+                cloud_labels[seed_index, cloud_index, condition_index] = (
+                    row.cloud_label
+                )
+                cloud_scores[seed_index, cloud_index, condition_index] = (
+                    row.cloud_score
+                )
+                if row.point_auroc is not None:
+                    point_aurocs[seed_index, cloud_index, condition_index] = (
+                        row.point_auroc
+                    )
+                if row.point_auprc is not None:
+                    point_auprcs[seed_index, cloud_index, condition_index] = (
+                        row.point_auprc
+                    )
+                valid[seed_index, cloud_index, condition_index] = True
+    return _BootstrapTable(
+        seeds=seeds,
+        clouds=clouds,
+        cloud_labels=cloud_labels,
+        cloud_scores=cloud_scores,
+        point_aurocs=point_aurocs,
+        point_auprcs=point_auprcs,
+        valid=valid,
+    )
+
+
+def _bootstrap_draw_indices(
+    table: _BootstrapTable, *, samples: int, seed: int
+) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
+    """Generate the legacy alternating seed/cloud draws, then index them."""
+
+    rng = np.random.default_rng(seed)
+    seed_lookup = {value: index for index, value in enumerate(table.seeds)}
+    cloud_lookup = {value: index for index, value in enumerate(table.clouds)}
+    seed_draws = np.empty((samples, len(table.seeds)), dtype=np.int64)
+    cloud_draws = np.empty((samples, len(table.clouds)), dtype=np.int64)
+    for index in range(samples):
+        drawn_seeds = rng.choice(
+            table.seeds, size=len(table.seeds), replace=True
+        )
+        drawn_clouds = rng.choice(
+            table.clouds, size=len(table.clouds), replace=True
+        )
+        seed_draws[index] = [seed_lookup[int(value)] for value in drawn_seeds]
+        cloud_draws[index] = [cloud_lookup[str(value)] for value in drawn_clouds]
+    return seed_draws, cloud_draws
+
+
+def _bootstrap_seed_metrics(
+    table: _BootstrapTable,
+    *,
+    metric: str,
+    cloud_draws: NDArray[np.int64],
+) -> NDArray[np.float64]:
+    values = np.full(
+        (len(cloud_draws), len(table.seeds)), np.nan, dtype=np.float64
+    )
+    for start in range(0, len(cloud_draws), BOOTSTRAP_BATCH_SIZE):
+        stop = min(start + BOOTSTRAP_BATCH_SIZE, len(cloud_draws))
+        drawn = cloud_draws[start:stop]
+        for seed_index in range(len(table.seeds)):
+            valid = table.valid[seed_index, drawn].reshape(len(drawn), -1)
+            if metric in {"cloud_auroc", "cloud_auprc"}:
+                labels = table.cloud_labels[seed_index, drawn].reshape(
+                    len(drawn), -1
+                )
+                scores = table.cloud_scores[seed_index, drawn].reshape(
+                    len(drawn), -1
+                )
+                aurocs, auprcs = _binary_metrics_matrix(labels, scores, valid)
+                values[start:stop, seed_index] = (
+                    aurocs if metric == "cloud_auroc" else auprcs
+                )
+                continue
+            if metric == "point_auroc":
+                point_values = table.point_aurocs[seed_index, drawn].reshape(
+                    len(drawn), -1
+                )
+            elif metric == "point_auprc":
+                point_values = table.point_auprcs[seed_index, drawn].reshape(
+                    len(drawn), -1
+                )
+            else:
+                raise ValueError(f"unknown anomaly metric: {metric}")
+            point_valid = valid & np.isfinite(point_values)
+            counts = point_valid.sum(axis=1)
+            eligible = counts > 0
+            totals = np.sum(
+                np.where(point_valid, point_values, 0.0), axis=1, dtype=np.float64
+            )
+            values[start:stop, seed_index][eligible] = (
+                totals[eligible] / counts[eligible]
+            )
+    return values
+
+
+def _average_drawn_seeds(
+    per_seed: NDArray[np.float64], seed_draws: NDArray[np.int64]
+) -> NDArray[np.float64]:
+    drawn = np.take_along_axis(per_seed, seed_draws, axis=1)
+    finite = np.isfinite(drawn)
+    counts = finite.sum(axis=1)
+    values = np.full(len(drawn), np.nan, dtype=np.float64)
+    eligible = counts > 0
+    totals = np.sum(np.where(finite, drawn, 0.0), axis=1, dtype=np.float64)
+    values[eligible] = totals[eligible] / counts[eligible]
+    return values
+
+
 def _bootstrap_metric(
     rows: Sequence[ScoredCloud],
     *,
@@ -1814,29 +2320,14 @@ def _bootstrap_metric(
     confidence_level: float,
     seed: int,
 ) -> dict[str, Any]:
-    seeds = sorted({row.scorer_seed for row in rows})
-    clouds = sorted({row.cloud_id for row in rows})
-    if not seeds or not clouds:
-        raise ValueError("bootstrap requires scorer seeds and clouds")
-    rng = np.random.default_rng(seed)
-    draws = np.empty(samples, dtype=np.float64)
-    for index in range(samples):
-        seed_draw = rng.choice(seeds, size=len(seeds), replace=True)
-        cloud_draw = rng.choice(clouds, size=len(clouds), replace=True)
-        seed_values = []
-        for scorer_seed in seed_draw:
-            sampled_rows = []
-            for cloud_id in cloud_draw:
-                sampled_rows.extend(
-                    row
-                    for row in rows
-                    if row.scorer_seed == scorer_seed and row.cloud_id == cloud_id
-                )
-            seed_values.append(_metric(sampled_rows, metric))
-        finite_seed_values = [value for value in seed_values if np.isfinite(value)]
-        draws[index] = (
-            float(np.mean(finite_seed_values)) if finite_seed_values else float("nan")
-        )
+    table = _bootstrap_table(rows)
+    seed_draws, cloud_draws = _bootstrap_draw_indices(
+        table, samples=samples, seed=seed
+    )
+    per_seed = _bootstrap_seed_metrics(
+        table, metric=metric, cloud_draws=cloud_draws
+    )
+    draws = _average_drawn_seeds(per_seed, seed_draws)
     finite = draws[np.isfinite(draws)]
     if not len(finite):
         return {
@@ -1875,35 +2366,25 @@ def _paired_bootstrap_difference(
     }
     if candidate_identity != baseline_identity:
         raise ValueError("paired arm rows do not share scorer/cloud/condition identity")
-    seeds = sorted({row.scorer_seed for row in candidate})
-    clouds = sorted({row.cloud_id for row in candidate})
-    rng = np.random.default_rng(seed)
-    draws = np.empty(samples, dtype=np.float64)
-    for index in range(samples):
-        seed_draw = rng.choice(seeds, size=len(seeds), replace=True)
-        cloud_draw = rng.choice(clouds, size=len(clouds), replace=True)
-        seed_differences = []
-        for scorer_seed in seed_draw:
-            candidate_draw = []
-            baseline_draw = []
-            for cloud_id in cloud_draw:
-                candidate_draw.extend(
-                    row
-                    for row in candidate
-                    if row.scorer_seed == scorer_seed and row.cloud_id == cloud_id
-                )
-                baseline_draw.extend(
-                    row
-                    for row in baseline
-                    if row.scorer_seed == scorer_seed and row.cloud_id == cloud_id
-                )
-            seed_differences.append(
-                _metric(candidate_draw, metric) - _metric(baseline_draw, metric)
-            )
-        finite_differences = [value for value in seed_differences if np.isfinite(value)]
-        draws[index] = (
-            float(np.mean(finite_differences)) if finite_differences else float("nan")
-        )
+    candidate_table = _bootstrap_table(candidate)
+    baseline_table = _bootstrap_table(baseline)
+    if (
+        candidate_table.seeds != baseline_table.seeds
+        or candidate_table.clouds != baseline_table.clouds
+    ):
+        raise ValueError("paired arm rows do not share scorer/cloud identities")
+    seed_draws, cloud_draws = _bootstrap_draw_indices(
+        candidate_table, samples=samples, seed=seed
+    )
+    candidate_values = _bootstrap_seed_metrics(
+        candidate_table, metric=metric, cloud_draws=cloud_draws
+    )
+    baseline_values = _bootstrap_seed_metrics(
+        baseline_table, metric=metric, cloud_draws=cloud_draws
+    )
+    draws = _average_drawn_seeds(
+        candidate_values - baseline_values, seed_draws
+    )
     finite = draws[np.isfinite(draws)]
     if not len(finite):
         return {
@@ -2121,6 +2602,9 @@ def run_defect_anomaly_benchmark(
     timing: dict[str, Any] = {
         "defect_injection_seconds": 0.0,
         "scorer_fitting_seconds": 0.0,
+        "label_transfer_seconds": 0.0,
+        "scorer_inference_seconds": 0.0,
+        "point_metrics_seconds": 0.0,
         "per_arm_encode_seconds": {},
         "per_arm_decode_seconds": {"raw": 0.0},
         "official_metrics_seconds": 0.0,
@@ -2144,6 +2628,7 @@ def run_defect_anomaly_benchmark(
         samples,
         arms,
         config,
+        device_name=device_name,
         output_dir=output_dir,
         resume=resume,
         progress=progress,
@@ -2197,6 +2682,7 @@ def run_defect_anomaly_benchmark(
     accounted_seconds = (
         timing["defect_injection_seconds"]
         + timing["scorer_fitting_seconds"]
+        + timing["label_transfer_seconds"]
         + sum(timing["per_arm_encode_seconds"].values())
         + sum(timing["per_arm_decode_seconds"].values())
         + timing["official_metrics_seconds"]
